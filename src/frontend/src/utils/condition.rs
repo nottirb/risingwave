@@ -12,18 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::ops::Bound;
 
 use fixedbitset::FixedBitSet;
 use itertools::Itertools;
+use risingwave_common::catalog::Schema;
+use risingwave_common::types::ScalarImpl;
+use risingwave_common::util::scan_range::ScanRange;
 
 use crate::expr::{
     factorization_expr, fold_boolean_constant, push_down_not, to_conjunctions,
-    try_get_bool_constant, ExprImpl, ExprRewriter, ExprType, ExprVisitor, InputRef,
+    try_get_bool_constant, ExprImpl, ExprRewriter, ExprType, ExprVerboseDisplay, ExprVisitor,
+    InputRef,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Condition {
     /// Condition expressions in conjunction form (combined with `AND`)
     pub conjunctions: Vec<ExprImpl>,
@@ -68,6 +73,12 @@ impl Condition {
         }
     }
 
+    pub fn false_cond() -> Self {
+        Self {
+            conjunctions: vec![ExprImpl::literal_bool(false)],
+        }
+    }
+
     pub fn always_true(&self) -> bool {
         self.conjunctions.is_empty()
     }
@@ -109,6 +120,66 @@ impl Condition {
         .unwrap()
     }
 
+    /// Split the condition expressions into (N choose 2) + 1 groups: those containing two columns
+    /// from different buckets (and optionally, needing an equal condition between them), and
+    /// others.
+    ///
+    /// `input_num_cols` are the number of columns in each of the input buckets. For instance, with
+    /// bucket0: col0, col1, col2 | bucket1: col3, col4 | bucket2: col5
+    /// `input_num_cols` = [3, 2, 1]
+    ///
+    /// Returns hashmap with keys of the form (col1, col2) where col1 < col2 in terms of their col
+    /// index.
+    ///
+    /// `only_eq`: whether to only split those conditions with an eq condition predicate between two
+    /// buckets.
+    #[must_use]
+    pub fn split_by_input_col_nums(
+        self,
+        input_col_nums: &[usize],
+        only_eq: bool,
+    ) -> (HashMap<(usize, usize), Self>, Self) {
+        let mut bitmaps = Vec::with_capacity(input_col_nums.len());
+        let mut cols_seen = 0;
+        for cols in input_col_nums {
+            bitmaps.push(FixedBitSet::from_iter(cols_seen..cols_seen + cols));
+            cols_seen += cols;
+        }
+
+        let mut pairwise_conditions = HashMap::with_capacity(self.conjunctions.len());
+        let mut non_eq_join = vec![];
+
+        for expr in self.conjunctions {
+            let input_bits = expr.collect_input_refs(cols_seen);
+            let mut subset_indices = Vec::with_capacity(input_col_nums.len());
+            for (idx, bitmap) in bitmaps.iter().enumerate() {
+                if !input_bits.is_disjoint(bitmap) {
+                    subset_indices.push(idx);
+                }
+            }
+            if subset_indices.len() != 2 || (only_eq && expr.as_eq_cond().is_none()) {
+                non_eq_join.push(expr);
+            } else {
+                // The key has the canonical ordering (lower, higher)
+                let key = if subset_indices[0] < subset_indices[1] {
+                    (subset_indices[0], subset_indices[1])
+                } else {
+                    (subset_indices[1], subset_indices[0])
+                };
+                let e = pairwise_conditions
+                    .entry(key)
+                    .or_insert_with(Condition::true_cond);
+                e.conjunctions.push(expr);
+            }
+        }
+        (
+            pairwise_conditions,
+            Condition {
+                conjunctions: non_eq_join,
+            },
+        )
+    }
+
     #[must_use]
     /// For [`EqJoinPredicate`], separate equality conditions which connect left columns and right
     /// columns from other conditions.
@@ -129,23 +200,10 @@ impl Condition {
             let input_bits = expr.collect_input_refs(left_col_num + right_col_num);
             if input_bits.is_disjoint(&left_bit_map) || input_bits.is_disjoint(&right_bit_map) {
                 others.push(expr)
+            } else if let Some(columns) = expr.as_eq_cond() {
+                eq_keys.push(columns);
             } else {
-                let mut is_eq_cond = false;
-                if let ExprImpl::FunctionCall(function_call) = expr.clone()
-                    && function_call.get_expr_type() == ExprType::Equal
-                    && let (_, ExprImpl::InputRef(x), ExprImpl::InputRef(y)) =
-                            function_call.decompose_as_binary()
-                    {
-                        is_eq_cond = true;
-                        if x.index() < y.index() {
-                            eq_keys.push((*x, *y));
-                        } else {
-                            eq_keys.push((*y, *x));
-                        }
-                    }
-                if !is_eq_cond {
-                    others.push(expr)
-                }
+                others.push(expr)
             }
         });
 
@@ -172,6 +230,194 @@ impl Condition {
         .into_iter()
         .next_tuple()
         .unwrap()
+    }
+
+    /// See also [`ScanRange`](risingwave_pb::batch_plan::ScanRange).
+    pub fn split_to_scan_ranges(
+        self,
+        order_column_ids: &[usize],
+        num_cols: usize,
+    ) -> (Vec<ScanRange>, Self) {
+        fn always_false() -> (Vec<ScanRange>, Condition) {
+            (vec![], Condition::false_cond())
+        }
+
+        let mut col_idx_to_pk_idx = vec![None; num_cols];
+        order_column_ids
+            .iter()
+            .enumerate()
+            .for_each(|(idx, pk_idx)| {
+                col_idx_to_pk_idx[*pk_idx] = Some(idx);
+            });
+
+        // The i-th group only has exprs that reference the i-th PK column.
+        // The last group contains all the other exprs.
+        let mut groups = vec![vec![]; order_column_ids.len() + 1];
+        for (key, group) in &self.conjunctions.into_iter().group_by(|expr| {
+            let input_bits = expr.collect_input_refs(num_cols);
+            if input_bits.count_ones(..) == 1 {
+                let col_idx = input_bits.ones().next().unwrap();
+                col_idx_to_pk_idx[col_idx].unwrap_or(order_column_ids.len())
+            } else {
+                order_column_ids.len()
+            }
+        }) {
+            groups[key].extend(group);
+        }
+
+        let mut scan_range = ScanRange::full_table_scan();
+        let mut other_conds = groups.pop().unwrap();
+
+        for i in 0..order_column_ids.len() {
+            let group = std::mem::take(&mut groups[i]);
+            if group.is_empty() {
+                groups.push(other_conds);
+                return (
+                    if scan_range.is_full_table_scan() {
+                        vec![]
+                    } else {
+                        vec![scan_range]
+                    },
+                    Self {
+                        conjunctions: groups[i + 1..].concat(),
+                    },
+                );
+            }
+            let mut lb = vec![];
+            let mut ub = vec![];
+            // values in eq_cond are OR'ed
+            let mut eq_conds = vec![];
+
+            // analyze exprs in the group. scan_range is not updated
+            for expr in group.clone() {
+                if let Some((input_ref, const_expr)) = expr.as_eq_const() &&
+                    let Ok(const_expr) = const_expr.cast_implicit(input_ref.data_type) {
+                    assert_eq!(input_ref.index, order_column_ids[i]);
+                    let Ok(Some(value)) = const_expr.eval_row_const() else {
+                        // column = NULL or failed to eval
+                        return always_false();
+                    };
+                    if !eq_conds.is_empty() && eq_conds.into_iter().all(|l| l != value) {
+                        return always_false();
+                    }
+                    eq_conds = vec![value];
+                } else if let Some((input_ref, in_const_list)) = expr.as_in_const_list() {
+                    assert_eq!(input_ref.index, order_column_ids[i]);
+                    let mut scalars = vec![];
+                    for const_expr in in_const_list.into_iter().unique() {
+                        // The cast should succeed, because otherwise the input_ref is casted
+                        // and thus `as_in_const_list` returns None.
+                        let const_expr = const_expr.cast_implicit(input_ref.data_type.clone()).unwrap();
+                        let value = const_expr.eval_row_const().unwrap();
+                        let Some(value) = value else {
+                            continue;
+                        };
+                        scalars.push(value);
+                    }
+                    if scalars.is_empty() {
+                        // There're only NULLs in the in-list
+                        return always_false();
+                    }
+                    if !eq_conds.is_empty() {
+                        let old: HashSet<ScalarImpl> = HashSet::from_iter(eq_conds);
+                        let new = HashSet::from_iter(scalars);
+                        let intersection: HashSet<_> = old.intersection(&new).collect();
+                        if intersection.is_empty() {
+                            return always_false();
+                        }
+                        scalars = intersection.into_iter().cloned().collect();
+                    }
+                    eq_conds = scalars;
+                } else if let Some((input_ref, op, const_expr)) = expr.as_comparison_const() &&
+                    let Ok(const_expr) = const_expr.cast_implicit(input_ref.data_type) {
+                    assert_eq!(input_ref.index, order_column_ids[i]);
+                    let Ok(Some(value)) = const_expr.eval_row_const() else {
+                        // column compare with NULL or failed to eval
+                        return always_false();
+                    };
+                    match op {
+                        ExprType::LessThan => {
+                            ub.push((Bound::Excluded(value), expr));
+                        }
+                        ExprType::LessThanOrEqual => {
+                            ub.push((Bound::Included(value), expr));
+                        }
+                        ExprType::GreaterThan => {
+                            lb.push((Bound::Excluded(value), expr));
+                        }
+                        ExprType::GreaterThanOrEqual => {
+                            lb.push((Bound::Included(value), expr));
+                        }
+                        _ => unreachable!(),
+                    }
+                } else {
+                    other_conds.push(expr);
+                }
+            }
+
+            // update scan_range
+            match eq_conds.len() {
+                1 => {
+                    scan_range.eq_conds.extend(eq_conds.into_iter());
+                    // TODO: simplify bounds: it's either true or false according to whether lit is
+                    // included
+                    other_conds.extend(lb.into_iter().chain(ub.into_iter()).map(|(_, expr)| expr));
+                }
+                0 => {
+                    if lb.len() > 1 || ub.len() > 1 {
+                        // TODO: simplify bounds: it can be merged into a single lb & ub.
+                        other_conds
+                            .extend(lb.into_iter().chain(ub.into_iter()).map(|(_, expr)| expr));
+                    } else if !lb.is_empty() || !ub.is_empty() {
+                        scan_range.range = (
+                            lb.first()
+                                .map(|(bound, _)| (bound.clone()))
+                                .unwrap_or(Bound::Unbounded),
+                            ub.first()
+                                .map(|(bound, _)| (bound.clone()))
+                                .unwrap_or(Bound::Unbounded),
+                        )
+                    }
+                    other_conds.extend(groups[i + 1..].iter().flatten().cloned());
+                    break;
+                }
+                _ => {
+                    // currently we will split IN list to multiple scan ranges immediately
+                    // i.e., a = 1 AND b in (1,2) is handled
+                    // TODO:
+                    // a in (1,2) AND b = 1
+                    // a in (1,2) AND b in (1,2)
+                    // a in (1,2) AND b > 1
+                    other_conds.extend(lb.into_iter().chain(ub.into_iter()).map(|(_, expr)| expr));
+                    other_conds.extend(groups[i + 1..].iter().flatten().cloned());
+                    let scan_ranges = eq_conds
+                        .into_iter()
+                        .map(|lit| {
+                            let mut scan_range = scan_range.clone();
+                            scan_range.eq_conds.push(lit);
+                            scan_range
+                        })
+                        .collect();
+                    return (
+                        scan_ranges,
+                        Self {
+                            conjunctions: other_conds,
+                        },
+                    );
+                }
+            }
+        }
+
+        (
+            if scan_range.is_full_table_scan() {
+                vec![]
+            } else {
+                vec![scan_range]
+            },
+            Self {
+                conjunctions: other_conds,
+            },
+        )
     }
 
     /// Split the condition expressions into `N` groups.
@@ -201,7 +447,7 @@ impl Condition {
     }
 
     #[must_use]
-    pub fn rewrite_expr(self, rewriter: &mut impl ExprRewriter) -> Self {
+    pub fn rewrite_expr(self, rewriter: &mut (impl ExprRewriter + ?Sized)) -> Self {
         Self {
             conjunctions: self
                 .conjunctions
@@ -265,6 +511,55 @@ impl Condition {
             }
         }
         Self { conjunctions: res }
+    }
+}
+
+pub struct ConditionVerboseDisplay<'a> {
+    pub condition: &'a Condition,
+    pub input_schema: &'a Schema,
+}
+
+impl ConditionVerboseDisplay<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let that = self.condition;
+        let mut conjunctions = that.conjunctions.iter();
+        if let Some(expr) = conjunctions.next() {
+            write!(
+                f,
+                "{:?}",
+                ExprVerboseDisplay {
+                    expr,
+                    input_schema: self.input_schema
+                }
+            )?;
+        }
+        if that.always_true() {
+            write!(f, "true")?;
+        } else {
+            for expr in conjunctions {
+                write!(
+                    f,
+                    " AND {:?}",
+                    ExprVerboseDisplay {
+                        expr,
+                        input_schema: self.input_schema
+                    }
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for ConditionVerboseDisplay<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt(f)
+    }
+}
+
+impl fmt::Debug for ConditionVerboseDisplay<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt(f)
     }
 }
 

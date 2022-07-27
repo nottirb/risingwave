@@ -12,18 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use risingwave_common::catalog::TableId;
-use risingwave_common::error::tonic_err;
-use risingwave_pb::common::ParallelUnitType;
+use std::collections::{HashMap, HashSet};
+
+use itertools::Itertools;
+use risingwave_pb::meta::list_table_fragments_response::{
+    ActorInfo, FragmentInfo, TableFragmentInfo,
+};
 use risingwave_pb::meta::stream_manager_service_server::StreamManagerService;
 use risingwave_pb::meta::*;
 use tonic::{Request, Response, Status};
 
-use crate::cluster::ClusterManagerRef;
+use crate::barrier::BarrierManagerRef;
 use crate::manager::MetaSrvEnv;
-use crate::model::TableFragments;
 use crate::storage::MetaStore;
-use crate::stream::{FragmentManagerRef, GlobalStreamManagerRef, StreamFragmenter};
+use crate::stream::FragmentManagerRef;
 
 pub type TonicResponse<T> = Result<Response<T>, Status>;
 
@@ -33,10 +35,8 @@ where
     S: MetaStore,
 {
     env: MetaSrvEnv<S>,
-
-    global_stream_manager: GlobalStreamManagerRef<S>,
+    barrier_manager: BarrierManagerRef<S>,
     fragment_manager: FragmentManagerRef<S>,
-    cluster_manager: ClusterManagerRef<S>,
 }
 
 impl<S> StreamServiceImpl<S>
@@ -45,15 +45,13 @@ where
 {
     pub fn new(
         env: MetaSrvEnv<S>,
-        global_stream_manager: GlobalStreamManagerRef<S>,
+        barrier_manager: BarrierManagerRef<S>,
         fragment_manager: FragmentManagerRef<S>,
-        cluster_manager: ClusterManagerRef<S>,
     ) -> Self {
         StreamServiceImpl {
             env,
-            global_stream_manager,
+            barrier_manager,
             fragment_manager,
-            cluster_manager,
         }
     }
 }
@@ -64,80 +62,52 @@ where
     S: MetaStore,
 {
     #[cfg_attr(coverage, no_coverage)]
-    async fn create_materialized_view(
-        &self,
-        request: Request<CreateMaterializedViewRequest>,
-    ) -> TonicResponse<CreateMaterializedViewResponse> {
-        use crate::stream::CreateMaterializedViewContext;
-
-        let req = request.into_inner();
-
-        tracing::trace!(
-            target: "events::meta::create_mv_v1",
-            plan = serde_json::to_string(&req).unwrap().as_str(),
-            "create materialized view"
-        );
-
-        let hash_mapping = self.cluster_manager.get_hash_mapping().await;
-        let parallel_degree = self
-            .cluster_manager
-            .get_parallel_unit_count(Some(ParallelUnitType::Hash))
-            .await;
-        let mut ctx = CreateMaterializedViewContext {
-            is_legacy_frontend: true,
-            hash_mapping,
-            ..Default::default()
-        };
-
-        let graph = StreamFragmenter::generate_graph(
-            self.env.id_gen_manager_ref(),
-            self.fragment_manager.clone(),
-            parallel_degree as u32,
-            true,
-            req.get_stream_node().map_err(tonic_err)?,
-            &mut ctx,
-        )
-        .await
-        .map_err(|e| e.to_grpc_status())?;
-
-        let table_fragments = TableFragments::new(TableId::from(&req.table_ref_id), graph);
-        match self
-            .global_stream_manager
-            .create_materialized_view(table_fragments, ctx)
-            .await
-        {
-            Ok(()) => Ok(Response::new(CreateMaterializedViewResponse {
-                status: None,
-            })),
-            Err(e) => Err(e.to_grpc_status()),
-        }
-    }
-
-    #[cfg_attr(coverage, no_coverage)]
-    async fn drop_materialized_view(
-        &self,
-        request: Request<DropMaterializedViewRequest>,
-    ) -> TonicResponse<DropMaterializedViewResponse> {
-        let req = request.into_inner();
-
-        match self
-            .global_stream_manager
-            .drop_materialized_view(&TableId::from(&req.table_ref_id))
-            .await
-        {
-            Ok(()) => Ok(Response::new(DropMaterializedViewResponse { status: None })),
-            Err(e) => Err(e.to_grpc_status()),
-        }
-    }
-
-    #[cfg_attr(coverage, no_coverage)]
     async fn flush(&self, request: Request<FlushRequest>) -> TonicResponse<FlushResponse> {
+        self.env.idle_manager().record_activity();
         let _req = request.into_inner();
 
-        self.global_stream_manager
-            .flush()
-            .await
-            .map_err(|e| e.to_grpc_status())?;
+        self.barrier_manager.flush().await?;
         Ok(Response::new(FlushResponse { status: None }))
+    }
+
+    #[cfg_attr(coverage, no_coverage)]
+    async fn list_table_fragments(
+        &self,
+        request: Request<ListTableFragmentsRequest>,
+    ) -> Result<Response<ListTableFragmentsResponse>, Status> {
+        let req = request.into_inner();
+        let table_ids = HashSet::<u32>::from_iter(req.table_ids);
+        let table_fragments = self.fragment_manager.list_table_fragments().await?;
+        let info = table_fragments
+            .into_iter()
+            .filter(|tf| table_ids.contains(&tf.table_id().table_id))
+            .map(|tf| {
+                (
+                    tf.table_id().table_id,
+                    TableFragmentInfo {
+                        fragments: tf
+                            .fragments
+                            .into_iter()
+                            .map(|(id, fragment)| FragmentInfo {
+                                id,
+                                actors: fragment
+                                    .actors
+                                    .into_iter()
+                                    .map(|actor| ActorInfo {
+                                        id: actor.actor_id,
+                                        node: actor.nodes,
+                                        dispatcher: actor.dispatcher,
+                                    })
+                                    .collect_vec(),
+                            })
+                            .collect_vec(),
+                    },
+                )
+            })
+            .collect::<HashMap<u32, TableFragmentInfo>>();
+
+        Ok(Response::new(ListTableFragmentsResponse {
+            table_fragments: info,
+        }))
     }
 }

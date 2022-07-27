@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use bytes::{BufMut, Bytes, BytesMut};
+use risingwave_common::config::StorageConfig;
 use risingwave_hummock_sdk::key::{get_table_id, user_key};
-use risingwave_pb::hummock::VNodeBitmap;
 
 use super::bloom::Bloom;
 use super::utils::CompressionAlgorithm;
@@ -30,20 +30,32 @@ pub const DEFAULT_SSTABLE_SIZE: usize = 4 * 1024 * 1024;
 pub const DEFAULT_BLOOM_FALSE_POSITIVE: f64 = 0.1;
 
 #[derive(Clone, Debug)]
-pub struct SSTableBuilderOptions {
+pub struct SstableBuilderOptions {
     /// Approximate sstable capacity.
     pub capacity: usize,
     /// Approximate block capacity.
     pub block_capacity: usize,
     /// Restart point interval.
     pub restart_interval: usize,
-    /// False prsitive probability of bloom filter.
+    /// False positive probability of bloom filter.
     pub bloom_false_positive: f64,
     /// Compression algorithm.
     pub compression_algorithm: CompressionAlgorithm,
 }
 
-impl Default for SSTableBuilderOptions {
+impl From<&StorageConfig> for SstableBuilderOptions {
+    fn from(options: &StorageConfig) -> SstableBuilderOptions {
+        SstableBuilderOptions {
+            capacity: (options.sstable_size_mb as usize) * (1 << 20),
+            block_capacity: (options.block_size_kb as usize) * (1 << 10),
+            restart_interval: DEFAULT_RESTART_INTERVAL,
+            bloom_false_positive: options.bloom_false_positive,
+            compression_algorithm: CompressionAlgorithm::None,
+        }
+    }
+}
+
+impl Default for SstableBuilderOptions {
     fn default() -> Self {
         Self {
             capacity: DEFAULT_SSTABLE_SIZE,
@@ -55,37 +67,37 @@ impl Default for SSTableBuilderOptions {
     }
 }
 
-pub const VNODE_BITS: usize = 8;
-pub const VNODE_BITMAP_LEN: usize = 1 << (VNODE_BITS - 3);
-pub struct SSTableBuilder {
+pub struct SstableBuilder {
     /// Options.
-    options: SSTableBuilderOptions,
+    options: SstableBuilderOptions,
     /// Write buffer.
     buf: BytesMut,
     /// Current block builder.
     block_builder: Option<BlockBuilder>,
     /// Block metadata vec.
     block_metas: Vec<BlockMeta>,
-    /// `table_id` -> Bitmaps of value meta.
-    vnode_bitmaps: BTreeMap<u32, [u8; VNODE_BITMAP_LEN]>,
+    /// `table_id` of added keys.
+    table_ids: BTreeSet<u32>,
     /// Hashes of user keys.
     user_key_hashes: Vec<u32>,
     /// Last added full key.
     last_full_key: Bytes,
     key_count: usize,
+    sstable_id: u64,
 }
 
-impl SSTableBuilder {
-    pub fn new(options: SSTableBuilderOptions) -> Self {
+impl SstableBuilder {
+    pub fn new(sstable_id: u64, options: SstableBuilderOptions) -> Self {
         Self {
             options: options.clone(),
             buf: BytesMut::with_capacity(options.capacity),
             block_builder: None,
             block_metas: Vec::with_capacity(options.capacity / options.block_capacity + 1),
-            vnode_bitmaps: BTreeMap::new(),
+            table_ids: BTreeSet::new(),
             user_key_hashes: Vec::with_capacity(options.capacity / DEFAULT_ENTRY_SIZE + 1),
             last_full_key: Bytes::default(),
             key_count: 0,
+            sstable_id,
         }
     }
 
@@ -95,7 +107,7 @@ impl SSTableBuilder {
         if self.block_builder.is_none() {
             self.last_full_key.clear();
             self.block_builder = Some(BlockBuilder::new(BlockBuilderOptions {
-                capacity: self.options.capacity,
+                capacity: self.options.block_capacity,
                 restart_interval: self.options.restart_interval,
                 compression_algorithm: self.options.compression_algorithm,
             }));
@@ -110,14 +122,9 @@ impl SSTableBuilder {
 
         // TODO: refine me
         let mut raw_value = BytesMut::default();
-        let value_meta = value.encode(&mut raw_value) & ((1 << VNODE_BITS) - 1);
+        value.encode(&mut raw_value);
         if let Some(table_id) = get_table_id(full_key) {
-            // We use 8 bit of bitmap[x] to indicate existence of virtual node x*8..(x+1)*8,
-            // respectively
-            self.vnode_bitmaps
-                .entry(table_id)
-                .or_insert([0; VNODE_BITMAP_LEN])[(value_meta >> 3) as usize] |=
-                1 << (value_meta & 0b111);
+            self.table_ids.insert(table_id);
         }
         let raw_value = raw_value.freeze();
 
@@ -149,7 +156,7 @@ impl SSTableBuilder {
     /// ```plain
     /// | Block 0 | ... | Block N-1 | N (4B) |
     /// ```
-    pub fn finish(mut self) -> (Bytes, SstableMeta, Vec<VNodeBitmap>) {
+    pub fn finish(mut self) -> (u64, Bytes, SstableMeta, Vec<u32>) {
         let smallest_key = self.block_metas[0].smallest_key.clone();
         let largest_key = self.last_full_key.to_vec();
         self.build_block();
@@ -174,16 +181,10 @@ impl SSTableBuilder {
         };
 
         (
+            self.sstable_id,
             self.buf.freeze(),
             meta,
-            self.vnode_bitmaps
-                .iter()
-                .map(|(table_id, vnode_bitmaps)| VNodeBitmap {
-                    table_id: *table_id,
-                    maplen: VNODE_BITMAP_LEN as u32,
-                    bitmap: ::prost::alloc::vec::Vec::from(*vnode_bitmaps),
-                })
-                .collect(),
+            self.table_ids.into_iter().collect(),
         )
     }
 
@@ -228,7 +229,7 @@ pub(super) mod tests {
     #[test]
     #[should_panic]
     fn test_empty() {
-        let opt = SSTableBuilderOptions {
+        let opt = SstableBuilderOptions {
             capacity: 0,
             block_capacity: 4096,
             restart_interval: 16,
@@ -236,20 +237,20 @@ pub(super) mod tests {
             compression_algorithm: CompressionAlgorithm::None,
         };
 
-        let b = SSTableBuilder::new(opt);
+        let b = SstableBuilder::new(0, opt);
 
         b.finish();
     }
 
     #[test]
     fn test_smallest_key_and_largest_key() {
-        let mut b = SSTableBuilder::new(default_builder_opt_for_test());
+        let mut b = SstableBuilder::new(0, default_builder_opt_for_test());
 
         for i in 0..TEST_KEYS_COUNT {
             b.add(&test_key_of(i), HummockValue::put(&test_value_of(i)));
         }
 
-        let (_, meta, _) = b.finish();
+        let (_, _, meta, _) = b.finish();
 
         assert_eq!(test_key_of(0), meta.smallest_key);
         assert_eq!(test_key_of(TEST_KEYS_COUNT - 1), meta.largest_key);
@@ -258,7 +259,7 @@ pub(super) mod tests {
     async fn test_with_bloom_filter(with_blooms: bool) {
         let key_count = 1000;
 
-        let opts = SSTableBuilderOptions {
+        let opts = SstableBuilderOptions {
             capacity: 0,
             block_capacity: 4096,
             restart_interval: 16,

@@ -45,7 +45,10 @@ pub async fn handle_create_database(
     }
 
     let catalog_writer = session.env().catalog_writer();
-    catalog_writer.create_database(&database_name).await?;
+    catalog_writer
+        .create_database(&database_name, session.user_id())
+        .await?;
+
     Ok(PgResponse::empty_result(StatementType::CREATE_DATABASE))
 }
 

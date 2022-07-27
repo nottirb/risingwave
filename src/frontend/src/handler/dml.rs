@@ -17,7 +17,6 @@ use pgwire::pg_response::{PgResponse, StatementType};
 use risingwave_common::error::Result;
 use risingwave_sqlparser::ast::Statement;
 
-use super::query::IMPLICIT_FLUSH;
 use crate::binder::Binder;
 use crate::handler::util::{to_pg_field, to_pg_rows};
 use crate::planner::Planner;
@@ -54,7 +53,7 @@ pub async fn handle_dml(context: OptimizerContext, stmt: Statement) -> Result<Pg
         .schedule_single(execution_context, plan)
         .await?
     {
-        rows.extend(to_pg_rows(chunk?));
+        rows.extend(to_pg_rows(chunk?, false));
     }
 
     let rows_count = match stmt_type {
@@ -64,30 +63,32 @@ pub async fn handle_dml(context: OptimizerContext, stmt: Statement) -> Result<Pg
             let affected_rows_str = first_row[0]
                 .as_ref()
                 .expect("compute node should return affected rows in output");
-            affected_rows_str.parse().unwrap_or_default()
+            String::from_utf8(affected_rows_str.to_vec())
+                .unwrap()
+                .parse()
+                .unwrap_or_default()
         }
 
         _ => unreachable!(),
     };
 
     // Implicitly flush the writes.
-    if let Some(flag) = session.get_config(IMPLICIT_FLUSH) {
-        if flag.is_set(false) {
-            flush_for_write(&session, stmt_type).await?;
-        }
+    if session.config().get_implicit_flush() {
+        flush_for_write(&session, stmt_type).await?;
     }
 
-    Ok(PgResponse::new(stmt_type, rows_count, rows, pg_descs))
+    Ok(PgResponse::new(stmt_type, rows_count, rows, pg_descs, true))
 }
 
 async fn flush_for_write(session: &SessionImpl, stmt_type: StatementType) -> Result<()> {
     match stmt_type {
         StatementType::INSERT | StatementType::DELETE | StatementType::UPDATE => {
             let client = session.env().meta_client();
-            client.flush().await
+            client.flush().await?;
         }
-        _ => Ok(()),
+        _ => {}
     }
+    Ok(())
 }
 
 fn to_statement_type(stmt: &Statement) -> StatementType {

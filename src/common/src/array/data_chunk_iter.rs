@@ -21,17 +21,24 @@ use super::column::Column;
 use crate::array::DataChunk;
 use crate::hash::HashCode;
 use crate::types::{
-    deserialize_datum_from, deserialize_datum_not_null_from, serialize_datum_into,
+    deserialize_datum_from, deserialize_datum_not_null_from, hash_datum, serialize_datum_into,
     serialize_datum_not_null_into, DataType, Datum, DatumRef, ToOwnedDatum,
 };
 use crate::util::sort_util::OrderType;
-
 impl DataChunk {
     /// Get an iterator for visible rows.
     pub fn rows(&self) -> impl Iterator<Item = RowRef> {
         DataChunkRefIter {
             chunk: self,
             idx: Some(0),
+        }
+    }
+
+    /// Get an iterator for all rows in the chunk, and a `None` represents an invisible row.
+    pub fn rows_with_holes(&self) -> impl Iterator<Item = Option<RowRef>> {
+        DataChunkRefIterWithHoles {
+            chunk: self,
+            idx: 0,
         }
     }
 }
@@ -61,6 +68,34 @@ impl<'a> Iterator for DataChunkRefIter<'a> {
                     }
                 }
             }
+        }
+    }
+}
+
+struct DataChunkRefIterWithHoles<'a> {
+    chunk: &'a DataChunk,
+    idx: usize,
+}
+
+impl<'a> Iterator for DataChunkRefIterWithHoles<'a> {
+    type Item = Option<RowRef<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let len = self.chunk.capacity();
+        let vis = self.chunk.vis();
+        if self.idx == len {
+            None
+        } else {
+            let ret = Some(if !vis.is_set(self.idx) {
+                None
+            } else {
+                Some(RowRef {
+                    chunk: self.chunk,
+                    idx: self.idx,
+                })
+            });
+            self.idx += 1;
+            ret
         }
     }
 }
@@ -209,6 +244,11 @@ impl Row {
         Self(values)
     }
 
+    pub fn empty<'a>() -> &'a Self {
+        static EMPTY_ROW: Row = Row(Vec::new());
+        &EMPTY_ROW
+    }
+
     /// Serialize the row into a memcomparable bytes.
     ///
     /// All values are nullable. Each value will have 1 extra byte to indicate whether it is null.
@@ -243,7 +283,7 @@ impl Row {
         Ok(serializer.into_inner())
     }
 
-    /// Deserialize a datum in the row to a memcomparable bytes. The datum must not be null.
+    /// Serialize a datum in the row to a memcomparable bytes. The datum must not be null.
     ///
     /// !Panics
     ///
@@ -270,9 +310,28 @@ impl Row {
     {
         let mut hasher = hash_builder.build_hasher();
         for datum in &self.0 {
-            datum.hash(&mut hasher);
+            hash_datum(datum, &mut hasher);
         }
         HashCode(hasher.finish())
+    }
+
+    /// Compute hash value of a row on corresponding indices.
+    pub fn hash_by_indices<H>(&self, hash_indices: &[usize], hash_builder: &H) -> HashCode
+    where
+        H: BuildHasher,
+    {
+        let mut hasher = hash_builder.build_hasher();
+        for idx in hash_indices {
+            hash_datum(&self.0[*idx], &mut hasher);
+        }
+        HashCode(hasher.finish())
+    }
+
+    /// Get an owned `Row` by the given `indices` from current row.
+    ///
+    /// Use `datum_refs_by_indices` if possible instead to avoid allocating owned datums.
+    pub fn by_indices(&self, indices: &[usize]) -> Row {
+        Row(indices.iter().map(|&idx| self.0[idx].clone()).collect_vec())
     }
 }
 
@@ -289,8 +348,7 @@ impl RowDeserializer {
 
     /// Deserialize the row from a memcomparable bytes.
     pub fn deserialize(&self, data: &[u8]) -> Result<Row, memcomparable::Error> {
-        let mut values = vec![];
-        values.reserve(self.data_types.len());
+        let mut values = Vec::with_capacity(self.data_types.len());
         let mut deserializer = memcomparable::Deserializer::new(data);
         for ty in &self.data_types {
             values.push(deserialize_datum_from(ty, &mut deserializer)?);
@@ -300,8 +358,7 @@ impl RowDeserializer {
 
     /// Deserialize the row from a memcomparable bytes. All values are not null.
     pub fn deserialize_not_null(&self, data: &[u8]) -> Result<Row, memcomparable::Error> {
-        let mut values = vec![];
-        values.reserve(self.data_types.len());
+        let mut values = Vec::with_capacity(self.data_types.len());
         let mut deserializer = memcomparable::Deserializer::new(data);
         for ty in &self.data_types {
             values.push(deserialize_datum_not_null_from(

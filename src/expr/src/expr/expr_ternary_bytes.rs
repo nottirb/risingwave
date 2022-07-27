@@ -19,7 +19,9 @@ use risingwave_common::types::DataType;
 
 use crate::expr::template::TernaryBytesExpression;
 use crate::expr::BoxedExpression;
+use crate::vector_op::overlay::overlay;
 use crate::vector_op::replace::replace;
+use crate::vector_op::split_part::split_part;
 use crate::vector_op::substr::substr_start_for;
 use crate::vector_op::translate::translate;
 
@@ -74,13 +76,63 @@ pub fn new_translate_expr(
     )
 }
 
+pub fn new_split_part_expr(
+    string_expr: BoxedExpression,
+    delimiter_expr: BoxedExpression,
+    nth_expr: BoxedExpression,
+    return_type: DataType,
+) -> BoxedExpression {
+    Box::new(
+        TernaryBytesExpression::<Utf8Array, Utf8Array, I32Array, _>::new(
+            string_expr,
+            delimiter_expr,
+            nth_expr,
+            return_type,
+            split_part,
+        ),
+    )
+}
+
+pub fn new_overlay_exp(
+    s: BoxedExpression,
+    new_sub_str: BoxedExpression,
+    start: BoxedExpression,
+    return_type: DataType,
+) -> BoxedExpression {
+    Box::new(
+        TernaryBytesExpression::<Utf8Array, Utf8Array, I32Array, _>::new(
+            s,
+            new_sub_str,
+            start,
+            return_type,
+            overlay,
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use risingwave_common::array::DataChunk;
-    use risingwave_common::types::ScalarImpl;
+    use risingwave_common::array::{DataChunk, Row};
+    use risingwave_common::types::{Datum, ScalarImpl};
 
     use super::*;
     use crate::expr::LiteralExpression;
+
+    fn test_evals_dummy(expr: BoxedExpression, expected: Datum, is_negative_len: bool) {
+        let res = expr.eval(&DataChunk::new_dummy(1));
+        if is_negative_len {
+            assert!(res.is_err());
+        } else {
+            assert_eq!(res.unwrap().to_datum(), expected);
+        }
+
+        let res = expr.eval_row(&Row::new(vec![]));
+        if is_negative_len {
+            assert!(res.is_err());
+        } else {
+            assert_eq!(res.unwrap(), expected);
+        }
+    }
 
     #[test]
     fn test_substr_start_end() {
@@ -132,12 +184,8 @@ mod tests {
                 Box::new(LiteralExpression::new(DataType::Int32, len)),
                 DataType::Varchar,
             );
-            let res = expr.eval(&DataChunk::new_dummy(1));
-            if is_negative_len {
-                assert!(res.is_err());
-            } else {
-                assert_eq!(res.unwrap().to_datum(), expected);
-            }
+
+            test_evals_dummy(expr, expected, is_negative_len);
         }
     }
 
@@ -174,11 +222,39 @@ mod tests {
                 )),
                 DataType::Varchar,
             );
-            let res = expr.eval(&DataChunk::new_dummy(1)).unwrap();
-            assert_eq!(
-                res.to_datum(),
-                Some(ScalarImpl::from(String::from(expected)))
+
+            test_evals_dummy(expr, Some(ScalarImpl::from(String::from(expected))), false);
+        }
+    }
+
+    #[test]
+    fn test_overlay() {
+        let cases = vec![
+            ("aaa__aaa", "XY", 4, "aaaXYaaa"),
+            ("aaa", "XY", 3, "aaXY"),
+            ("aaa", "XY", 4, "aaaXY"),
+            ("aaa", "XY", -123, "XYa"),
+            ("aaa", "XY", 123, "aaaXY"),
+        ];
+
+        for (s, new_sub_str, start, expected) in cases {
+            let expr = new_overlay_exp(
+                Box::new(LiteralExpression::new(
+                    DataType::Varchar,
+                    Some(ScalarImpl::from(String::from(s))),
+                )),
+                Box::new(LiteralExpression::new(
+                    DataType::Varchar,
+                    Some(ScalarImpl::from(String::from(new_sub_str))),
+                )),
+                Box::new(LiteralExpression::new(
+                    DataType::Int32,
+                    Some(ScalarImpl::from(start)),
+                )),
+                DataType::Varchar,
             );
+
+            test_evals_dummy(expr, Some(ScalarImpl::from(String::from(expected))), false);
         }
     }
 }

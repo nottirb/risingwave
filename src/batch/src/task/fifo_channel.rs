@@ -16,33 +16,38 @@ use std::future::Future;
 
 use risingwave_common::array::DataChunk;
 use risingwave_common::error::ErrorCode::InternalError;
-use risingwave_common::error::{Result, ToRwResult};
+use risingwave_common::error::Result;
 use tokio::sync::mpsc;
 
+use crate::error::BatchError::SenderError;
+use crate::error::Result as BatchResult;
 use crate::task::channel::{ChanReceiver, ChanReceiverImpl, ChanSender, ChanSenderImpl};
+use crate::task::data_chunk_in_channel::DataChunkInChannel;
+use crate::task::BOUNDED_BUFFER_SIZE;
 
 pub struct FifoSender {
-    sender: mpsc::UnboundedSender<Option<DataChunk>>,
+    sender: mpsc::Sender<Option<DataChunkInChannel>>,
 }
 
 pub struct FifoReceiver {
-    receiver: mpsc::UnboundedReceiver<Option<DataChunk>>,
+    receiver: mpsc::Receiver<Option<DataChunkInChannel>>,
 }
 
 impl ChanSender for FifoSender {
-    type SendFuture<'a> = impl Future<Output = Result<()>>;
+    type SendFuture<'a> = impl Future<Output = BatchResult<()>>;
 
     fn send(&mut self, chunk: Option<DataChunk>) -> Self::SendFuture<'_> {
         async move {
             self.sender
-                .send(chunk)
-                .to_rw_result_with(|| "FifoSender::send".into())
+                .send(chunk.map(DataChunkInChannel::new))
+                .await
+                .map_err(|_| SenderError)
         }
     }
 }
 
 impl ChanReceiver for FifoReceiver {
-    type RecvFuture<'a> = impl Future<Output = Result<Option<DataChunk>>>;
+    type RecvFuture<'a> = impl Future<Output = Result<Option<DataChunkInChannel>>>;
 
     fn recv(&mut self) -> Self::RecvFuture<'_> {
         async move {
@@ -56,7 +61,7 @@ impl ChanReceiver for FifoReceiver {
 }
 
 pub fn new_fifo_channel() -> (ChanSenderImpl, Vec<ChanReceiverImpl>) {
-    let (s, r) = mpsc::unbounded_channel();
+    let (s, r) = mpsc::channel(BOUNDED_BUFFER_SIZE);
     (
         ChanSenderImpl::Fifo(FifoSender { sender: s }),
         vec![ChanReceiverImpl::Fifo(FifoReceiver { receiver: r })],

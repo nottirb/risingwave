@@ -13,28 +13,24 @@
 // limitations under the License.
 
 use risingwave_common::array::{
-    Array, BoolArray, DecimalArray, I32Array, IntervalArray, NaiveDateArray, NaiveDateTimeArray,
-    Utf8Array,
+    Array, BoolArray, DecimalArray, I32Array, IntervalArray, ListArray, NaiveDateArray,
+    NaiveDateTimeArray, StructArray, Utf8Array,
 };
-use risingwave_common::error::ErrorCode::InternalError;
-use risingwave_common::error::Result;
 use risingwave_common::types::*;
 use risingwave_pb::expr::expr_node::Type;
 
+use crate::expr::expr_binary_bytes::new_concat_op;
 use crate::expr::template::BinaryExpression;
 use crate::expr::BoxedExpression;
+use crate::for_all_cmp_variants;
 use crate::vector_op::arithmetic_op::*;
+use crate::vector_op::bitwise_op::*;
 use crate::vector_op::cmp::*;
 use crate::vector_op::extract::{extract_from_date, extract_from_timestamp};
 use crate::vector_op::like::like_default;
 use crate::vector_op::position::position;
 use crate::vector_op::round::round_digits;
 use crate::vector_op::tumble::{tumble_start_date, tumble_start_date_time};
-
-/// A placeholder function that returns bool in [`gen_binary_expr_atm`]
-pub fn cmp_placeholder<T1, T2, T3>(_l: T1, _r: T2) -> Result<bool> {
-    Err(InternalError("The function is not supported".to_string()).into())
-}
 
 /// This macro helps create arithmetic expression.
 /// It receive all the combinations of `gen_binary_expr` and generate corresponding match cases
@@ -108,6 +104,38 @@ macro_rules! gen_cmp_impl {
     };
 }
 
+/// This macro helps create bitwise shift expression. The Output type is same as LHS of the
+/// expression and the RHS of the expression is being match into u32. Similar to `gen_atm_impl`.
+macro_rules! gen_shift_impl {
+    ([$l:expr, $r:expr, $ret:expr], $( { $i1:ident, $i2:ident, $func:ident },)*) => {
+        match ($l.return_type(), $r.return_type()) {
+            $(
+                ($i1! { type_match_pattern }, $i2! { type_match_pattern }) => {
+                    Box::new(
+                        BinaryExpression::<
+                            $i1! { type_array },
+                            $i2! { type_array },
+                            $i1! { type_array },
+                            _
+                        >::new(
+                            $l,
+                            $r,
+                            $ret,
+                            $func::<
+                                <$i1! { type_array } as Array>::OwnedItem,
+                                <$i2! { type_array } as Array>::OwnedItem>,
+
+                        )
+                    )
+                },
+            )*
+            _ => {
+                unimplemented!("The expression ({:?}, {:?}, {:?}) using vectorized expression framework is not supported yet!", $l.return_type(), $r.return_type(), $ret)
+            }
+        }
+    };
+}
+
 /// Based on the data type of `$l`, `$r`, `$ret`, return corresponding expression struct with scalar
 /// function inside.
 /// * `$l`: left expression
@@ -117,58 +145,34 @@ macro_rules! gen_cmp_impl {
 /// * `general_f`: generic cmp function (require a common ``TryInto`` type for two input).
 /// * `str_f`: cmp function between str
 macro_rules! gen_binary_expr_cmp {
-    ($macro:ident, $general_f:ident, $str_f:ident, $l:expr, $r:expr, $ret:expr) => {
+    ($macro:ident, $general_f:ident, $op:ident, $l:expr, $r:expr, $ret:expr) => {
         match ($l.return_type(), $r.return_type()) {
             (DataType::Varchar, DataType::Varchar) => {
                 Box::new(BinaryExpression::<Utf8Array, Utf8Array, BoolArray, _>::new(
-                    $l, $r, $ret, $str_f,
+                    $l,
+                    $r,
+                    $ret,
+                    gen_str_cmp($op),
+                ))
+            }
+            (DataType::Struct { fields: _ }, DataType::Struct { fields: _ }) => Box::new(
+                BinaryExpression::<StructArray, StructArray, BoolArray, _>::new(
+                    $l,
+                    $r,
+                    $ret,
+                    gen_struct_cmp($op),
+                ),
+            ),
+            (DataType::List { datatype: _ }, DataType::List { datatype: _ }) => {
+                Box::new(BinaryExpression::<ListArray, ListArray, BoolArray, _>::new(
+                    $l,
+                    $r,
+                    $ret,
+                    gen_list_cmp($op),
                 ))
             }
             _ => {
-                $macro! {
-                    [$l, $r, $ret],
-                    { int16, int16, int16, $general_f },
-                    { int16, int32, int32, $general_f },
-                    { int16, int64, int64, $general_f },
-                    { int16, float32, float64, $general_f },
-                    { int16, float64, float64, $general_f },
-                    { int32, int16, int32, $general_f },
-                    { int32, int32, int32, $general_f },
-                    { int32, int64, int64, $general_f },
-                    { int32, float32, float64, $general_f },
-                    { int32, float64, float64, $general_f },
-                    { int64, int16,int64, $general_f },
-                    { int64, int32,int64, $general_f },
-                    { int64, int64, int64, $general_f },
-                    { int64, float32, float64 , $general_f},
-                    { int64, float64, float64, $general_f },
-                    { float32, int16, float64, $general_f },
-                    { float32, int32, float64, $general_f },
-                    { float32, int64, float64 , $general_f},
-                    { float32, float32, float32, $general_f },
-                    { float32, float64, float64, $general_f },
-                    { float64, int16, float64, $general_f },
-                    { float64, int32, float64, $general_f },
-                    { float64, int64, float64, $general_f },
-                    { float64, float32, float64, $general_f },
-                    { float64, float64, float64, $general_f },
-                    { decimal, int16, decimal, $general_f },
-                    { decimal, int32, decimal, $general_f },
-                    { decimal, int64, decimal, $general_f },
-                    { decimal, float32, float64, $general_f },
-                    { decimal, float64, float64, $general_f },
-                    { int16, decimal, decimal, $general_f },
-                    { int32, decimal, decimal, $general_f },
-                    { int64, decimal, decimal, $general_f },
-                    { decimal, decimal, decimal, $general_f },
-                    { float32, decimal, float64, $general_f },
-                    { float64, decimal, float64, $general_f },
-                    { timestamp, timestamp, timestamp, $general_f },
-                    { date, date, date, $general_f },
-                    { boolean, boolean, boolean, $general_f },
-                    { timestamp, date, timestamp, $general_f },
-                    { date, timestamp, timestamp, $general_f }
-                }
+                for_all_cmp_variants! {$macro, $l, $r, $ret, $general_f}
             }
         }
     };
@@ -236,6 +240,70 @@ macro_rules! gen_binary_expr_atm {
     };
 }
 
+/// `gen_binary_expr_bitwise` is similar to `gen_binary_expr_atm`.
+/// They are differentiate because bitwise operation only supports integral datatype.
+/// * `$general_f`: generic atm function (require a common ``TryInto`` type for two input)
+/// * `$i1`, `$i2`, `$rt`, `$func`: extra list passed to `$macro` directly
+macro_rules! gen_binary_expr_bitwise {
+    (
+        $macro:ident,
+        $l:expr,
+        $r:expr,
+        $ret:expr,
+        $general_f:ident,
+        {
+            $( { $i1:ident, $i2:ident, $rt:ident, $func:ident }, )*
+        } $(,)?
+    ) => {
+        $macro! {
+            [$l, $r, $ret],
+            { int16, int16, int16, $general_f },
+            { int16, int32, int32, $general_f },
+            { int16, int64, int64, $general_f },
+            { int32, int16, int32, $general_f },
+            { int32, int32, int32, $general_f },
+            { int32, int64, int64, $general_f },
+            { int64, int16,int64, $general_f },
+            { int64, int32,int64, $general_f },
+            { int64, int64, int64, $general_f },
+            $(
+                { $i1, $i2, $rt, $func },
+            )*
+        }
+    };
+}
+
+/// `gen_binary_expr_shift` is similar to `gen_binary_expr_bitwise`.
+/// They are differentiate because shift operation have different typing rules.
+/// * `$general_f`: generic atm function
+/// `$rt` is not required because Type of the output is same as the Type of LHS of expression.
+/// * `$i1`, `$i2`, `$func`: extra list passed to `$macro` directly
+macro_rules! gen_binary_expr_shift {
+    (
+        $macro:ident,
+        $l:expr,
+        $r:expr,
+        $ret:expr,
+        $general_f:ident,
+        {
+            $( { $i1:ident, $i2:ident, $func:ident }, )*
+        } $(,)?
+    ) => {
+        $macro! {
+            [$l, $r, $ret],
+            { int16, int16, $general_f },
+            { int32, int16, $general_f },
+            { int16, int32, $general_f },
+            { int32, int32, $general_f },
+            { int64, int16, $general_f },
+            { int64, int32, $general_f },
+            $(
+                { $i1, $i2, $func },
+            )*
+        }
+    };
+}
+
 fn build_extract_expr(ret: DataType, l: BoxedExpression, r: BoxedExpression) -> BoxedExpression {
     match r.return_type() {
         DataType::Date => Box::new(
@@ -265,25 +333,24 @@ pub fn new_binary_expr(
     r: BoxedExpression,
 ) -> BoxedExpression {
     use crate::expr::data_types::*;
-
     match expr_type {
         Type::Equal => {
-            gen_binary_expr_cmp! {gen_cmp_impl, general_eq, str_eq, l, r, ret}
+            gen_binary_expr_cmp! {gen_cmp_impl, general_eq, EQ, l, r, ret}
         }
         Type::NotEqual => {
-            gen_binary_expr_cmp! {gen_cmp_impl, general_ne, str_ne, l, r, ret}
+            gen_binary_expr_cmp! {gen_cmp_impl, general_ne, NE, l, r, ret}
         }
         Type::LessThan => {
-            gen_binary_expr_cmp! {gen_cmp_impl, general_lt, str_lt, l, r, ret}
+            gen_binary_expr_cmp! {gen_cmp_impl, general_lt, LT, l, r, ret}
         }
         Type::GreaterThan => {
-            gen_binary_expr_cmp! {gen_cmp_impl, general_gt, str_gt, l, r, ret}
+            gen_binary_expr_cmp! {gen_cmp_impl, general_gt, GT, l, r, ret}
         }
         Type::GreaterThanOrEqual => {
-            gen_binary_expr_cmp! {gen_cmp_impl, general_ge, str_ge, l, r, ret}
+            gen_binary_expr_cmp! {gen_cmp_impl, general_ge, GE, l, r, ret}
         }
         Type::LessThanOrEqual => {
-            gen_binary_expr_cmp! {gen_cmp_impl, general_le, str_le, l, r, ret}
+            gen_binary_expr_cmp! {gen_cmp_impl, general_le, LE, l, r, ret}
         }
         Type::Add => {
             gen_binary_expr_atm! {
@@ -294,8 +361,14 @@ pub fn new_binary_expr(
                     { timestamp, interval, timestamp, timestamp_interval_add },
                     { interval, timestamp, timestamp, interval_timestamp_add },
                     { interval, date, timestamp, interval_date_add },
+                    { interval, time, time, interval_time_add },
                     { date, interval, timestamp, date_interval_add },
+                    { date, int32, date, date_int_add },
+                    { int32, date, date, int_date_add },
+                    { date, time, timestamp, date_time_add },
+                    { time, date, timestamp, time_date_add },
                     { interval, interval, interval, general_add },
+                    { time, interval, time, time_interval_add },
                 },
             }
         }
@@ -309,7 +382,10 @@ pub fn new_binary_expr(
                     { timestamp, interval, timestamp, timestamp_interval_sub },
                     { date, date, int32, date_date_sub },
                     { date, interval, timestamp, date_interval_sub },
+                    { time, time, interval, time_time_sub },
+                    { time, interval, time, time_interval_sub },
                     { interval, interval, interval, general_sub },
+                    { date, int32, date, date_int_sub },
                 },
             }
         }
@@ -322,9 +398,16 @@ pub fn new_binary_expr(
                     { interval, int16, interval, interval_int_mul },
                     { interval, int32, interval, interval_int_mul },
                     { interval, int64, interval, interval_int_mul },
+                    { interval, float32, interval, interval_float_mul },
+                    { interval, float64, interval, interval_float_mul },
+                    { interval, decimal, interval, interval_float_mul },
+
                     { int16, interval, interval, int_interval_mul },
                     { int32, interval, interval, int_interval_mul },
                     { int64, interval, interval, int_interval_mul },
+                    { float32, interval, interval, float_interval_mul },
+                    { float64, interval, interval, float_interval_mul },
+                    { decimal, interval, interval, float_interval_mul },
                 },
             }
         }
@@ -334,6 +417,12 @@ pub fn new_binary_expr(
                 l, r, ret,
                 general_div,
                 {
+                    { interval, int16, interval, interval_float_div },
+                    { interval, int32, interval, interval_float_div },
+                    { interval, int64, interval, interval_float_div },
+                    { interval, float32, interval, interval_float_div },
+                    { interval, float64, interval, interval_float_div },
+                    { interval, decimal, interval, interval_float_div },
                 },
             }
         }
@@ -342,6 +431,54 @@ pub fn new_binary_expr(
                 gen_atm_impl,
                 l, r, ret,
                 general_mod,
+                {
+                },
+            }
+        }
+        // BitWise Operation
+        Type::BitwiseShiftLeft => {
+            gen_binary_expr_shift! {
+                gen_shift_impl,
+                l, r, ret,
+                general_shl,
+                {
+
+                },
+            }
+        }
+        Type::BitwiseShiftRight => {
+            gen_binary_expr_shift! {
+                gen_shift_impl,
+                l, r, ret,
+                general_shr,
+                {
+
+                },
+            }
+        }
+        Type::BitwiseAnd => {
+            gen_binary_expr_bitwise! {
+                gen_atm_impl,
+                l, r, ret,
+                general_bitand,
+                {
+                },
+            }
+        }
+        Type::BitwiseOr => {
+            gen_binary_expr_bitwise! {
+                gen_atm_impl,
+                l, r, ret,
+                general_bitor,
+                {
+                },
+            }
+        }
+        Type::BitwiseXor => {
+            gen_binary_expr_bitwise! {
+                gen_atm_impl,
+                l, r, ret,
+                general_bitxor,
                 {
                 },
             }
@@ -359,6 +496,8 @@ pub fn new_binary_expr(
             l, r, ret, position,
         )),
         Type::TumbleStart => new_tumble_start(l, r, ret),
+        Type::ConcatOp => new_concat_op(l, r, ret),
+
         tp => {
             unimplemented!(
                 "The expression {:?} using vectorized expression framework is not supported yet!",
@@ -504,7 +643,7 @@ mod tests {
                 .map(|x| Arc::new(x.into()))
                 .unwrap(),
         );
-        let data_chunk = DataChunk::builder().columns(vec![col1, col2]).build();
+        let data_chunk = DataChunk::new(vec![col1, col2], 100);
         let expr = make_expression(kind, &[TypeName::Int32, TypeName::Int32], &[0, 1]);
         let vec_executor = build_from_prost(&expr).unwrap();
         let res = vec_executor.eval(&data_chunk).unwrap();
@@ -512,6 +651,16 @@ mod tests {
         for (idx, item) in arr.iter().enumerate() {
             let x = target[idx].as_ref().map(|x| x.as_scalar_ref());
             assert_eq!(x, item);
+        }
+
+        for i in 0..lhs.len() {
+            let row = Row::new(vec![
+                lhs[i].map(|int| int.to_scalar_value()),
+                rhs[i].map(|int| int.to_scalar_value()),
+            ]);
+            let result = vec_executor.eval_row(&row).unwrap();
+            let expected = target[i].as_ref().cloned().map(|x| x.to_scalar_value());
+            assert_eq!(result, expected);
         }
     }
 
@@ -552,7 +701,7 @@ mod tests {
                 .map(|x| Arc::new(x.into()))
                 .unwrap(),
         );
-        let data_chunk = DataChunk::builder().columns(vec![col1, col2]).build();
+        let data_chunk = DataChunk::new(vec![col1, col2], 100);
         let expr = make_expression(kind, &[TypeName::Date, TypeName::Interval], &[0, 1]);
         let vec_executor = build_from_prost(&expr).unwrap();
         let res = vec_executor.eval(&data_chunk).unwrap();
@@ -560,6 +709,16 @@ mod tests {
         for (idx, item) in arr.iter().enumerate() {
             let x = target[idx].as_ref().map(|x| x.as_scalar_ref());
             assert_eq!(x, item);
+        }
+
+        for i in 0..lhs.len() {
+            let row = Row::new(vec![
+                lhs[i].map(|date| date.to_scalar_value()),
+                rhs[i].map(|date| date.to_scalar_value()),
+            ]);
+            let result = vec_executor.eval_row(&row).unwrap();
+            let expected = target[i].as_ref().cloned().map(|x| x.to_scalar_value());
+            assert_eq!(result, expected);
         }
     }
 
@@ -603,7 +762,7 @@ mod tests {
                 .map(|x| Arc::new(x.into()))
                 .unwrap(),
         );
-        let data_chunk = DataChunk::builder().columns(vec![col1, col2]).build();
+        let data_chunk = DataChunk::new(vec![col1, col2], 100);
         let expr = make_expression(kind, &[TypeName::Decimal, TypeName::Decimal], &[0, 1]);
         let vec_executor = build_from_prost(&expr).unwrap();
         let res = vec_executor.eval(&data_chunk).unwrap();
@@ -611,6 +770,16 @@ mod tests {
         for (idx, item) in arr.iter().enumerate() {
             let x = target[idx].as_ref().map(|x| x.as_scalar_ref());
             assert_eq!(x, item);
+        }
+
+        for i in 0..lhs.len() {
+            let row = Row::new(vec![
+                lhs[i].map(|dec| dec.to_scalar_value()),
+                rhs[i].map(|dec| dec.to_scalar_value()),
+            ]);
+            let result = vec_executor.eval_row(&row).unwrap();
+            let expected = target[i].as_ref().cloned().map(|x| x.to_scalar_value());
+            assert_eq!(result, expected);
         }
     }
 }

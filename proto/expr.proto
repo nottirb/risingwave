@@ -3,6 +3,7 @@ syntax = "proto3";
 package expr;
 
 import "data.proto";
+import "plan_common.proto";
 
 option optimize_for = SPEED;
 
@@ -29,9 +30,15 @@ message ExprNode {
     OR = 22;
     NOT = 23;
     IN = 24;
+    // bitwise operators
+    BITWISE_AND = 31;
+    BITWISE_OR = 32;
+    BITWISE_XOR = 33;
+    BITWISE_NOT = 34;
+    BITWISE_SHIFT_LEFT = 35;
+    BITWISE_SHIFT_RIGHT = 36;
     // date functions
     EXTRACT = 101;
-    PG_SLEEP = 102;
     TUMBLE_START = 103;
     // other functions
     CAST = 201;
@@ -54,6 +61,23 @@ message ExprNode {
     ASCII = 215;
     TRANSLATE = 216;
     COALESCE = 217;
+    CONCAT_WS = 218;
+    ABS = 219;
+    SPLIT_PART = 220;
+    CEIL = 221;
+    FLOOR = 222;
+    TO_CHAR = 223;
+    MD5 = 224;
+    CHAR_LENGTH = 225;
+    REPEAT = 226;
+    CONCAT_OP = 227;
+    // BOOL_OUT is different from CAST-bool-to-varchar in PostgreSQL.
+    BOOL_OUT = 228;
+    OCTET_LENGTH = 229;
+    BIT_LENGTH = 230;
+    OVERLAY = 231;
+    REGEXP_MATCH = 232;
+
     // Boolean comparison
     IS_TRUE = 301;
     IS_NOT_TRUE = 302;
@@ -61,14 +85,18 @@ message ExprNode {
     IS_NOT_FALSE = 304;
     IS_NULL = 305;
     IS_NOT_NULL = 306;
+    IS_DISTINCT_FROM = 307;
     // Unary operators
     NEG = 401;
     // Nested selection operators
     FIELD = 501;
+    // Array expression.
+    ARRAY = 521;
+    ARRAY_ACCESS = 522;
+    ROW = 523;
     // Search operator and Search ARGument
     SEARCH = 998;
     SARG = 999;
-    STREAM_NULL_BY_ROW_COUNT = 1000;
   }
   Type expr_type = 1;
   data.DataType return_type = 3;
@@ -79,8 +107,52 @@ message ExprNode {
   }
 }
 
+message TableFunction {
+  enum Type {
+    GENERATE = 0;
+    UNNEST = 1;
+    REGEXP_MATCHES = 2;
+  }
+  Type function_type = 1;
+  repeated expr.ExprNode args = 2;
+  data.DataType return_type = 3;
+}
+
 message InputRefExpr {
   int32 column_idx = 1;
+}
+
+// The items which can occur in the select list of `ProjectSet` operator.
+//
+// When there are table functions in the SQL query `SELECT ...`, it will be planned as `ProjectSet`.
+// Otherwise it will be planned as `Project`.
+//
+// # Examples
+//
+// ```sql
+// # Project
+// select 1;
+//
+// # ProjectSet
+// select unnest(array[1,2,3]);
+//
+// # ProjectSet (table function & usual expression)
+// select unnest(array[1,2,3]), 1;
+//
+// # ProjectSet (multiple table functions)
+// select unnest(array[1,2,3]), unnest(array[4,5]);
+//
+// # ProjectSet over ProjectSet (table function as parameters of table function)
+// select unnest(regexp_matches(v1, 'a(\d)c(\d)', 'g')) from t;
+//
+// # Project over ProjectSet (table function as parameters of usual function)
+// select unnest(regexp_matches(v1, 'a(\d)c(\d)', 'g')) from t;
+// ```
+message ProjectSetSelectItem {
+  oneof select_item {
+    expr.ExprNode expr = 1;
+    expr.TableFunction table_function = 2;
+  }
 }
 
 message ConstantValue {
@@ -89,6 +161,16 @@ message ConstantValue {
   // interval: encoded to (months, days, milliseconds), big-endianness
   // varchar: encoded accorded to encoding, currently only utf8 is supported.
   bytes body = 1;
+}
+
+// For serializing struct value to vec<bytes>.
+message StructValue {
+  repeated bytes fields = 1;
+}
+
+// For serializing list value to vec<bytes>.
+message ListValue {
+  repeated bytes fields = 1;
 }
 
 message FunctionCall {
@@ -106,6 +188,7 @@ message AggCall {
     AVG = 5;
     STRING_AGG = 6;
     SINGLE_VALUE = 7;
+    APPROX_COUNT_DISTINCT = 8;
   }
   message Arg {
     InputRefExpr input = 1;
@@ -115,4 +198,12 @@ message AggCall {
   repeated Arg args = 2;
   data.DataType return_type = 3;
   bool distinct = 4;
+  message OrderByField {
+    InputRefExpr input = 1;
+    data.DataType type = 2;
+    plan_common.OrderType direction = 3;
+    bool nulls_first = 4;
+  }
+  repeated OrderByField order_by_fields = 5;
+  ExprNode filter = 6;
 }

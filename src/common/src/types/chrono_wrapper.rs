@@ -12,18 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp::min;
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 
+use bytes::{BufMut, BytesMut};
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 
-use crate::error::ErrorCode::{InternalError, IoError};
+use super::{CheckedAdd, IntervalUnit};
+use crate::array::ArrayResult;
 use crate::error::{Result, RwError};
 use crate::util::value_encoding::error::ValueEncodingError;
 /// The same as `NaiveDate::from_ymd(1970, 1, 1).num_days_from_ce()`.
 /// Minus this magic number to store the number of days since 1970-01-01.
 pub const UNIX_EPOCH_DAYS: i32 = 719_163;
+const LEAP_DAYS: &[i32] = &[0, 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+const NORMAL_DAYS: &[i32] = &[0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
 macro_rules! impl_chrono_wrapper {
     ($({ $variant_name:ident, $chrono:ty, $_array:ident, $_builder:ident }),*) => {
@@ -105,17 +110,26 @@ impl NaiveDateWrapper {
         ))
     }
 
-    /// Converted to the number of days since 1970.1.1 for compatibility with existing Java
-    /// frontend. TODO: Save days directly when using Rust frontend.
-    pub fn to_protobuf<T: Write>(self, output: &mut T) -> Result<usize> {
+    pub fn to_protobuf<T: Write>(self, output: &mut T) -> ArrayResult<usize> {
         output
-            .write(&(self.0.num_days_from_ce() - UNIX_EPOCH_DAYS).to_be_bytes())
-            .map_err(|e| RwError::from(IoError(e)))
+            .write(&(self.0.num_days_from_ce()).to_be_bytes())
+            .map_err(Into::into)
     }
 
-    pub fn from_protobuf(days: i32) -> Result<Self> {
-        Self::with_days(days + UNIX_EPOCH_DAYS)
-            .map_err(|e| RwError::from(InternalError(e.to_string())))
+    pub fn to_protobuf_owned(&self) -> Vec<u8> {
+        self.0.num_days_from_ce().to_be_bytes().to_vec()
+    }
+
+    pub fn from_protobuf(days: i32) -> ArrayResult<Self> {
+        Self::with_days(days).map_err(Into::into)
+    }
+
+    pub fn from_protobuf_bytes(b: &[u8]) -> ArrayResult<Self> {
+        let days = i32::from_be_bytes(
+            b.try_into()
+                .map_err(|e| anyhow::anyhow!("Failed to deserialize date, reason: {:?}", e))?,
+        );
+        Self::from_protobuf(days)
     }
 }
 
@@ -134,22 +148,35 @@ impl NaiveTimeWrapper {
         ))
     }
 
-    /// Converted to microsecond timestamps for compatibility with existing Java frontend.
-    /// TODO: Save nanoseconds directly when using Rust frontend.
-    pub fn to_protobuf<T: Write>(self, output: &mut T) -> Result<usize> {
-        output
-            .write(
-                &(self.0.num_seconds_from_midnight() as i64 * 1_000_000
-                    + self.0.nanosecond() as i64 / 1000)
-                    .to_be_bytes(),
-            )
-            .map_err(|e| RwError::from(IoError(e)))
+    pub fn to_protobuf_owned(&self) -> Vec<u8> {
+        let buf = BytesMut::with_capacity(8);
+        let mut writer = buf.writer();
+        self.to_protobuf(&mut writer).unwrap();
+        writer.into_inner().to_vec()
     }
 
-    pub fn from_protobuf(timestamp_micro: i64) -> Result<Self> {
-        let secs = (timestamp_micro / 1_000_000) as u32;
-        let nano = (timestamp_micro % 1_000_000) as u32 * 1000;
-        Self::with_secs_nano(secs, nano).map_err(|e| RwError::from(InternalError(e.to_string())))
+    pub fn to_protobuf<T: Write>(self, output: &mut T) -> ArrayResult<usize> {
+        output
+            .write(
+                &(self.0.num_seconds_from_midnight() as u64 * 1_000_000_000
+                    + self.0.nanosecond() as u64)
+                    .to_be_bytes(),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn from_protobuf(nano: u64) -> ArrayResult<Self> {
+        let secs = (nano / 1_000_000_000) as u32;
+        let nano = (nano % 1_000_000_000) as u32;
+        Self::with_secs_nano(secs, nano).map_err(Into::into)
+    }
+
+    pub fn from_protobuf_bytes(b: &[u8]) -> ArrayResult<Self> {
+        let nanos = u64::from_be_bytes(
+            b.try_into()
+                .map_err(|e| anyhow::anyhow!("Failed to deserialize time, reason: {:?}", e))?,
+        );
+        Self::from_protobuf(nanos)
     }
 }
 
@@ -171,34 +198,29 @@ impl NaiveDateTimeWrapper {
     }
 
     /// Although `NaiveDateTime` takes 12 bytes, we drop 4 bytes in protobuf encoding.
-    /// Converted to microsecond timestamps for compatibility with existing Java frontend.
-    /// TODO: Consider another way to save when using Rust frontend. Nanosecond timestamp can only
-    /// represent about 584 years
-    pub fn to_protobuf<T: Write>(self, output: &mut T) -> Result<usize> {
+    /// TODO: Consider another way to save. Nanosecond timestamp can only represent about 584 years.
+    pub fn to_protobuf<T: Write>(self, output: &mut T) -> ArrayResult<usize> {
         output
-            .write(&(self.0.timestamp_nanos() / 1000).to_be_bytes())
-            .map_err(|e| RwError::from(IoError(e)))
+            .write(&(self.0.timestamp_nanos()).to_be_bytes())
+            .map_err(Into::into)
     }
 
-    pub fn from_protobuf(timestamp_micro: i64) -> Result<Self> {
-        let secs = timestamp_micro / 1_000_000;
-        let nsecs = (timestamp_micro % 1_000_000) as u32 * 1000;
-        Self::with_secs_nsecs(secs, nsecs).map_err(|e| RwError::from(InternalError(e.to_string())))
+    pub fn to_protobuf_owned(&self) -> Vec<u8> {
+        self.0.timestamp_nanos().to_be_bytes().to_vec()
     }
 
-    pub fn parse_from_str(s: &str) -> Result<Self> {
-        Ok(NaiveDateTimeWrapper::new(
-            NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
-                .map_err(|e| RwError::from(InternalError(e.to_string())))?,
-        ))
+    pub fn from_protobuf(timestamp_nanos: i64) -> ArrayResult<Self> {
+        let secs = timestamp_nanos / 1_000_000_000;
+        let nsecs = (timestamp_nanos % 1_000_000_000) as u32;
+        Self::with_secs_nsecs(secs, nsecs).map_err(Into::into)
     }
 
-    pub fn sub(&self, rhs: NaiveDateTimeWrapper) -> Duration {
-        self.0 - rhs.0
-    }
-
-    pub fn add(&self, duration: Duration) -> Self {
-        NaiveDateTimeWrapper::new(self.0 + duration)
+    pub fn from_protobuf_bytes(b: &[u8]) -> ArrayResult<Self> {
+        let nanos =
+            i64::from_be_bytes(b.try_into().map_err(|e| {
+                anyhow::anyhow!("Failed to deserialize date time, reason: {:?}", e)
+            })?);
+        Self::from_protobuf(nanos)
     }
 }
 
@@ -207,5 +229,61 @@ impl TryFrom<NaiveDateWrapper> for NaiveDateTimeWrapper {
 
     fn try_from(date: NaiveDateWrapper) -> Result<Self> {
         Ok(NaiveDateTimeWrapper::new(date.0.and_hms(0, 0, 0)))
+    }
+}
+
+/// return the days of the `year-month`
+fn get_mouth_days(year: i32, month: usize) -> i32 {
+    if is_leap_year(year) {
+        LEAP_DAYS[month]
+    } else {
+        NORMAL_DAYS[month]
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+impl CheckedAdd<IntervalUnit> for NaiveDateTimeWrapper {
+    type Output = NaiveDateTimeWrapper;
+
+    fn checked_add(self, rhs: IntervalUnit) -> Option<NaiveDateTimeWrapper> {
+        let mut date = self.0.date();
+        if rhs.get_months() != 0 {
+            // NaiveDate don't support add months. We need calculate manually
+            let mut day = date.day() as i32;
+            let mut month = date.month() as i32;
+            let mut year = date.year();
+            // Calculate the number of year in this interval
+            let interval_months = rhs.get_months();
+            let year_diff = interval_months / 12;
+            year += year_diff;
+
+            // Calculate the number of month in this interval except the added year
+            // The range of month_diff is (-12, 12) (The month is negative when the interval is
+            // negative)
+            let month_diff = interval_months - year_diff * 12;
+            // The range of new month is (-12, 24) ( original month:[1, 12] + month_diff:(-12, 12) )
+            month += month_diff;
+            // Process the overflow months
+            if month > 12 {
+                year += 1;
+                month -= 12;
+            } else if month <= 0 {
+                year -= 1;
+                month += 12;
+            }
+
+            // Fix the days after changing date.
+            // For example, 1970.1.31 + 1 month = 1970.2.28
+            day = min(day, get_mouth_days(year, month as usize));
+            date = NaiveDate::from_ymd(year, month as u32, day as u32);
+        }
+        let mut datetime = NaiveDateTime::new(date, self.0.time());
+        datetime = datetime.checked_add_signed(Duration::days(rhs.get_days().into()))?;
+        datetime = datetime.checked_add_signed(Duration::milliseconds(rhs.get_ms()))?;
+
+        Some(NaiveDateTimeWrapper::new(datetime))
     }
 }

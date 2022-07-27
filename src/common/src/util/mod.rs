@@ -23,6 +23,7 @@ pub mod addr;
 pub mod bit_util;
 pub mod chunk_coalesce;
 pub mod compress;
+pub mod debug_context;
 pub mod encoding_for_comparison;
 pub mod env_var;
 pub mod hash_util;
@@ -32,7 +33,12 @@ pub mod sort_util;
 #[macro_use]
 pub mod try_match;
 pub mod epoch;
+mod future_utils;
+pub mod scan_range;
 pub mod value_encoding;
+pub mod worker_util;
+
+pub use future_utils::select_all;
 
 pub fn downcast_ref<S, T>(source: &S) -> Result<&T>
 where

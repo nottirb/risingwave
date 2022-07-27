@@ -17,7 +17,47 @@ use risingwave_common::error::{ErrorCode, Result, RwError};
 use risingwave_common::types::DataType;
 use risingwave_expr::expr::AggKind;
 
-use super::{Expr, ExprImpl};
+use super::{Expr, ExprImpl, ExprRewriter};
+use crate::optimizer::property::Direction;
+use crate::utils::Condition;
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct AggOrderByExpr {
+    pub expr: ExprImpl,
+    pub direction: Direction,
+    pub nulls_first: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct AggOrderBy {
+    pub sort_exprs: Vec<AggOrderByExpr>,
+}
+
+impl AggOrderBy {
+    pub fn any() -> Self {
+        Self {
+            sort_exprs: Vec::new(),
+        }
+    }
+
+    pub fn new(sort_exprs: Vec<AggOrderByExpr>) -> Self {
+        Self { sort_exprs }
+    }
+
+    pub fn rewrite_expr(self, rewriter: &mut (impl ExprRewriter + ?Sized)) -> Self {
+        Self {
+            sort_exprs: self
+                .sort_exprs
+                .into_iter()
+                .map(|e| AggOrderByExpr {
+                    expr: rewriter.rewrite_expr(e.expr),
+                    direction: e.direction,
+                    nulls_first: e.nulls_first,
+                })
+                .collect(),
+        }
+    }
+}
 
 #[derive(Clone, Eq, PartialEq, Hash)]
 pub struct AggCall {
@@ -25,6 +65,8 @@ pub struct AggCall {
     return_type: DataType,
     inputs: Vec<ExprImpl>,
     distinct: bool,
+    order_by: AggOrderBy,
+    filter: Condition,
 }
 
 impl std::fmt::Debug for AggCall {
@@ -34,6 +76,7 @@ impl std::fmt::Debug for AggCall {
                 .field("agg_kind", &self.agg_kind)
                 .field("return_type", &self.return_type)
                 .field("inputs", &self.inputs)
+                .field("filter", &self.filter)
                 .finish()
         } else {
             let mut builder = f.debug_tuple(&format!("{}", self.agg_kind));
@@ -46,20 +89,36 @@ impl std::fmt::Debug for AggCall {
 }
 
 impl AggCall {
-    pub fn infer_return_type(agg_kind: &AggKind, inputs: &[DataType]) -> Option<DataType> {
+    /// Infer the return type for the given agg call.
+    /// Returns error if not supported or the arguments are invalid.
+    pub fn infer_return_type(agg_kind: &AggKind, inputs: &[DataType]) -> Result<DataType> {
+        let invalid = || {
+            let args = inputs.iter().map(|t| format!("{:?}", t)).join(", ");
+            Err(RwError::from(ErrorCode::InvalidInputSyntax(format!(
+                "Invalid aggregation: {}({})",
+                agg_kind, args
+            ))))
+        };
+
         // The function signatures are aligned with postgres, see
         // https://www.postgresql.org/docs/current/functions-aggregate.html.
         let return_type = match (&agg_kind, inputs) {
-            (AggKind::Min, [input]) => input.clone(),
-            (AggKind::Max, [input]) => input.clone(),
+            // Min, Max
+            (AggKind::Min | AggKind::Max, [input]) => input.clone(),
+            (AggKind::Min | AggKind::Max, _) => return invalid(),
+
+            // Avg
             (AggKind::Avg, [input]) => match input {
                 DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Decimal => {
                     DataType::Decimal
                 }
                 DataType::Float32 | DataType::Float64 => DataType::Float64,
                 DataType::Interval => DataType::Interval,
-                _ => return None,
+                _ => return invalid(),
             },
+            (AggKind::Avg, _) => return invalid(),
+
+            // Sum
             (AggKind::Sum, [input]) => match input {
                 DataType::Int16 => DataType::Int64,
                 DataType::Int32 => DataType::Int64,
@@ -68,42 +127,53 @@ impl AggCall {
                 DataType::Float32 => DataType::Float32,
                 DataType::Float64 => DataType::Float64,
                 DataType::Interval => DataType::Interval,
-                _ => return None,
+                _ => return invalid(),
             },
-            (AggKind::Count, _) => DataType::Int64,
-            (other_kind, other_inputs) => {
-                todo!(
-                    "Unsupported aggregate function: {:?} with {} inputs",
-                    other_kind,
-                    other_inputs.len()
-                )
-            }
+            (AggKind::Sum, _) => return invalid(),
+
+            // Count
+            (AggKind::Count | AggKind::ApproxCountDistinct, _) => DataType::Int64,
+
+            // StringAgg
+            (AggKind::StringAgg, _) => DataType::Varchar,
+
+            // SingleValue
+            (AggKind::SingleValue, [input]) => input.clone(),
+            (AggKind::SingleValue, _) => return invalid(),
         };
-        Some(return_type)
+
+        Ok(return_type)
     }
 
     /// Returns error if the function name matches with an existing function
     /// but with illegal arguments.
-    pub fn new(agg_kind: AggKind, inputs: Vec<ExprImpl>, distinct: bool) -> Result<Self> {
-        // TODO(TaoWu): Add arguments validator.
+    pub fn new(
+        agg_kind: AggKind,
+        inputs: Vec<ExprImpl>,
+        distinct: bool,
+        order_by: AggOrderBy,
+        filter: Condition,
+    ) -> Result<Self> {
         let data_types = inputs.iter().map(ExprImpl::return_type).collect_vec();
-        let return_type = Self::infer_return_type(&agg_kind, &data_types).ok_or_else(|| {
-            let args = data_types.iter().map(|t| format!("{:?}", t)).join(", ");
-            RwError::from(ErrorCode::NotImplemented(
-                format!("No function matches to {}({})", agg_kind, args),
-                None.into(),
-            ))
-        })?;
+        let return_type = Self::infer_return_type(&agg_kind, &data_types)?;
         Ok(AggCall {
             agg_kind,
             return_type,
             inputs,
             distinct,
+            order_by,
+            filter,
         })
     }
 
-    pub fn decompose(self) -> (AggKind, Vec<ExprImpl>, bool) {
-        (self.agg_kind, self.inputs, self.distinct)
+    pub fn decompose(self) -> (AggKind, Vec<ExprImpl>, bool, AggOrderBy, Condition) {
+        (
+            self.agg_kind,
+            self.inputs,
+            self.distinct,
+            self.order_by,
+            self.filter,
+        )
     }
 
     pub fn agg_kind(&self) -> AggKind {
@@ -114,7 +184,12 @@ impl AggCall {
     pub fn inputs(&self) -> &[ExprImpl] {
         self.inputs.as_ref()
     }
+
+    pub fn inputs_mut(&mut self) -> &mut [ExprImpl] {
+        self.inputs.as_mut()
+    }
 }
+
 impl Expr for AggCall {
     fn return_type(&self) -> DataType {
         self.return_type.clone()

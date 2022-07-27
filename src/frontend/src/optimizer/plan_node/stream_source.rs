@@ -14,7 +14,6 @@
 
 use std::fmt;
 
-use risingwave_pb::plan_common::TableRefId;
 use risingwave_pb::stream_plan::stream_node::NodeBody as ProstStreamNode;
 use risingwave_pb::stream_plan::SourceNode;
 
@@ -34,8 +33,8 @@ impl StreamSource {
             logical.ctx(),
             logical.schema().clone(),
             logical.pk_indices().to_vec(),
-            Distribution::any().clone(),
-            false, // TODO: determine the `append-only` field of source
+            Distribution::SomeShard,
+            logical.source_catalog().append_only,
         );
         Self { base, logical }
     }
@@ -53,24 +52,21 @@ impl_plan_tree_node_for_leaf! { StreamSource }
 
 impl fmt::Display for StreamSource {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "StreamSource {{ source: {},  columns: [{}] }}",
-            self.logical.source_catalog.name,
-            self.column_names().join(", ")
-        )
+        let mut builder = f.debug_struct("StreamSource");
+        builder
+            .field("source", &self.logical.source_catalog.name)
+            .field(
+                "columns",
+                &format_args!("[{}]", &self.column_names().join(", ")),
+            )
+            .finish()
     }
 }
 
 impl ToStreamProst for StreamSource {
     fn to_stream_prost_body(&self) -> ProstStreamNode {
         ProstStreamNode::Source(SourceNode {
-            // TODO: Refactor this id
-            table_ref_id: TableRefId {
-                table_id: self.logical.source_catalog.id as i32,
-                ..Default::default()
-            }
-            .into(),
+            table_id: self.logical.source_catalog.id,
             column_ids: self
                 .logical
                 .source_catalog
@@ -79,7 +75,6 @@ impl ToStreamProst for StreamSource {
                 .map(|c| c.column_id().into())
                 .collect(),
             source_type: self.logical.source_catalog.source_type as i32,
-            stream_source_state: None,
         })
     }
 }

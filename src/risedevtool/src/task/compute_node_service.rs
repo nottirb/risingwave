@@ -73,30 +73,8 @@ impl ComputeNodeService {
         let provide_aws_s3 = config.provide_aws_s3.as_ref().unwrap();
         let provide_compute_node = config.provide_compute_node.as_ref().unwrap();
 
-        let is_shared_backend = match (
-            config.enable_in_memory_kv_state_backend,
-            provide_minio.as_slice(),
-            provide_aws_s3.as_slice(),
-        ) {
-            (true, [], []) => {
-                cmd.arg("--state-store").arg("in-memory");
-                false
-            }
-            (true, _, _) => {
-                return Err(anyhow!(
-                    "When `enable_in_memory_kv_state_backend` is enabled, no minio and aws-s3 should be provided.",
-                ));
-            }
-            (false, [], []) => {
-                cmd.arg("--state-store").arg("hummock+memory");
-                false
-            }
-            (false, provide_minio, provide_aws_s3) => {
-                add_storage_backend(&config.id, provide_minio, provide_aws_s3, cmd)?;
-                true
-            }
-        };
-
+        let is_shared_backend =
+            add_storage_backend(&config.id, provide_minio, provide_aws_s3, true, cmd)?;
         if provide_compute_node.len() > 1 && !is_shared_backend {
             return Err(anyhow!(
                 "should use a shared backend (e.g. MinIO) for multiple compute-node configuration. Consider adding `use: minio` in risedev config."
@@ -126,7 +104,16 @@ impl Task for ComputeNodeService {
 
         let mut cmd = self.compute_node()?;
 
-        cmd.env("RUST_BACKTRACE", "1");
+        cmd.env("RUST_BACKTRACE", "1").env(
+            "TOKIO_CONSOLE_BIND",
+            format!("127.0.0.1:{}", self.config.port + 1000),
+        );
+        if crate::util::is_env_set("RISEDEV_ENABLE_PROFILE") {
+            cmd.env(
+                "RW_PROFILE_PATH",
+                Path::new(&env::var("PREFIX_LOG")?).join(format!("profile-{}", self.id())),
+            );
+        }
         cmd.arg("--config-path")
             .arg(Path::new(&prefix_config).join("risingwave.toml"));
         Self::apply_command_args(&mut cmd, &self.config)?;

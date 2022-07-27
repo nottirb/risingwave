@@ -16,8 +16,9 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 use risingwave_common::array::column::Column;
-use risingwave_common::array::{ArrayBuilderImpl, ArrayImpl, Op, Row, RowRef, StreamChunk};
-use risingwave_common::error::Result;
+use risingwave_common::array::{
+    ArrayBuilderImpl, ArrayImpl, ArrayResult, Op, Row, RowRef, StreamChunk,
+};
 use risingwave_common::types::DataType;
 
 /// Build a array and it's corresponding operations.
@@ -52,55 +53,66 @@ pub struct StreamChunkBuilder {
     size: usize,
 }
 
+impl Drop for StreamChunkBuilder {
+    fn drop(&mut self) {
+        assert_eq!(self.size, 0, "dropping non-empty stream chunk builder");
+    }
+}
+
 impl StreamChunkBuilder {
     pub fn new(
         capacity: usize,
         data_types: &[DataType],
         update_start_pos: usize,
         matched_start_pos: usize,
-    ) -> Result<Self> {
-        // TODO: assert `capacity != 0`
-        let ops = Vec::with_capacity(capacity);
+    ) -> ArrayResult<Self> {
+        // Leave room for paired `UpdateDelete` and `UpdateInsert`. When there are `capacity - 1`
+        // ops in current builder and the last op is `UpdateDelete`, we delay the chunk generation
+        // until `UpdateInsert` comes. This means that the effective output message size will indeed
+        // be at most the original `capacity`
+        let reduced_capacity = capacity - 1;
+        assert!(reduced_capacity > 0);
+
+        let ops = Vec::with_capacity(reduced_capacity);
         let column_builders = data_types
             .iter()
-            .map(|datatype| datatype.create_array_builder(capacity))
-            .collect::<Result<Vec<_>>>()?;
+            .map(|datatype| datatype.create_array_builder(reduced_capacity))
+            .collect();
         Ok(Self {
             ops,
             column_builders,
             data_types: data_types.to_owned(),
             update_start_pos,
             matched_start_pos,
-            capacity,
+            capacity: reduced_capacity,
             size: 0,
         })
     }
 
-    /// Append a row with coming update value and matched value, while tracking the chunk size under
-    /// the capacity limit
+    /// Increase chunk size
     ///
     /// A [`StreamChunk`] will be returned when `size == capacity`
-    pub fn append_row_with_limit(
-        &mut self,
-        op: Op,
-        row_update: &RowRef<'_>,
-        row_matched: &Row,
-    ) -> Result<Option<StreamChunk>> {
-        self.append_row(op, row_update, row_matched)?;
-
-        // TODO: check `size == 0` when builder is dropped
+    fn inc_size(&mut self) -> ArrayResult<Option<StreamChunk>> {
         self.size += 1;
-        if self.size == self.capacity {
+
+        // Take a chunk when capacity is exceeded, but splitting `UpdateDelete` and `UpdateInsert`
+        // should be avoided
+        if self.size >= self.capacity && self.ops[self.ops.len() - 1] != Op::UpdateDelete {
             self.take()
         } else {
             Ok(None)
         }
     }
 
-    // TODO(wzl): refactor following methods with limit
-
-    /// Append a row with coming update value and matched value.
-    pub fn append_row(&mut self, op: Op, row_update: &RowRef<'_>, row_matched: &Row) -> Result<()> {
+    /// Append a row with coming update value and matched value
+    ///
+    /// A [`StreamChunk`] will be returned when `size == capacity`
+    pub fn append_row(
+        &mut self,
+        op: Op,
+        row_update: &RowRef<'_>,
+        row_matched: &Row,
+    ) -> ArrayResult<Option<StreamChunk>> {
         self.ops.push(op);
         for (i, d) in row_update.values().enumerate() {
             self.column_builders[i + self.update_start_pos].append_datum_ref(d)?;
@@ -109,11 +121,17 @@ impl StreamChunkBuilder {
             self.column_builders[i + self.matched_start_pos].append_datum(d)?;
         }
 
-        Ok(())
+        self.inc_size()
     }
 
     /// Append a row with coming update value and fill the other side with null.
-    pub fn append_row_update(&mut self, op: Op, row_update: &RowRef<'_>) -> Result<()> {
+    ///
+    /// A [`StreamChunk`] will be returned when `size == capacity`
+    pub fn append_row_update(
+        &mut self,
+        op: Op,
+        row_update: &RowRef<'_>,
+    ) -> ArrayResult<Option<StreamChunk>> {
         self.ops.push(op);
         for (i, d) in row_update.values().enumerate() {
             self.column_builders[i + self.update_start_pos].append_datum_ref(d)?;
@@ -122,11 +140,17 @@ impl StreamChunkBuilder {
             self.column_builders[i + self.matched_start_pos].append_datum(&None)?;
         }
 
-        Ok(())
+        self.inc_size()
     }
 
     /// append a row with matched value and fill the coming side with null.
-    pub fn append_row_matched(&mut self, op: Op, row_matched: &Row) -> Result<()> {
+    ///
+    /// A [`StreamChunk`] will be returned when `size == capacity`
+    pub fn append_row_matched(
+        &mut self,
+        op: Op,
+        row_matched: &Row,
+    ) -> ArrayResult<Option<StreamChunk>> {
         self.ops.push(op);
         for i in 0..self.column_builders.len() - row_matched.size() {
             self.column_builders[i + self.update_start_pos].append_datum_ref(None)?;
@@ -134,32 +158,18 @@ impl StreamChunkBuilder {
         for i in 0..row_matched.size() {
             self.column_builders[i + self.matched_start_pos].append_datum(&row_matched[i])?;
         }
-        Ok(())
+
+        self.inc_size()
     }
 
-    pub fn finish(self) -> Result<StreamChunk> {
-        let new_arrays = self
-            .column_builders
-            .into_iter()
-            .map(|builder| builder.finish())
-            .collect::<Result<Vec<_>>>()?;
-
-        let new_columns = new_arrays
-            .into_iter()
-            .map(|array_impl| Column::new(Arc::new(array_impl)))
-            .collect::<Vec<_>>();
-
-        Ok(StreamChunk::new(self.ops, new_columns, None))
-    }
-
-    pub fn take(&mut self) -> Result<Option<StreamChunk>> {
+    pub fn take(&mut self) -> ArrayResult<Option<StreamChunk>> {
         self.size = 0;
         let new_arrays: Vec<ArrayImpl> = self
             .column_builders
             .iter_mut()
             .zip_eq(&self.data_types)
             .map(|(builder, datatype)| {
-                std::mem::replace(builder, datatype.create_array_builder(self.capacity)?).finish()
+                std::mem::replace(builder, datatype.create_array_builder(self.capacity)).finish()
             })
             .try_collect()?;
         let new_columns = new_arrays

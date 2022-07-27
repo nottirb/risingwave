@@ -21,6 +21,7 @@ use risingwave_pb::stream_plan::stream_node::NodeBody as ProstStreamNode;
 use risingwave_pb::stream_plan::StreamNode as ProstStreamPlan;
 
 use super::{LogicalScan, PlanBase, PlanNodeId, StreamIndexScan, ToStreamProst};
+use crate::catalog::ColumnId;
 use crate::optimizer::property::Distribution;
 
 /// `StreamTableScan` is a virtual plan node to represent a stream table scan. It will be converted
@@ -38,13 +39,24 @@ impl StreamTableScan {
         let ctx = logical.base.ctx.clone();
 
         let batch_plan_id = ctx.next_plan_node_id();
+
+        let distribution = {
+            let distribution_key = logical
+                .distribution_key()
+                .expect("distribution key of stream chain must exist in output columns");
+            if distribution_key.is_empty() {
+                Distribution::Single
+            } else {
+                // Follows upstream distribution from TableCatalog
+                Distribution::HashShard(distribution_key)
+            }
+        };
         let base = PlanBase::new_stream(
             ctx,
             logical.schema().clone(),
             logical.base.pk_indices.clone(),
-            // follows upstream distribution from TableCatalog
-            Distribution::HashShard(logical.map_distribution_keys()),
-            false, // TODO: determine the `append-only` field of table scan
+            distribution,
+            logical.table_desc().appendonly,
         );
         Self {
             base,
@@ -70,13 +82,29 @@ impl_plan_tree_node_for_leaf! { StreamTableScan }
 
 impl fmt::Display for StreamTableScan {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "StreamTableScan {{ table: {}, columns: [{}], pk_indices: {:?} }}",
-            self.logical.table_name(),
-            self.logical.column_names().join(", "),
-            self.base.pk_indices
-        )
+        let verbose = self.base.ctx.is_explain_verbose();
+        let mut builder = f.debug_struct("StreamTableScan");
+
+        builder
+            .field("table", &format_args!("{}", self.logical.table_name()))
+            .field(
+                "columns",
+                &format_args!(
+                    "[{}]",
+                    match verbose {
+                        false => self.logical.column_names(),
+                        true => self.logical.column_names_with_table_prefix(),
+                    }
+                    .join(", ")
+                ),
+            )
+            .field("pk_indices", &format_args!("{:?}", self.base.pk_indices));
+
+        if verbose {
+            builder.field("distribution", &self.distribution());
+        }
+
+        builder.finish()
     }
 }
 
@@ -92,34 +120,13 @@ impl StreamTableScan {
         use risingwave_pb::stream_plan::*;
 
         let batch_plan_node = BatchPlanNode {
-            table_ref_id: Some(TableRefId {
-                table_id: self.logical.table_desc().table_id.table_id as i32,
-                schema_ref_id: Default::default(),
-            }),
-            column_descs: self
-                .schema()
-                .fields()
+            table_desc: Some(self.logical.table_desc().to_protobuf()),
+            column_ids: self
+                .logical
+                .output_column_ids()
                 .iter()
-                .zip_eq(self.logical.column_descs().iter())
-                .zip_eq(self.logical.column_names().iter())
-                .map(|((field, col), column_name)| ColumnDesc {
-                    column_type: Some(field.data_type().to_protobuf()),
-                    column_id: col.column_id.into(),
-                    name: column_name.clone(),
-                    field_descs: vec![],
-                    type_name: "".to_string(),
-                })
+                .map(ColumnId::get_id)
                 .collect(),
-            distribution_keys: self
-                .base
-                .dist
-                .dist_column_indices()
-                .iter()
-                .map(|k| *k as i32)
-                .collect_vec(),
-            // Will fill when resolving chain node.
-            hash_mapping: None,
-            parallel_unit_id: 0,
         };
 
         let pk_indices = self.base.pk_indices.iter().map(|x| *x as u32).collect_vec();
@@ -147,12 +154,9 @@ impl StreamTableScan {
                 },
             ],
             node_body: Some(ProstStreamNode::Chain(ChainNode {
+                table_id: self.logical.table_desc().table_id.table_id,
                 same_worker_node: false,
                 disable_rearrange: false,
-                table_ref_id: Some(TableRefId {
-                    table_id: self.logical.table_desc().table_id.table_id as i32,
-                    schema_ref_id: None, // TODO: fill schema ref id
-                }),
                 // The fields from upstream
                 upstream_fields: self
                     .logical
@@ -171,6 +175,7 @@ impl StreamTableScan {
                     .iter()
                     .map(|x| x.column_id.get_id())
                     .collect(),
+                is_singleton: *self.distribution() == Distribution::Single,
             })),
             pk_indices,
             operator_id: if auto_fields {

@@ -13,18 +13,18 @@
 // limitations under the License.
 
 use prost::Message;
-use risingwave_hummock_sdk::HummockEpoch;
-use risingwave_pb::hummock::{HummockContextRefId, HummockPinnedSnapshot};
+use risingwave_hummock_sdk::HummockContextId;
+use risingwave_pb::hummock::HummockPinnedSnapshot;
 
 use crate::model::MetadataModel;
 
 /// Column family name for hummock pinned snapshot
-/// `cf(hummock_pinned_snapshot)`: `HummockContextRefId` -> `HummockPinnedSnapshot`
+/// `cf(hummock_pinned_snapshot)`: `HummockContextId` -> `HummockPinnedSnapshot`
 const HUMMOCK_PINNED_SNAPSHOT_CF_NAME: &str = "cf/hummock_pinned_snapshot";
 
 /// `HummockPinnedSnapshot` tracks pinned snapshots by given context id.
 impl MetadataModel for HummockPinnedSnapshot {
-    type KeyType = HummockContextRefId;
+    type KeyType = HummockContextId;
     type ProstType = HummockPinnedSnapshot;
 
     fn cf_name() -> String {
@@ -44,30 +44,6 @@ impl MetadataModel for HummockPinnedSnapshot {
     }
 
     fn key(&self) -> risingwave_common::error::Result<Self::KeyType> {
-        Ok(HummockContextRefId {
-            id: self.context_id,
-        })
-    }
-}
-
-pub trait HummockPinnedSnapshotExt {
-    fn pin_snapshot(&mut self, new_snapshot_id: HummockEpoch);
-
-    fn unpin_snapshot(&mut self, pinned_snapshot_id: HummockEpoch);
-}
-
-impl HummockPinnedSnapshotExt for HummockPinnedSnapshot {
-    fn pin_snapshot(&mut self, epoch: HummockEpoch) {
-        let found = self.snapshot_id.iter().position(|&v| v == epoch);
-        if found.is_none() {
-            self.snapshot_id.push(epoch);
-        }
-    }
-
-    fn unpin_snapshot(&mut self, epoch: HummockEpoch) {
-        let found = self.snapshot_id.iter().position(|&v| v == epoch);
-        if let Some(pos) = found {
-            self.snapshot_id.remove(pos);
-        }
+        Ok(self.context_id)
     }
 }

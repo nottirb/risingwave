@@ -12,24 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
+use risingwave_common::catalog::TableId;
 use risingwave_common::error::{tonic_err, ErrorCode};
 use risingwave_pb::hummock::hummock_manager_service_server::HummockManagerService;
 use risingwave_pb::hummock::*;
 use tonic::{Request, Response, Status};
 
-use crate::hummock::{CompactorManager, HummockManagerRef, VacuumTrigger};
+use crate::hummock::compaction::ManualCompactionOption;
+use crate::hummock::compaction_group::manager::CompactionGroupManagerRef;
+use crate::hummock::{CompactorManagerRef, HummockManagerRef, VacuumTrigger};
 use crate::rpc::service::RwReceiverStream;
 use crate::storage::MetaStore;
+use crate::stream::FragmentManagerRef;
 
 pub struct HummockServiceImpl<S>
 where
     S: MetaStore,
 {
     hummock_manager: HummockManagerRef<S>,
-    compactor_manager: Arc<CompactorManager>,
+    compactor_manager: CompactorManagerRef,
     vacuum_trigger: Arc<VacuumTrigger<S>>,
+    compaction_group_manager: CompactionGroupManagerRef<S>,
+    fragment_manager: FragmentManagerRef<S>,
 }
 
 impl<S> HummockServiceImpl<S>
@@ -38,13 +45,17 @@ where
 {
     pub fn new(
         hummock_manager: HummockManagerRef<S>,
-        compactor_manager: Arc<CompactorManager>,
+        compactor_manager: CompactorManagerRef,
         vacuum_trigger: Arc<VacuumTrigger<S>>,
+        compaction_group_manager: CompactionGroupManagerRef<S>,
+        fragment_manager: FragmentManagerRef<S>,
     ) -> Self {
         HummockServiceImpl {
             hummock_manager,
             compactor_manager,
             vacuum_trigger,
+            compaction_group_manager,
+            fragment_manager,
         }
     }
 }
@@ -66,10 +77,14 @@ where
             .pin_version(req.context_id, req.last_pinned)
             .await;
         match result {
-            Ok(pinned_version) => Ok(Response::new(PinVersionResponse {
-                status: None,
-                pinned_version: Some(pinned_version),
-            })),
+            Ok((is_delta_response, version_deltas, pinned_version)) => {
+                Ok(Response::new(PinVersionResponse {
+                    status: None,
+                    is_delta_response,
+                    version_deltas,
+                    pinned_version,
+                }))
+            }
             Err(e) => Err(tonic_err(e)),
         }
     }
@@ -79,30 +94,24 @@ where
         request: Request<UnpinVersionRequest>,
     ) -> Result<Response<UnpinVersionResponse>, Status> {
         let req = request.into_inner();
-        let result = self
-            .hummock_manager
-            .unpin_version(req.context_id, req.pinned_version_ids)
-            .await;
+        let result = self.hummock_manager.unpin_version(req.context_id).await;
         match result {
             Ok(_) => Ok(Response::new(UnpinVersionResponse { status: None })),
             Err(e) => Err(tonic_err(e)),
         }
     }
 
-    async fn add_tables(
+    async fn unpin_version_before(
         &self,
-        request: Request<AddTablesRequest>,
-    ) -> Result<Response<AddTablesResponse>, Status> {
+        request: Request<UnpinVersionBeforeRequest>,
+    ) -> Result<Response<UnpinVersionBeforeResponse>, Status> {
         let req = request.into_inner();
         let result = self
             .hummock_manager
-            .add_tables(req.context_id, req.tables, req.epoch)
+            .unpin_version_before(req.context_id, req.unpin_version_before)
             .await;
         match result {
-            Ok(version) => Ok(Response::new(AddTablesResponse {
-                status: None,
-                version: Some(version),
-            })),
+            Ok(_) => Ok(Response::new(UnpinVersionBeforeResponse { status: None })),
             Err(e) => Err(tonic_err(e)),
         }
     }
@@ -136,10 +145,7 @@ where
         request: Request<PinSnapshotRequest>,
     ) -> Result<Response<PinSnapshotResponse>, Status> {
         let req = request.into_inner();
-        let result = self
-            .hummock_manager
-            .pin_snapshot(req.context_id, req.last_pinned)
-            .await;
+        let result = self.hummock_manager.pin_snapshot(req.context_id).await;
         match result {
             Ok(hummock_snapshot) => Ok(Response::new(PinSnapshotResponse {
                 status: None,
@@ -154,38 +160,25 @@ where
         request: Request<UnpinSnapshotRequest>,
     ) -> Result<Response<UnpinSnapshotResponse>, Status> {
         let req = request.into_inner();
-        if let Err(e) = self
-            .hummock_manager
-            .unpin_snapshot(req.context_id, req.snapshots)
-            .await
-        {
+        if let Err(e) = self.hummock_manager.unpin_snapshot(req.context_id).await {
             return Err(tonic_err(e));
         }
         Ok(Response::new(UnpinSnapshotResponse { status: None }))
     }
 
-    async fn commit_epoch(
+    async fn unpin_snapshot_before(
         &self,
-        request: Request<CommitEpochRequest>,
-    ) -> Result<Response<CommitEpochResponse>, Status> {
+        request: Request<UnpinSnapshotBeforeRequest>,
+    ) -> Result<Response<UnpinSnapshotBeforeResponse>, Status> {
         let req = request.into_inner();
-        let result = self.hummock_manager.commit_epoch(req.epoch).await;
-        match result {
-            Ok(_) => Ok(Response::new(CommitEpochResponse { status: None })),
-            Err(e) => Err(tonic_err(e)),
+        if let Err(e) = self
+            .hummock_manager
+            .unpin_snapshot_before(req.context_id, req.min_snapshot.unwrap())
+            .await
+        {
+            return Err(tonic_err(e));
         }
-    }
-
-    async fn abort_epoch(
-        &self,
-        request: Request<AbortEpochRequest>,
-    ) -> Result<Response<AbortEpochResponse>, Status> {
-        let req = request.into_inner();
-        let result = self.hummock_manager.abort_epoch(req.epoch).await;
-        match result {
-            Ok(_) => Ok(Response::new(AbortEpochResponse { status: None })),
-            Err(e) => Err(tonic_err(e)),
-        }
+        Ok(Response::new(UnpinSnapshotBeforeResponse { status: None }))
     }
 
     async fn get_new_table_id(
@@ -230,5 +223,96 @@ where
                 .map_err(tonic_err)?;
         }
         Ok(Response::new(ReportVacuumTaskResponse { status: None }))
+    }
+
+    async fn get_compaction_groups(
+        &self,
+        _request: Request<GetCompactionGroupsRequest>,
+    ) -> Result<Response<GetCompactionGroupsResponse>, Status> {
+        let resp = GetCompactionGroupsResponse {
+            status: None,
+            compaction_groups: self
+                .compaction_group_manager
+                .compaction_groups()
+                .await
+                .iter()
+                .map(|cg| cg.into())
+                .collect(),
+        };
+        Ok(Response::new(resp))
+    }
+
+    async fn trigger_manual_compaction(
+        &self,
+        request: Request<TriggerManualCompactionRequest>,
+    ) -> Result<Response<TriggerManualCompactionResponse>, Status> {
+        let request = request.into_inner();
+        let compaction_group_id = request.compaction_group_id;
+        let mut option = ManualCompactionOption {
+            level: request.level as usize,
+            ..Default::default()
+        };
+
+        // rewrite the key_range
+        match request.key_range {
+            Some(key_range) => {
+                option.key_range = key_range;
+            }
+
+            None => {
+                option.key_range = KeyRange {
+                    inf: true,
+                    ..Default::default()
+                }
+            }
+        }
+
+        // get internal_table_id by fragment_manager
+        let table_id = TableId::new(request.table_id);
+        if let Ok(table_frgament) = self
+            .fragment_manager
+            .select_table_fragments_by_table_id(&table_id)
+            .await
+        {
+            option.internal_table_id = HashSet::from_iter(table_frgament.internal_table_ids());
+        }
+        option.internal_table_id.insert(request.table_id); // need to handle outter table_id (mv)
+
+        tracing::info!(
+            "Try trigger_manual_compaction compaction_group_id {} option {:?}",
+            compaction_group_id,
+            &option
+        );
+
+        let result_state = match self
+            .hummock_manager
+            .trigger_manual_compaction(compaction_group_id, option)
+            .await
+        {
+            Ok(_) => None,
+
+            Err(error) => {
+                return Err(tonic_err(error));
+            }
+        };
+
+        let resp = TriggerManualCompactionResponse {
+            status: result_state,
+        };
+        Ok(Response::new(resp))
+    }
+
+    async fn get_epoch(
+        &self,
+        _request: Request<GetEpochRequest>,
+    ) -> Result<Response<GetEpochResponse>, Status> {
+        let result = self.hummock_manager.get_last_epoch();
+        match result {
+            Ok(hummock_snapshot) => Ok(Response::new(GetEpochResponse {
+                status: None,
+                snapshot: Some(hummock_snapshot),
+            })),
+            Err(e) => Err(tonic_err(e)),
+        }
     }
 }

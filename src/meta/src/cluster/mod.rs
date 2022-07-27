@@ -23,25 +23,21 @@ use std::time::{Duration, SystemTime};
 use itertools::Itertools;
 use risingwave_common::error::{internal_error, ErrorCode, Result};
 use risingwave_common::try_match_expand;
+use risingwave_common::types::ParallelUnitId;
 use risingwave_pb::common::worker_node::State;
-use risingwave_pb::common::{HostAddress, ParallelUnit, ParallelUnitType, WorkerNode, WorkerType};
+use risingwave_pb::common::{HostAddress, ParallelUnit, WorkerNode, WorkerType};
 use risingwave_pb::meta::subscribe_response::{Info, Operation};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot::Sender;
 use tokio::sync::{RwLock, RwLockReadGuard};
 use tokio::task::JoinHandle;
 
-use crate::manager::{
-    HashMappingManager, HashMappingManagerRef, IdCategory, LocalNotification, MetaSrvEnv, TableId,
-};
+use crate::manager::{IdCategory, LocalNotification, MetaSrvEnv};
 use crate::model::{MetadataModel, Worker, INVALID_EXPIRE_AT};
 use crate::storage::MetaStore;
 
 pub type WorkerId = u32;
-pub type ParallelUnitId = u32;
 pub type WorkerLocations = HashMap<WorkerId, WorkerNode>;
 pub type ClusterManagerRef<S> = Arc<ClusterManager<S>>;
-
-const DEFAULT_WORK_NODE_PARALLEL_DEGREE: usize = 4;
 
 #[derive(Debug)]
 pub struct WorkerKey(pub HostAddress);
@@ -68,7 +64,6 @@ pub struct ClusterManager<S: MetaStore> {
     env: MetaSrvEnv<S>,
 
     max_heartbeat_interval: Duration,
-    hash_mapping_manager: HashMappingManagerRef<S>,
 
     core: RwLock<ClusterManagerCore>,
 }
@@ -80,12 +75,9 @@ where
     pub async fn new(env: MetaSrvEnv<S>, max_heartbeat_interval: Duration) -> Result<Self> {
         let meta_store = env.meta_store_ref();
         let core = ClusterManagerCore::new(meta_store.clone()).await?;
-        let compute_nodes = core.list_worker_node(WorkerType::ComputeNode, None);
-        let dispatch_manager = Arc::new(HashMappingManager::new(&compute_nodes, meta_store).await?);
 
         Ok(Self {
             env,
-            hash_mapping_manager: dispatch_manager,
             max_heartbeat_interval,
             core: RwLock::new(core),
         })
@@ -103,12 +95,14 @@ where
     /// (via `activate_worker_node`) to set its state to `Running`.
     pub async fn add_worker_node(
         &self,
-        host_address: HostAddress,
         r#type: WorkerType,
-    ) -> Result<(WorkerNode, bool)> {
+        host_address: HostAddress,
+        worker_node_parallelism: usize,
+    ) -> Result<WorkerNode> {
         let mut core = self.core.write().await;
         match core.get_worker_by_host(host_address.clone()) {
-            Some(worker) => Ok((worker.to_protobuf(), false)),
+            // TODO(zehua): update parallelism when the worker exists.
+            Some(worker) => Ok(worker.to_protobuf()),
             None => {
                 // Generate worker id.
                 let worker_id = self
@@ -118,12 +112,9 @@ where
                     .await? as WorkerId;
 
                 // Generate parallel units.
-                let parallel_units = if r#type == WorkerType::ComputeNode {
-                    self.generate_cn_parallel_units(DEFAULT_WORK_NODE_PARALLEL_DEGREE, worker_id)
-                        .await?
-                } else {
-                    vec![]
-                };
+                let parallel_units = self
+                    .generate_cn_parallel_units(worker_node_parallelism, worker_id)
+                    .await?;
 
                 // Construct worker.
                 let worker_node = WorkerNode {
@@ -134,13 +125,6 @@ where
                     parallel_units,
                 };
 
-                // Alter consistent hash mapping.
-                if r#type == WorkerType::ComputeNode {
-                    self.hash_mapping_manager
-                        .add_worker_node(&worker_node)
-                        .await?;
-                }
-
                 let worker = Worker::from_protobuf(worker_node.clone());
 
                 // Persist worker node.
@@ -149,7 +133,7 @@ where
                 // Update core.
                 core.add_worker_node(worker);
 
-                Ok((worker_node, true))
+                Ok(worker_node)
             }
         }
     }
@@ -181,12 +165,6 @@ where
         let worker = core.get_worker_by_host_checked(host_address.clone())?;
         let worker_type = worker.worker_type();
         let worker_node = worker.to_protobuf();
-        // Alter consistent hash mapping.
-        if worker_type == WorkerType::ComputeNode {
-            self.hash_mapping_manager
-                .delete_worker_node(&worker.worker_node)
-                .await?;
-        }
 
         // Persist deletion.
         Worker::delete(self.env.meta_store(), &host_address).await?;
@@ -227,8 +205,8 @@ where
     pub async fn start_heartbeat_checker(
         cluster_manager: ClusterManagerRef<S>,
         check_interval: Duration,
-    ) -> (JoinHandle<()>, UnboundedSender<()>) {
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::unbounded_channel();
+    ) -> (JoinHandle<()>, Sender<()>) {
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
         let join_handle = tokio::spawn(async move {
             let mut min_interval = tokio::time::interval(check_interval);
             loop {
@@ -236,8 +214,8 @@ where
                     // Wait for interval
                     _ = min_interval.tick() => {},
                     // Shutdown
-                    _ = shutdown_rx.recv() => {
-                        tracing::info!("Heartbeat checker is shutting down");
+                    _ = &mut shutdown_rx => {
+                        tracing::info!("Heartbeat checker is stopped");
                         return;
                     }
                 }
@@ -251,11 +229,7 @@ where
                     .await
                     .workers
                     .values()
-                    // TODO: Java frontend doesn't send heartbeat. Remove this line after using Rust
-                    // frontend.
-                    .filter(|worker| {
-                        worker.worker_type() != WorkerType::Frontend && worker.expire_at() < now
-                    })
+                    .filter(|worker| worker.expire_at() < now)
                     .cloned()
                     .collect_vec();
                 // 1. Initialize new workers' expire_at.
@@ -317,45 +291,17 @@ where
         core.list_worker_node(worker_type, worker_state)
     }
 
-    pub async fn list_parallel_units(
-        &self,
-        parallel_unit_type: Option<ParallelUnitType>,
-    ) -> Vec<ParallelUnit> {
+    pub async fn list_parallel_units(&self) -> Vec<ParallelUnit> {
         let core = self.core.read().await;
-        core.list_parallel_units(parallel_unit_type)
+        core.list_parallel_units()
     }
 
-    pub async fn get_parallel_unit_count(
-        &self,
-        parallel_unit_type: Option<ParallelUnitType>,
-    ) -> usize {
+    pub async fn get_parallel_unit_count(&self) -> usize {
         let core = self.core.read().await;
-        core.get_parallel_unit_count(parallel_unit_type)
+        core.get_parallel_unit_count()
     }
 
-    /// Get default hash mapping, which uses all hash parallel units in the cluster.
-    pub async fn get_hash_mapping(&self) -> Vec<ParallelUnitId> {
-        self.hash_mapping_manager.get_default_mapping().await
-    }
-
-    /// Get hash mapping for a specific relational state table. If the mapping does not exist yet,
-    /// then build one and return the mapping.
-    pub async fn get_table_hash_mapping(&self, table_id: &TableId) -> Result<Vec<ParallelUnitId>> {
-        match self.hash_mapping_manager.get_table_mapping(table_id).await {
-            Some(mapping) => Ok(mapping),
-            None => {
-                self.hash_mapping_manager
-                    .build_table_mapping(*table_id)
-                    .await?;
-                Ok(self
-                    .hash_mapping_manager
-                    .get_table_mapping(table_id)
-                    .await
-                    .unwrap())
-            }
-        }
-    }
-
+    /// Generate `parallel_degree` parallel units.
     async fn generate_cn_parallel_units(
         &self,
         parallel_degree: usize,
@@ -366,21 +312,12 @@ where
             .id_gen_manager()
             .generate_interval::<{ IdCategory::ParallelUnit }>(parallel_degree as i32)
             .await? as ParallelUnitId;
-        let mut parallel_units = Vec::with_capacity(parallel_degree);
-        let single_parallel_unit = ParallelUnit {
-            id: start_id,
-            r#type: ParallelUnitType::Single as i32,
-            worker_node_id: worker_id,
-        };
-        parallel_units.push(single_parallel_unit);
-        (start_id + 1..start_id + parallel_degree as ParallelUnitId).for_each(|id| {
-            let hash_parallel_unit = ParallelUnit {
+        let parallel_units = (start_id..start_id + parallel_degree as ParallelUnitId)
+            .map(|id| ParallelUnit {
                 id,
-                r#type: ParallelUnitType::Hash as i32,
                 worker_node_id: worker_id,
-            };
-            parallel_units.push(hash_parallel_unit);
-        });
+            })
+            .collect();
         Ok(parallel_units)
     }
 
@@ -393,9 +330,8 @@ pub struct ClusterManagerCore {
     /// Record for workers in the cluster.
     workers: HashMap<WorkerKey, Worker>,
 
-    /// Record for parallel units of different types.
-    single_parallel_units: Vec<ParallelUnit>,
-    hash_parallel_units: Vec<ParallelUnit>,
+    /// Record for parallel units.
+    parallel_units: Vec<ParallelUnit>,
 }
 
 impl ClusterManagerCore {
@@ -405,27 +341,16 @@ impl ClusterManagerCore {
     {
         let workers = try_match_expand!(Worker::list(&*meta_store).await, Ok, "Worker::list fail")?;
         let mut worker_map = HashMap::new();
-        let mut single_parallel_units = Vec::new();
-        let mut hash_parallel_units = Vec::new();
+        let mut parallel_units = Vec::new();
 
-        workers.iter().for_each(|w| {
+        workers.into_iter().for_each(|w| {
             worker_map.insert(WorkerKey(w.key().unwrap()), w.clone());
-            w.worker_node
-                .parallel_units
-                .iter()
-                .for_each(|parallel_unit| {
-                    if parallel_unit.r#type == ParallelUnitType::Single as i32 {
-                        single_parallel_units.push(parallel_unit.clone());
-                    } else {
-                        hash_parallel_units.push(parallel_unit.clone());
-                    }
-                });
+            parallel_units.extend(w.worker_node.parallel_units);
         });
 
         Ok(Self {
             workers: worker_map,
-            single_parallel_units,
-            hash_parallel_units,
+            parallel_units,
         })
     }
 
@@ -447,17 +372,8 @@ impl ClusterManagerCore {
     }
 
     fn add_worker_node(&mut self, worker: Worker) {
-        worker
-            .worker_node
-            .parallel_units
-            .iter()
-            .for_each(|parallel_unit| {
-                if parallel_unit.r#type == ParallelUnitType::Single as i32 {
-                    self.single_parallel_units.push(parallel_unit.clone());
-                } else {
-                    self.hash_parallel_units.push(parallel_unit.clone());
-                }
-            });
+        self.parallel_units
+            .extend(worker.worker_node.parallel_units.clone());
         self.workers
             .insert(WorkerKey(worker.key().unwrap()), worker);
     }
@@ -473,13 +389,7 @@ impl ClusterManagerCore {
             .parallel_units
             .iter()
             .for_each(|parallel_unit| {
-                if parallel_unit.r#type == ParallelUnitType::Single as i32 {
-                    self.single_parallel_units
-                        .retain(|p| p.id != parallel_unit.id);
-                } else {
-                    self.hash_parallel_units
-                        .retain(|p| p.id != parallel_unit.id);
-                }
+                self.parallel_units.retain(|p| p.id != parallel_unit.id);
             });
         self.workers.remove(&WorkerKey(worker.key().unwrap()));
     }
@@ -500,27 +410,12 @@ impl ClusterManagerCore {
             .collect::<Vec<_>>()
     }
 
-    fn list_parallel_units(
-        &self,
-        parallel_unit_type: Option<ParallelUnitType>,
-    ) -> Vec<ParallelUnit> {
-        match parallel_unit_type {
-            Some(ParallelUnitType::Single) => self.single_parallel_units.clone(),
-            Some(ParallelUnitType::Hash) => self.hash_parallel_units.clone(),
-            None => {
-                let mut all_parallel_units = self.single_parallel_units.clone();
-                all_parallel_units.extend(self.hash_parallel_units.clone());
-                all_parallel_units
-            }
-        }
+    fn list_parallel_units(&self) -> Vec<ParallelUnit> {
+        self.parallel_units.clone()
     }
 
-    fn get_parallel_unit_count(&self, parallel_unit_type: Option<ParallelUnitType>) -> usize {
-        match parallel_unit_type {
-            Some(ParallelUnitType::Single) => self.single_parallel_units.len(),
-            Some(ParallelUnitType::Hash) => self.hash_parallel_units.len(),
-            None => self.single_parallel_units.len() + self.hash_parallel_units.len(),
-        }
+    fn get_parallel_unit_count(&self) -> usize {
+        self.parallel_units.len()
     }
 
     fn update_worker_ttl(&mut self, host_address: HostAddress, ttl: Duration) {
@@ -543,8 +438,6 @@ impl ClusterManagerCore {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use super::*;
     use crate::hummock::test_utils::setup_compute_env;
     use crate::storage::MemStore;
@@ -561,21 +454,21 @@ mod tests {
 
         let mut worker_nodes = Vec::new();
         let worker_count = 5usize;
+        let fake_parallelism = 4;
         for i in 0..worker_count {
             let fake_host_address = HostAddress {
                 host: "localhost".to_string(),
                 port: 5000 + i as i32,
             };
-            let (worker_node, _) = cluster_manager
-                .add_worker_node(fake_host_address, WorkerType::ComputeNode)
+            let worker_node = cluster_manager
+                .add_worker_node(WorkerType::ComputeNode, fake_host_address, fake_parallelism)
                 .await
                 .unwrap();
             worker_nodes.push(worker_node);
         }
 
-        let single_parallel_count = worker_count;
-        let hash_parallel_count = (DEFAULT_WORK_NODE_PARALLEL_DEGREE - 1) * worker_count;
-        assert_cluster_manager(&cluster_manager, single_parallel_count, hash_parallel_count).await;
+        let parallel_count = fake_parallelism * worker_count;
+        assert_cluster_manager(&cluster_manager, parallel_count).await;
 
         let worker_to_delete_count = 4usize;
         for i in 0..worker_to_delete_count {
@@ -588,34 +481,17 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert_cluster_manager(&cluster_manager, 1, DEFAULT_WORK_NODE_PARALLEL_DEGREE - 1).await;
-
-        let mapping = cluster_manager
-            .hash_mapping_manager
-            .get_default_mapping()
-            .await;
-        let unique_parallel_units = HashSet::<ParallelUnitId>::from_iter(mapping.into_iter());
-        assert_eq!(
-            unique_parallel_units.len(),
-            DEFAULT_WORK_NODE_PARALLEL_DEGREE - 1
-        );
+        assert_cluster_manager(&cluster_manager, fake_parallelism).await;
 
         Ok(())
     }
 
     async fn assert_cluster_manager(
         cluster_manager: &ClusterManager<MemStore>,
-        single_parallel_count: usize,
-        hash_parallel_count: usize,
+        parallel_count: usize,
     ) {
-        let single_parallel_units = cluster_manager
-            .list_parallel_units(Some(ParallelUnitType::Single))
-            .await;
-        let hash_parallel_units = cluster_manager
-            .list_parallel_units(Some(ParallelUnitType::Hash))
-            .await;
-        assert_eq!(single_parallel_units.len(), single_parallel_count);
-        assert_eq!(hash_parallel_units.len(), hash_parallel_count);
+        let parallel_units = cluster_manager.list_parallel_units().await;
+        assert_eq!(parallel_units.len(), parallel_count);
     }
 
     // This test takes seconds because the TTL is measured in seconds.
@@ -628,8 +504,13 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 2,
         };
-        let (_worker_node_2, _) = cluster_manager
-            .add_worker_node(fake_host_address_2, WorkerType::ComputeNode)
+        let fake_parallelism = 4;
+        let _worker_node_2 = cluster_manager
+            .add_worker_node(
+                WorkerType::ComputeNode,
+                fake_host_address_2,
+                fake_parallelism,
+            )
             .await
             .unwrap();
         // Two live nodes

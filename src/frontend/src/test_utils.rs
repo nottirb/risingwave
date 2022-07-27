@@ -13,21 +13,28 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-use std::error::Error;
 use std::io::Write;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 use pgwire::pg_response::PgResponse;
-use pgwire::pg_server::{Session, SessionManager};
-use risingwave_common::catalog::{TableId, DEFAULT_DATABASE_NAME, DEFAULT_SCHEMA_NAME};
+use pgwire::pg_server::{BoxedError, Session, SessionManager, UserAuthenticator};
+use risingwave_common::catalog::{
+    TableId, DEFAULT_DATABASE_NAME, DEFAULT_SCHEMA_NAME, DEFAULT_SUPER_USER, DEFAULT_SUPER_USER_ID,
+    NON_RESERVED_USER_ID, PG_CATALOG_SCHEMA_NAME,
+};
 use risingwave_common::error::Result;
 use risingwave_pb::catalog::table::OptionalAssociatedSourceId;
 use risingwave_pb::catalog::{
-    Database as ProstDatabase, Schema as ProstSchema, Source as ProstSource, Table as ProstTable,
+    Database as ProstDatabase, Schema as ProstSchema, Sink as ProstSink, Source as ProstSource,
+    Table as ProstTable,
 };
-use risingwave_pb::stream_plan::StreamNode;
+use risingwave_pb::common::ParallelUnitMapping;
+use risingwave_pb::meta::list_table_fragments_response::TableFragmentInfo;
+use risingwave_pb::stream_plan::StreamFragmentGraph;
+use risingwave_pb::user::{GrantPrivilege, UserInfo};
+use risingwave_rpc_client::error::Result as RpcResult;
 use risingwave_sqlparser::ast::Statement;
 use risingwave_sqlparser::parser::Parser;
 use tempfile::{Builder, NamedTempFile};
@@ -39,7 +46,10 @@ use crate::catalog::{DatabaseId, SchemaId};
 use crate::meta_client::FrontendMetaClient;
 use crate::optimizer::PlanRef;
 use crate::planner::Planner;
-use crate::session::{FrontendEnv, OptimizerContext, SessionImpl};
+use crate::session::{AuthContext, FrontendEnv, OptimizerContext, SessionImpl};
+use crate::user::user_manager::UserInfoManager;
+use crate::user::user_service::UserInfoWriter;
+use crate::user::UserId;
 use crate::FrontendOpts;
 
 /// An embedded frontend without starting meta and without starting frontend as a tcp server.
@@ -49,15 +59,19 @@ pub struct LocalFrontend {
 }
 
 impl SessionManager for LocalFrontend {
+    type Session = SessionImpl;
+
     fn connect(
         &self,
         _database: &str,
-    ) -> std::result::Result<Arc<dyn Session>, Box<dyn Error + Send + Sync>> {
+        _user_name: &str,
+    ) -> std::result::Result<Arc<Self::Session>, BoxedError> {
         Ok(self.session_ref())
     }
 }
 
 impl LocalFrontend {
+    #[expect(clippy::unused_async)]
     pub async fn new(opts: FrontendOpts) -> Self {
         let env = FrontendEnv::mock();
         Self { opts, env }
@@ -68,7 +82,7 @@ impl LocalFrontend {
         sql: impl Into<String>,
     ) -> std::result::Result<PgResponse, Box<dyn std::error::Error + Send + Sync>> {
         let sql = sql.into();
-        self.session_ref().run_statement(sql.as_str()).await
+        self.session_ref().run_statement(sql.as_str(), false).await
     }
 
     pub async fn query_formatted_result(&self, sql: impl Into<String>) -> Vec<String> {
@@ -81,8 +95,9 @@ impl LocalFrontend {
     }
 
     /// Convert a sql (must be an `Query`) into an unoptimized batch plan.
-    pub async fn to_batch_plan(&self, sql: impl Into<String>) -> Result<PlanRef> {
-        let statements = Parser::parse_sql(&sql.into()).unwrap();
+    pub fn to_batch_plan(&self, sql: impl Into<String>) -> Result<PlanRef> {
+        let raw_sql = &sql.into();
+        let statements = Parser::parse_sql(raw_sql).unwrap();
         let statement = statements.get(0).unwrap();
         if let Statement::Query(query) = statement {
             let session = self.session_ref();
@@ -94,7 +109,7 @@ impl LocalFrontend {
                 );
                 binder.bind(Statement::Query(query.clone()))?
             };
-            Planner::new(OptimizerContext::new(session).into())
+            Planner::new(OptimizerContext::new(session, Arc::from(raw_sql.as_str())).into())
                 .plan(bound)
                 .unwrap()
                 .gen_batch_query_plan()
@@ -106,7 +121,12 @@ impl LocalFrontend {
     pub fn session_ref(&self) -> Arc<SessionImpl> {
         Arc::new(SessionImpl::new(
             self.env.clone(),
-            DEFAULT_DATABASE_NAME.to_string(),
+            Arc::new(AuthContext::new(
+                DEFAULT_DATABASE_NAME.to_string(),
+                DEFAULT_SUPER_USER.to_string(),
+                DEFAULT_SUPER_USER_ID,
+            )),
+            UserAuthenticator::None,
         ))
     }
 }
@@ -120,20 +140,32 @@ pub struct MockCatalogWriter {
 
 #[async_trait::async_trait]
 impl CatalogWriter for MockCatalogWriter {
-    async fn create_database(&self, db_name: &str) -> Result<()> {
+    async fn create_database(&self, db_name: &str, owner: UserId) -> Result<()> {
+        let database_id = self.gen_id();
         self.catalog.write().create_database(ProstDatabase {
             name: db_name.to_string(),
-            id: self.gen_id(),
+            id: database_id,
+            owner,
         });
+        self.create_schema(database_id, DEFAULT_SCHEMA_NAME, owner)
+            .await?;
+        self.create_schema(database_id, PG_CATALOG_SCHEMA_NAME, owner)
+            .await?;
         Ok(())
     }
 
-    async fn create_schema(&self, db_id: DatabaseId, schema_name: &str) -> Result<()> {
+    async fn create_schema(
+        &self,
+        db_id: DatabaseId,
+        schema_name: &str,
+        owner: UserId,
+    ) -> Result<()> {
         let id = self.gen_id();
         self.catalog.write().create_schema(ProstSchema {
             id,
             name: schema_name.to_string(),
             database_id: db_id,
+            owner,
         });
         self.add_schema_id(id, db_id);
         Ok(())
@@ -142,9 +174,14 @@ impl CatalogWriter for MockCatalogWriter {
     async fn create_materialized_view(
         &self,
         mut table: ProstTable,
-        _plan: StreamNode,
+        _graph: StreamFragmentGraph,
     ) -> Result<()> {
         table.id = self.gen_id();
+        table.mapping = Some(ParallelUnitMapping {
+            table_id: table.id,
+            original_indices: [0, 10, 20].to_vec(),
+            data: [1, 2, 3].to_vec(),
+        });
         self.catalog.write().create_table(&table);
         self.add_table_or_source_id(table.id, table.schema_id, table.database_id);
         Ok(())
@@ -154,17 +191,21 @@ impl CatalogWriter for MockCatalogWriter {
         &self,
         source: ProstSource,
         mut table: ProstTable,
-        plan: StreamNode,
+        graph: StreamFragmentGraph,
     ) -> Result<()> {
         let source_id = self.create_source_inner(source)?;
         table.optional_associated_source_id =
             Some(OptionalAssociatedSourceId::AssociatedSourceId(source_id));
-        self.create_materialized_view(table, plan).await?;
+        self.create_materialized_view(table, graph).await?;
         Ok(())
     }
 
     async fn create_source(&self, source: ProstSource) -> Result<()> {
         self.create_source_inner(source).map(|_| ())
+    }
+
+    async fn create_sink(&self, sink: ProstSink) -> Result<()> {
+        self.create_sink_inner(sink).map(|_| ())
     }
 
     async fn drop_materialized_source(&self, source_id: u32, table_id: TableId) -> Result<()> {
@@ -179,11 +220,27 @@ impl CatalogWriter for MockCatalogWriter {
         Ok(())
     }
 
+    async fn drop_materialized_view(&self, table_id: TableId) -> Result<()> {
+        let (database_id, schema_id) = self.drop_table_or_source_id(table_id.table_id);
+        self.catalog
+            .write()
+            .drop_table(database_id, schema_id, table_id);
+        Ok(())
+    }
+
     async fn drop_source(&self, source_id: u32) -> Result<()> {
         let (database_id, schema_id) = self.drop_table_or_source_id(source_id);
         self.catalog
             .write()
             .drop_source(database_id, schema_id, source_id);
+        Ok(())
+    }
+
+    async fn drop_sink(&self, sink_id: u32) -> Result<()> {
+        let (database_id, schema_id) = self.drop_table_or_sink_id(sink_id);
+        self.catalog
+            .write()
+            .drop_sink(database_id, schema_id, sink_id);
         Ok(())
     }
 
@@ -197,33 +254,33 @@ impl CatalogWriter for MockCatalogWriter {
         self.catalog.write().drop_schema(database_id, schema_id);
         Ok(())
     }
-
-    async fn drop_materialized_view(&self, table_id: TableId) -> Result<()> {
-        let (database_id, schema_id) = self.drop_table_or_source_id(table_id.table_id);
-        self.drop_table_or_source_id(table_id.table_id);
-        self.catalog
-            .write()
-            .drop_table(database_id, schema_id, table_id);
-        Ok(())
-    }
 }
 
 impl MockCatalogWriter {
     pub fn new(catalog: Arc<RwLock<Catalog>>) -> Self {
         catalog.write().create_database(ProstDatabase {
-            name: DEFAULT_DATABASE_NAME.to_string(),
             id: 0,
+            name: DEFAULT_DATABASE_NAME.to_string(),
+            owner: DEFAULT_SUPER_USER_ID,
         });
         catalog.write().create_schema(ProstSchema {
-            id: 0,
+            id: 1,
             name: DEFAULT_SCHEMA_NAME.to_string(),
             database_id: 0,
+            owner: DEFAULT_SUPER_USER_ID,
+        });
+        catalog.write().create_schema(ProstSchema {
+            id: 2,
+            name: PG_CATALOG_SCHEMA_NAME.to_string(),
+            database_id: 0,
+            owner: DEFAULT_SUPER_USER_ID,
         });
         let mut map: HashMap<u32, DatabaseId> = HashMap::new();
-        map.insert(0_u32, 0_u32);
+        map.insert(1_u32, 0_u32);
+        map.insert(2_u32, 0_u32);
         Self {
             catalog,
-            id: AtomicU32::new(0),
+            id: AtomicU32::new(2),
             table_id_to_schema_id: Default::default(),
             schema_id_to_database_id: RwLock::new(map),
         }
@@ -241,6 +298,21 @@ impl MockCatalogWriter {
     }
 
     fn drop_table_or_source_id(&self, table_id: u32) -> (DatabaseId, SchemaId) {
+        let schema_id = self
+            .table_id_to_schema_id
+            .write()
+            .remove(&table_id)
+            .unwrap();
+        (self.get_database_id_by_schema(schema_id), schema_id)
+    }
+
+    fn add_table_or_sink_id(&self, table_id: u32, schema_id: SchemaId, _database_id: DatabaseId) {
+        self.table_id_to_schema_id
+            .write()
+            .insert(table_id, schema_id);
+    }
+
+    fn drop_table_or_sink_id(&self, table_id: u32) -> (DatabaseId, SchemaId) {
         let schema_id = self
             .table_id_to_schema_id
             .write()
@@ -269,6 +341,13 @@ impl MockCatalogWriter {
         Ok(source.id)
     }
 
+    fn create_sink_inner(&self, mut sink: ProstSink) -> Result<()> {
+        sink.id = self.gen_id();
+        self.catalog.write().create_sink(sink.clone());
+        self.add_table_or_sink_id(sink.id, sink.schema_id, sink.database_id);
+        Ok(())
+    }
+
     fn get_database_id_by_schema(&self, schema_id: u32) -> DatabaseId {
         *self
             .schema_id_to_database_id
@@ -278,19 +357,145 @@ impl MockCatalogWriter {
     }
 }
 
+pub struct MockUserInfoWriter {
+    id: AtomicU32,
+    user_info: Arc<RwLock<UserInfoManager>>,
+}
+
+#[async_trait::async_trait]
+impl UserInfoWriter for MockUserInfoWriter {
+    async fn create_user(&self, user: UserInfo) -> Result<()> {
+        let mut user = user;
+        user.id = self.gen_id();
+        self.user_info.write().create_user(user);
+        Ok(())
+    }
+
+    async fn drop_user(&self, id: UserId) -> Result<()> {
+        self.user_info.write().drop_user(id);
+        Ok(())
+    }
+
+    /// In `MockUserInfoWriter`, we don't support expand privilege with `GrantAllTables` and
+    /// `GrantAllSources` when grant privilege to user.
+    async fn grant_privilege(
+        &self,
+        users: Vec<UserId>,
+        privileges: Vec<GrantPrivilege>,
+        with_grant_option: bool,
+        _grantor: UserId,
+    ) -> Result<()> {
+        let privileges = privileges
+            .into_iter()
+            .map(|mut p| {
+                p.action_with_opts
+                    .iter_mut()
+                    .for_each(|ao| ao.with_grant_option = with_grant_option);
+                p
+            })
+            .collect::<Vec<_>>();
+        for user_id in users {
+            if let Some(u) = self.user_info.write().get_user_mut(user_id) {
+                u.grant_privileges.extend(privileges.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// In `MockUserInfoWriter`, we don't support expand privilege with `RevokeAllTables` and
+    /// `RevokeAllSources` when revoke privilege from user.
+    async fn revoke_privilege(
+        &self,
+        users: Vec<UserId>,
+        privileges: Vec<GrantPrivilege>,
+        _granted_by: Option<UserId>,
+        _revoke_by: UserId,
+        revoke_grant_option: bool,
+        _cascade: bool,
+    ) -> Result<()> {
+        for user_id in users {
+            if let Some(u) = self.user_info.write().get_user_mut(user_id) {
+                u.grant_privileges.iter_mut().for_each(|p| {
+                    for rp in &privileges {
+                        if rp.object != p.object {
+                            continue;
+                        }
+                        if revoke_grant_option {
+                            for ao in &mut p.action_with_opts {
+                                if rp
+                                    .action_with_opts
+                                    .iter()
+                                    .any(|rao| rao.action == ao.action)
+                                {
+                                    ao.with_grant_option = false;
+                                }
+                            }
+                        } else {
+                            p.action_with_opts.retain(|po| {
+                                rp.action_with_opts
+                                    .iter()
+                                    .all(|rao| rao.action != po.action)
+                            });
+                        }
+                    }
+                });
+                u.grant_privileges
+                    .retain(|p| !p.action_with_opts.is_empty());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl MockUserInfoWriter {
+    pub fn new(user_info: Arc<RwLock<UserInfoManager>>) -> Self {
+        user_info.write().create_user(UserInfo {
+            id: DEFAULT_SUPER_USER_ID,
+            name: DEFAULT_SUPER_USER.to_string(),
+            is_supper: true,
+            can_create_db: true,
+            can_login: true,
+            ..Default::default()
+        });
+        Self {
+            user_info,
+            id: AtomicU32::new(NON_RESERVED_USER_ID as u32),
+        }
+    }
+
+    fn gen_id(&self) -> u32 {
+        self.id.fetch_add(1, Ordering::SeqCst)
+    }
+}
+
 pub struct MockFrontendMetaClient {}
 
 #[async_trait::async_trait]
 impl FrontendMetaClient for MockFrontendMetaClient {
-    async fn pin_snapshot(&self, _epoch: u64) -> Result<u64> {
+    async fn pin_snapshot(&self) -> RpcResult<u64> {
         Ok(0)
     }
 
-    async fn flush(&self) -> Result<()> {
+    async fn get_epoch(&self) -> RpcResult<u64> {
+        Ok(0)
+    }
+
+    async fn flush(&self) -> RpcResult<()> {
         Ok(())
     }
 
-    async fn unpin_snapshot(&self, _epoch: u64) -> Result<()> {
+    async fn list_table_fragments(
+        &self,
+        _table_ids: &[u32],
+    ) -> RpcResult<HashMap<u32, TableFragmentInfo>> {
+        Ok(HashMap::default())
+    }
+
+    async fn unpin_snapshot(&self) -> RpcResult<()> {
+        Ok(())
+    }
+
+    async fn unpin_snapshot_before(&self, _epoch: u64) -> RpcResult<()> {
         Ok(())
     }
 }

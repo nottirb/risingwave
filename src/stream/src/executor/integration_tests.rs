@@ -14,52 +14,68 @@
 
 use std::sync::{Arc, Mutex};
 
-use futures::channel::mpsc::channel;
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use futures_async_stream::try_stream;
 use risingwave_common::array::column::Column;
 use risingwave_common::array::*;
 use risingwave_common::catalog::{Field, Schema};
 use risingwave_common::types::*;
 use risingwave_expr::expr::*;
+use tokio::sync::mpsc::channel;
 
 use super::*;
+use crate::executor::actor::ActorContext;
 use crate::executor::aggregation::{AggArgs, AggCall};
 use crate::executor::dispatch::*;
+use crate::executor::exchange::input::LocalInput;
+use crate::executor::exchange::output::{BoxedOutput, LocalOutput};
+use crate::executor::monitor::StreamingMetrics;
 use crate::executor::receiver::ReceiverExecutor;
 use crate::executor::test_utils::create_in_memory_keyspace_agg;
-use crate::executor::{
-    Executor, LocalSimpleAggExecutor, MergeExecutor, ProjectExecutor, SimpleAggExecutor,
-};
+use crate::executor::test_utils::global_simple_agg::new_boxed_simple_agg_executor;
+use crate::executor::{Executor, LocalSimpleAggExecutor, MergeExecutor, ProjectExecutor};
 use crate::task::SharedContext;
 
 /// This test creates a merger-dispatcher pair, and run a sum. Each chunk
 /// has 0~9 elements. We first insert the 10 chunks, then delete them,
 /// and do this again and again.
-#[madsim::test]
+#[tokio::test]
 async fn test_merger_sum_aggr() {
     // `make_actor` build an actor to do local aggregation
     let make_actor = |input_rx| {
         let schema = Schema {
             fields: vec![Field::unnamed(DataType::Int64)],
         };
-        let input = ReceiverExecutor::new(schema, vec![], input_rx);
+        let metrics = Arc::new(StreamingMetrics::unused());
+        let input = ReceiverExecutor::new(
+            schema,
+            vec![],
+            LocalInput::for_test(input_rx),
+            ActorContext::create(),
+            0,
+            0,
+            metrics,
+        );
         let append_only = false;
         // for the local aggregator, we need two states: row count and sum
         let aggregator = LocalSimpleAggExecutor::new(
             input.boxed(),
             vec![
                 AggCall {
-                    kind: AggKind::RowCount,
+                    kind: AggKind::Count,
                     args: AggArgs::None,
                     return_type: DataType::Int64,
+                    order_pairs: vec![],
                     append_only,
+                    filter: None,
                 },
                 AggCall {
                     kind: AggKind::Sum,
                     args: AggArgs::Unary(DataType::Int64, 0),
                     return_type: DataType::Int64,
+                    order_pairs: vec![],
                     append_only,
+                    filter: None,
                 },
             ],
             vec![],
@@ -72,7 +88,13 @@ async fn test_merger_sum_aggr() {
             channel: Box::new(LocalOutput::new(233, tx)),
         };
         let context = SharedContext::for_test().into();
-        let actor = Actor::new(consumer, 0, context);
+        let actor = Actor::new(
+            consumer,
+            0,
+            context,
+            StreamingMetrics::unused().into(),
+            ActorContext::create(),
+        );
         (actor, rx)
     };
 
@@ -84,22 +106,31 @@ async fn test_merger_sum_aggr() {
     let mut outputs = vec![];
 
     let ctx = Arc::new(SharedContext::for_test());
+    let metrics = Arc::new(StreamingMetrics::unused());
 
     // create 17 local aggregation actors
     for _ in 0..17 {
         let (tx, rx) = channel(16);
         let (actor, channel) = make_actor(rx);
         outputs.push(channel);
-        handles.push(madsim::task::spawn(actor.run()));
-        inputs.push(Box::new(LocalOutput::new(233, tx)) as Box<dyn Output>);
+        handles.push(tokio::spawn(actor.run()));
+        inputs.push(Box::new(LocalOutput::new(233, tx)) as BoxedOutput);
     }
 
     // create a round robin dispatcher, which dispatches messages to the actors
-    let (mut input, rx) = channel(16);
+    let (input, rx) = channel(16);
     let schema = Schema {
         fields: vec![Field::unnamed(DataType::Int64)],
     };
-    let receiver_op = Box::new(ReceiverExecutor::new(schema.clone(), vec![], rx));
+    let receiver_op = Box::new(ReceiverExecutor::new(
+        schema.clone(),
+        vec![],
+        LocalInput::for_test(rx),
+        ActorContext::create(),
+        0,
+        0,
+        Arc::new(StreamingMetrics::unused()),
+    ));
     let dispatcher = DispatchExecutor::new(
         receiver_op,
         vec![DispatcherImpl::RoundRobin(RoundRobinDataDispatcher::new(
@@ -107,41 +138,51 @@ async fn test_merger_sum_aggr() {
         ))],
         0,
         ctx,
+        metrics,
     );
     let context = SharedContext::for_test().into();
-    let actor = Actor::new(dispatcher, 0, context);
-    handles.push(madsim::task::spawn(actor.run()));
+    let actor = Actor::new(
+        dispatcher,
+        0,
+        context,
+        StreamingMetrics::unused().into(),
+        ActorContext::create(),
+    );
+    handles.push(tokio::spawn(actor.run()));
 
     // use a merge operator to collect data from dispatchers before sending them to aggregator
-    let merger = MergeExecutor::new(schema, vec![], 0, outputs);
+    let merger = MergeExecutor::for_test(outputs);
 
     // for global aggregator, we need to sum data and sum row count
     let append_only = false;
-    let aggregator = SimpleAggExecutor::new(
+    let aggregator = new_boxed_simple_agg_executor(
+        create_in_memory_keyspace_agg(2),
         merger.boxed(),
         vec![
             AggCall {
                 kind: AggKind::Sum,
                 args: AggArgs::Unary(DataType::Int64, 0),
                 return_type: DataType::Int64,
+                order_pairs: vec![],
                 append_only,
+                filter: None,
             },
             AggCall {
                 kind: AggKind::Sum,
                 args: AggArgs::Unary(DataType::Int64, 1),
                 return_type: DataType::Int64,
+                order_pairs: vec![],
                 append_only,
+                filter: None,
             },
         ],
-        create_in_memory_keyspace_agg(2),
         vec![],
         2,
         vec![],
-    )
-    .unwrap();
+    );
 
     let projection = ProjectExecutor::new(
-        aggregator.boxed(),
+        aggregator,
         vec![],
         vec![
             // TODO: use the new streaming_if_null expression here, and add `None` tests
@@ -156,8 +197,14 @@ async fn test_merger_sum_aggr() {
         data: items.clone(),
     };
     let context = SharedContext::for_test().into();
-    let actor = Actor::new(consumer, 0, context);
-    handles.push(madsim::task::spawn(actor.run()));
+    let actor = Actor::new(
+        consumer,
+        0,
+        context,
+        StreamingMetrics::unused().into(),
+        ActorContext::create(),
+    );
+    handles.push(tokio::spawn(actor.run()));
 
     let mut epoch = 1;
     input
@@ -195,7 +242,7 @@ async fn test_merger_sum_aggr() {
 
     // wait for all actors
     for handle in handles {
-        handle.await.unwrap();
+        handle.await.unwrap().unwrap();
     }
 
     let data = items.lock().unwrap();
@@ -229,7 +276,7 @@ impl StreamConsumer for MockConsumer {
 /// `SenderConsumer` consumes data from input executor and send it into a channel.
 pub struct SenderConsumer {
     input: BoxedExecutor,
-    channel: Box<dyn Output>,
+    channel: BoxedOutput,
 }
 
 impl StreamConsumer for SenderConsumer {

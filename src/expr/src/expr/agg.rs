@@ -24,10 +24,10 @@ pub enum AggKind {
     Max,
     Sum,
     Count,
-    RowCount,
     Avg,
     StringAgg,
     SingleValue,
+    ApproxCountDistinct,
 }
 
 impl std::fmt::Display for AggKind {
@@ -37,10 +37,10 @@ impl std::fmt::Display for AggKind {
             AggKind::Max => write!(f, "max"),
             AggKind::Sum => write!(f, "sum"),
             AggKind::Count => write!(f, "count"),
-            AggKind::RowCount => write!(f, "row_count"),
             AggKind::Avg => write!(f, "avg"),
             AggKind::StringAgg => write!(f, "string_agg"),
             AggKind::SingleValue => write!(f, "single_value"),
+            AggKind::ApproxCountDistinct => write!(f, "approx_count_distinct"),
         }
     }
 }
@@ -57,6 +57,7 @@ impl TryFrom<Type> for AggKind {
             Type::Count => Ok(AggKind::Count),
             Type::StringAgg => Ok(AggKind::StringAgg),
             Type::SingleValue => Ok(AggKind::SingleValue),
+            Type::ApproxCountDistinct => Ok(AggKind::ApproxCountDistinct),
             _ => Err(ErrorCode::InternalError("Unrecognized agg.".into()).into()),
         }
     }
@@ -72,9 +73,7 @@ impl AggKind {
             Self::Count => Type::Count,
             Self::StringAgg => Type::StringAgg,
             Self::SingleValue => Type::SingleValue,
-            Self::RowCount => {
-                panic!("cannot convert RowCount to prost, TODO: remove RowCount from AggKind")
-            }
+            Self::ApproxCountDistinct => Type::ApproxCountDistinct,
         }
     }
 }

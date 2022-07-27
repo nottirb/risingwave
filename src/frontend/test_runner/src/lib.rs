@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(clippy::derive_partial_eq_without_eq)]
 //! Data-driven tests.
-#![feature(let_chains)]
 
 mod resolve_id;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -31,7 +31,7 @@ use risingwave_frontend::planner::Planner;
 use risingwave_frontend::session::{OptimizerContext, OptimizerContextRef, SessionImpl};
 use risingwave_frontend::test_utils::{create_proto_file, LocalFrontend};
 use risingwave_frontend::FrontendOpts;
-use risingwave_sqlparser::ast::{ObjectName, Statement};
+use risingwave_sqlparser::ast::{ObjectName, Statement, WithProperties};
 use risingwave_sqlparser::parser::Parser;
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +64,9 @@ pub struct TestCase {
     /// Proto JSON of generated batch plan
     pub batch_plan_proto: Option<String>,
 
+    /// Batch plan for local execution `.gen_batch_local_plan()`
+    pub batch_local_plan: Option<String>,
+
     /// Create MV plan `.gen_create_mv_plan()`
     pub stream_plan: Option<String>,
 
@@ -83,7 +86,7 @@ pub struct TestCase {
     pub create_source: Option<CreateSource>,
 
     /// Provide config map to frontend
-    pub with_config_map: Option<HashMap<String, String>>,
+    pub with_config_map: Option<BTreeMap<String, String>>,
 }
 
 #[serde_with::skip_serializing_none]
@@ -111,6 +114,9 @@ pub struct TestCaseResult {
 
     /// Proto JSON of generated batch plan
     pub batch_plan_proto: Option<String>,
+
+    /// Batch plan for local execution `.gen_batch_local_plan()`
+    pub batch_local_plan: Option<String>,
 
     /// Create MV plan `.gen_create_mv_plan()`
     pub stream_plan: Option<String>,
@@ -149,6 +155,7 @@ impl TestCaseResult {
             logical_plan: self.logical_plan,
             optimized_logical_plan: self.optimized_logical_plan,
             batch_plan: self.batch_plan,
+            batch_local_plan: self.batch_local_plan,
             stream_plan: self.stream_plan,
             stream_plan_proto: self.stream_plan_proto,
             batch_plan_proto: self.batch_plan_proto,
@@ -170,7 +177,7 @@ impl TestCase {
 
         if let Some(ref config_map) = self.with_config_map {
             for (key, val) in config_map {
-                session.set_config(key, val);
+                session.set_config(key, val).unwrap();
             }
         }
 
@@ -208,7 +215,7 @@ impl TestCase {
                     };
                     let sql = format!(
                         r#"CREATE {} SOURCE {}
-    WITH ('kafka.topic' = 'abc', 'kafka.servers' = 'localhost:1001')
+    WITH (kafka.topic = 'abc', kafka.servers = 'localhost:1001')
     ROW FORMAT {} MESSAGE '.test.TestRecord' ROW SCHEMA LOCATION 'file://"#,
                         materialized, source.name, source.row_format
                     );
@@ -240,9 +247,12 @@ impl TestCase {
     ) -> Result<Option<TestCaseResult>> {
         let statements = Parser::parse_sql(sql).unwrap();
         for stmt in statements {
-            let context = OptimizerContext::new(session.clone());
+            let context = OptimizerContext::new(session.clone(), Arc::from(sql));
             match stmt.clone() {
-                Statement::Query(_) | Statement::Insert { .. } | Statement::Delete { .. } => {
+                Statement::Query(_)
+                | Statement::Insert { .. }
+                | Statement::Delete { .. }
+                | Statement::Update { .. } => {
                     if result.is_some() {
                         panic!("two queries in one test case");
                     }
@@ -252,8 +262,13 @@ impl TestCase {
                     }
                     result = Some(ret);
                 }
-                Statement::CreateTable { name, columns, .. } => {
-                    create_table::handle_create_table(context, name, columns).await?;
+                Statement::CreateTable {
+                    name,
+                    columns,
+                    with_options,
+                    ..
+                } => {
+                    create_table::handle_create_table(context, name, columns, with_options).await?;
                 }
                 Statement::CreateSource {
                     is_materialized,
@@ -275,9 +290,11 @@ impl TestCase {
                     or_replace: false,
                     name,
                     query,
+                    with_options,
                     ..
                 } => {
-                    create_mv::handle_create_mv(context, name, query).await?;
+                    create_mv::handle_create_mv(context, name, query, WithProperties(with_options))
+                        .await?;
                 }
                 Statement::Drop(drop_statement) => {
                     drop_table::handle_drop_table(context, drop_statement.object_name).await?;
@@ -347,6 +364,15 @@ impl TestCase {
             }
         }
 
+        if self.batch_local_plan.is_some() {
+            let batch_plan = logical_plan.gen_batch_local_plan()?;
+
+            // Only generate batch_plan if it is specified in test case
+            if self.batch_local_plan.is_some() {
+                ret.batch_local_plan = Some(explain_plan(&batch_plan));
+            }
+        }
+
         if self.stream_plan.is_some() || self.stream_plan_proto.is_some() {
             let q = if let Statement::Query(q) = stmt {
                 q.as_ref().clone()
@@ -359,6 +385,7 @@ impl TestCase {
                 context,
                 Box::new(q),
                 ObjectName(vec!["test".into()]),
+                HashMap::new(),
             )?;
 
             // Only generate stream_plan if it is specified in test case
@@ -398,6 +425,11 @@ fn check_result(expected: &TestCase, actual: &TestCaseResult) -> Result<()> {
         &actual.optimized_logical_plan,
     )?;
     check_option_plan_eq("batch_plan", &expected.batch_plan, &actual.batch_plan)?;
+    check_option_plan_eq(
+        "batch_local_plan",
+        &expected.batch_local_plan,
+        &actual.batch_local_plan,
+    )?;
     check_option_plan_eq("stream_plan", &expected.stream_plan, &actual.stream_plan)?;
     check_option_plan_eq(
         "stream_plan_proto",
@@ -460,12 +492,12 @@ fn check_err(ctx: &str, expected_err: &Option<String>, actual_err: &Option<Strin
             if expected_err == actual_err {
                 Ok(())
             } else {
-                return Err(anyhow!(
+                Err(anyhow!(
                     "Expected {context} error: {}\n  Actual {context} error: {}",
                     expected_err,
                     actual_err,
                     context = ctx
-                ));
+                ))
             }
         }
     }

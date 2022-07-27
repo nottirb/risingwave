@@ -15,18 +15,17 @@
 use std::rc::Rc;
 
 use itertools::Itertools;
-use risingwave_common::catalog::{Field, Schema};
 use risingwave_common::error::{ErrorCode, Result};
-use risingwave_common::types::{DataType, NaiveDateTimeWrapper, ScalarImpl};
+use risingwave_common::types::ScalarImpl;
 
 use crate::binder::{
-    BoundBaseTable, BoundGenerateSeriesFunction, BoundJoin, BoundSource, BoundWindowTableFunction,
-    Relation, WindowTableFunctionKind,
+    BoundBaseTable, BoundJoin, BoundSource, BoundSystemTable, BoundWindowTableFunction, Relation,
+    WindowTableFunctionKind,
 };
-use crate::expr::{ExprImpl, ExprType, FunctionCall, InputRef};
+use crate::expr::{ExprImpl, ExprType, FunctionCall, InputRef, TableFunction};
 use crate::optimizer::plan_node::{
-    LogicalGenerateSeries, LogicalHopWindow, LogicalJoin, LogicalProject, LogicalScan,
-    LogicalSource, PlanRef,
+    LogicalHopWindow, LogicalJoin, LogicalProject, LogicalScan, LogicalSource,
+    LogicalTableFunction, PlanRef,
 };
 use crate::planner::Planner;
 
@@ -34,18 +33,31 @@ impl Planner {
     pub(super) fn plan_relation(&mut self, relation: Relation) -> Result<PlanRef> {
         match relation {
             Relation::BaseTable(t) => self.plan_base_table(*t),
+            Relation::SystemTable(st) => self.plan_sys_table(*st),
             // TODO: order is ignored in the subquery
             Relation::Subquery(q) => Ok(self.plan_query(q.query)?.as_subplan()),
             Relation::Join(join) => self.plan_join(*join),
             Relation::WindowTableFunction(tf) => self.plan_window_table_function(*tf),
             Relation::Source(s) => self.plan_source(*s),
-            Relation::GenerateSeriesFunction(gs) => self.plan_generate_series_function(*gs),
+            Relation::TableFunction(tf) => self.plan_table_function(*tf),
         }
     }
 
+    pub(crate) fn plan_sys_table(&mut self, sys_table: BoundSystemTable) -> Result<PlanRef> {
+        Ok(LogicalScan::create(
+            sys_table.name,
+            true,
+            Rc::new(sys_table.sys_table_catalog.table_desc()),
+            vec![],
+            self.ctx(),
+        )
+        .into())
+    }
+
     pub(super) fn plan_base_table(&mut self, base_table: BoundBaseTable) -> Result<PlanRef> {
-        LogicalScan::create(
+        Ok(LogicalScan::create(
             base_table.name,
+            false,
             Rc::new(base_table.table_catalog.table_desc()),
             base_table
                 .table_indexes
@@ -54,6 +66,7 @@ impl Planner {
                 .collect(),
             self.ctx(),
         )
+        .into())
     }
 
     pub(super) fn plan_source(&mut self, source: BoundSource) -> Result<PlanRef> {
@@ -87,51 +100,8 @@ impl Planner {
         }
     }
 
-    pub(super) fn plan_generate_series_function(
-        &mut self,
-        table_function: BoundGenerateSeriesFunction,
-    ) -> Result<PlanRef> {
-        let schema = Schema::new(vec![Field::with_name(
-            DataType::Timestamp,
-            "generate_series",
-        )]);
-        let mut args = table_function.args.into_iter();
-        let start;
-        let stop;
-
-        let Some((ExprImpl::Literal(start_time), ExprImpl::Literal(stop_time),ExprImpl::Literal(step_interval))) = args.next_tuple() else {
-            return Err(ErrorCode::BindError("Invalid arguments for Generate series function".to_string()).into());
-        };
-
-        if let Some(ScalarImpl::Utf8(start_time)) = &*start_time.get_data() {
-            start = NaiveDateTimeWrapper::parse_from_str(start_time)?;
-        } else {
-            return Err(ErrorCode::BindError(
-                "Invalid arguments for Generate series function".to_string(),
-            )
-            .into());
-        };
-
-        if let Some(ScalarImpl::Utf8(stop_time)) = &*stop_time.get_data() {
-            stop = NaiveDateTimeWrapper::parse_from_str(stop_time)?;
-        } else {
-            return Err(ErrorCode::BindError(
-                "Invalid arguments for Generate series functionn".to_string(),
-            )
-            .into());
-        };
-
-        let Some(ScalarImpl::Interval(step)) = *step_interval.get_data() else {
-            return Err(ErrorCode::BindError("Invalid arguments for Generate series function".to_string()).into());
-        };
-
-        Ok(LogicalGenerateSeries::create(
-            start,
-            stop,
-            step,
-            schema,
-            self.ctx(),
-        ))
+    pub(super) fn plan_table_function(&mut self, table_function: TableFunction) -> Result<PlanRef> {
+        Ok(LogicalTableFunction::new(table_function, self.ctx()).into())
     }
 
     fn plan_tumble_window(
@@ -195,6 +165,9 @@ impl Planner {
         let Some(ScalarImpl::Interval(window_size)) = *window_size.get_data() else {
             return Err(ErrorCode::BindError("Invalid arguments for HOP window function".to_string()).into());
         };
+        if window_size.exact_div(&window_slide).is_none() {
+            return Err(ErrorCode::BindError(format!("Invalid arguments for HOP window function: window_size {} cannot be divided by window_slide {}",window_size, window_slide)).into());
+        }
         Ok(LogicalHopWindow::create(
             input,
             time_col,

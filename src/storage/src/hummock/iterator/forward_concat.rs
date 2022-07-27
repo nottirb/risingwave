@@ -13,13 +13,14 @@
 // limitations under the License.
 
 use crate::hummock::iterator::concat_inner::ConcatIteratorInner;
-use crate::hummock::SSTableIterator;
+use crate::hummock::SstableIterator;
 
 /// Iterates on multiple non-overlapping tables.
-pub type ConcatIterator = ConcatIteratorInner<SSTableIterator>;
+pub type ConcatIterator = ConcatIteratorInner<SstableIterator>;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
 
     use super::*;
     use crate::hummock::iterator::test_utils::{
@@ -27,6 +28,7 @@ mod tests {
         iterator_test_value_of, mock_sstable_store, TEST_KEYS_COUNT,
     };
     use crate::hummock::iterator::ForwardHummockIterator;
+    use crate::hummock::sstable::SstableIteratorReadOptions;
 
     #[tokio::test]
     async fn test_concat_iterator() {
@@ -62,6 +64,7 @@ mod tests {
                 table2.get_sstable_info(),
             ],
             sstable_store,
+            Arc::new(SstableIteratorReadOptions::default()),
         );
         let mut i = 0;
         iter.rewind().await.unwrap();
@@ -126,6 +129,7 @@ mod tests {
                 table2.get_sstable_info(),
             ],
             sstable_store,
+            Arc::new(SstableIteratorReadOptions::default()),
         );
 
         iter.seek(iterator_test_key_of(TEST_KEYS_COUNT + 1).as_slice())
@@ -207,6 +211,7 @@ mod tests {
                 table2.get_sstable_info(),
             ],
             sstable_store,
+            Arc::new(SstableIteratorReadOptions::default()),
         );
 
         iter.seek(iterator_test_key_of(TEST_KEYS_COUNT + 1).as_slice())

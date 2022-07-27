@@ -18,18 +18,18 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use futures::Future;
-use risingwave_hummock_sdk::HummockSSTableId;
+use risingwave_common::cache::{CachableEntry, LruCache};
+use risingwave_hummock_sdk::HummockSstableId;
 
-use super::cache::{CachableEntry, LookupResult, LruCache};
-use super::{Block, HummockError, HummockResult};
+use super::{Block, HummockResult};
+use crate::hummock::HummockError;
 
-const CACHE_SHARD_BITS: usize = 6; // It means that there will be 64 shards lru-cache to avoid lock conflict.
-const DEFAULT_OBJECT_POOL_SIZE: usize = 1024; // we only need a small object pool because when the cache reach the limit of capacity, it will
-                                              // always release some object after insert a new block.
+const MIN_BUFFER_SIZE_PER_SHARD: usize = 32 * 1024 * 1024;
 
 enum BlockEntry {
-    Cache(CachableEntry<(HummockSSTableId, u64), Box<Block>>),
+    Cache(CachableEntry<(HummockSstableId, u64), Box<Block>>),
     Owned(Box<Block>),
+    RefEntry(Arc<Block>),
 }
 
 pub struct BlockHolder {
@@ -38,6 +38,14 @@ pub struct BlockHolder {
 }
 
 impl BlockHolder {
+    pub fn from_ref_block(block: Arc<Block>) -> Self {
+        let ptr = block.as_ref() as *const _;
+        Self {
+            _handle: BlockEntry::RefEntry(block),
+            block: ptr,
+        }
+    }
+
     pub fn from_owned_block(block: Box<Block>) -> Self {
         let ptr = block.as_ref() as *const _;
         Self {
@@ -46,7 +54,7 @@ impl BlockHolder {
         }
     }
 
-    pub fn from_cached_block(entry: CachableEntry<(HummockSSTableId, u64), Box<Block>>) -> Self {
+    pub fn from_cached_block(entry: CachableEntry<(HummockSstableId, u64), Box<Block>>) -> Self {
         let ptr = entry.value().as_ref() as *const _;
         Self {
             _handle: BlockEntry::Cache(entry),
@@ -68,71 +76,91 @@ unsafe impl Sync for BlockHolder {}
 
 #[derive(Clone)]
 pub struct BlockCache {
-    inner: Arc<LruCache<(HummockSSTableId, u64), Box<Block>>>,
+    inner: Arc<LruCache<(HummockSstableId, u64), Box<Block>>>,
 }
 
 impl BlockCache {
-    pub fn new(capacity: usize) -> Self {
-        let cache = LruCache::new(CACHE_SHARD_BITS, capacity, DEFAULT_OBJECT_POOL_SIZE);
+    pub fn new(capacity: usize, mut max_shard_bits: usize) -> Self {
+        if capacity == 0 {
+            panic!("block cache capacity == 0");
+        }
+        while (capacity >> max_shard_bits) < MIN_BUFFER_SIZE_PER_SHARD && max_shard_bits > 0 {
+            max_shard_bits -= 1;
+        }
+        let cache = LruCache::new(max_shard_bits, capacity);
         Self {
             inner: Arc::new(cache),
         }
     }
 
-    pub fn get(&self, sst_id: HummockSSTableId, block_idx: u64) -> Option<BlockHolder> {
+    pub fn get(&self, sst_id: HummockSstableId, block_idx: u64) -> Option<BlockHolder> {
         self.inner
             .lookup(Self::hash(sst_id, block_idx), &(sst_id, block_idx))
             .map(BlockHolder::from_cached_block)
     }
 
-    pub fn insert(&self, sst_id: HummockSSTableId, block_idx: u64, block: Box<Block>) {
-        self.inner.insert(
+    pub fn insert(
+        &self,
+        sst_id: HummockSstableId,
+        block_idx: u64,
+        block: Box<Block>,
+    ) -> BlockHolder {
+        BlockHolder::from_cached_block(self.inner.insert(
             (sst_id, block_idx),
             Self::hash(sst_id, block_idx),
             block.len(),
             block,
-        );
+        ))
     }
 
-    pub async fn get_or_insert_with<F>(
+    pub async fn get_or_insert_with<F, Fut>(
         &self,
-        sst_id: HummockSSTableId,
+        sst_id: HummockSstableId,
         block_idx: u64,
         f: F,
     ) -> HummockResult<BlockHolder>
     where
-        F: Future<Output = HummockResult<Box<Block>>>,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = HummockResult<Box<Block>>> + Send + 'static,
     {
         let h = Self::hash(sst_id, block_idx);
         let key = (sst_id, block_idx);
-        match self.inner.lookup_for_request(h, key) {
-            LookupResult::Cached(entry) => Ok(BlockHolder::from_cached_block(entry)),
-            LookupResult::WaitPendingRequest(recv) => {
-                let entry = recv.await.map_err(HummockError::other)?;
-                Ok(BlockHolder::from_cached_block(entry))
-            }
-            LookupResult::Miss => match f.await {
-                Ok(block) => {
-                    let entry = self.inner.insert(key, h, block.len(), block);
-                    Ok(BlockHolder::from_cached_block(entry))
+        let entry = self
+            .inner
+            .lookup_with_request_dedup::<_, HummockError, _>(h, key, || {
+                let f = f();
+                async move {
+                    let block = f.await?;
+                    let len = block.len();
+                    Ok((block, len))
                 }
-                Err(e) => {
-                    self.inner.clear_pending_request(&key, h);
-                    Err(e)
-                }
-            },
-        }
+            })
+            .await
+            .map_err(|e| {
+                HummockError::other(format!(
+                    "block cache lookup request dedup get cancel: {:?}",
+                    e,
+                ))
+            })??;
+        Ok(BlockHolder::from_cached_block(entry))
     }
 
-    fn hash(sst_id: HummockSSTableId, block_idx: u64) -> u64 {
+    fn hash(sst_id: HummockSstableId, block_idx: u64) -> u64 {
         let mut hasher = DefaultHasher::default();
         sst_id.hash(&mut hasher);
         block_idx.hash(&mut hasher);
         hasher.finish()
     }
 
-    #[cfg(test)]
+    pub fn size(&self) -> usize {
+        self.inner.get_memory_usage()
+    }
+
+    #[cfg(any(test, feature = "test"))]
     pub fn clear(&self) {
-        self.inner.clear();
+        // This is only a method for test. Therefore it should be safe to call the unsafe method.
+        unsafe {
+            self.inner.clear();
+        }
     }
 }

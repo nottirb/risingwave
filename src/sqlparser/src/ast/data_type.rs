@@ -17,7 +17,7 @@ use core::fmt;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::ast::ObjectName;
+use crate::ast::{display_comma_separated, Ident, ObjectName};
 
 /// SQL data types
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -25,8 +25,9 @@ use crate::ast::ObjectName;
 pub enum DataType {
     /// Fixed-length character type e.g. CHAR(10)
     Char(Option<u64>),
-    /// Variable-length character type e.g. VARCHAR(10)
-    Varchar(Option<u64>),
+    /// Variable-length character type.
+    /// We diverge from postgres by disallowing Varchar(n).
+    Varchar,
     /// Uuid type
     Uuid,
     /// Large character object e.g. CLOB(1000)
@@ -75,15 +76,15 @@ pub enum DataType {
     Custom(ObjectName),
     /// Arrays
     Array(Box<DataType>),
+    /// Structs
+    Struct(Vec<StructField>),
 }
 
 impl fmt::Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             DataType::Char(size) => format_type_with_optional_length(f, "CHAR", size),
-            DataType::Varchar(size) => {
-                format_type_with_optional_length(f, "CHARACTER VARYING", size)
-            }
+            DataType::Varchar => write!(f, "CHARACTER VARYING"),
             DataType::Uuid => write!(f, "UUID"),
             DataType::Clob(size) => write!(f, "CLOB({})", size),
             DataType::Binary(size) => write!(f, "BINARY({})", size),
@@ -118,6 +119,9 @@ impl fmt::Display for DataType {
             DataType::Bytea => write!(f, "BYTEA"),
             DataType::Array(ty) => write!(f, "{}[]", ty),
             DataType::Custom(ty) => write!(f, "{}", ty),
+            DataType::Struct(defs) => {
+                write!(f, "STRUCT<{}>", display_comma_separated(defs))
+            }
         }
     }
 }
@@ -132,4 +136,17 @@ fn format_type_with_optional_length(
         write!(f, "({})", len)?;
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct StructField {
+    pub name: Ident,
+    pub data_type: DataType,
+}
+
+impl fmt::Display for StructField {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{} {}", self.name, self.data_type)
+    }
 }

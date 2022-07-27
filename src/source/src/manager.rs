@@ -16,27 +16,29 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use parking_lot::{Mutex, MutexGuard};
 use risingwave_common::catalog::{ColumnDesc, ColumnId, TableId};
 use risingwave_common::ensure;
-use risingwave_common::error::ErrorCode::{InternalError, ProtocolError};
+use risingwave_common::error::ErrorCode::{ConnectorError, InternalError, ProtocolError};
 use risingwave_common::error::{Result, RwError};
 use risingwave_common::types::DataType;
 use risingwave_common::util::epoch::UNIX_SINGULARITY_DATE_EPOCH;
-use risingwave_connector::ConnectorProperties;
+use risingwave_connector::source::ConnectorProperties;
 use risingwave_pb::catalog::StreamSourceInfo;
 use risingwave_pb::plan_common::RowFormatType;
 
-use crate::connector_source::ConnectorSource;
+use crate::monitor::SourceMetrics;
 use crate::row_id::{RowId, RowIdGenerator};
 use crate::table_v2::TableSourceV2;
-use crate::{SourceFormat, SourceImpl, SourceParserImpl};
+use crate::{ConnectorSource, SourceFormat, SourceImpl, SourceParserImpl};
 
 pub type SourceRef = Arc<SourceImpl>;
 
 /// The local source manager on the compute node.
+#[async_trait]
 pub trait SourceManager: Debug + Sync + Send {
-    fn create_source(&self, table_id: &TableId, info: StreamSourceInfo) -> Result<()>;
+    async fn create_source(&self, table_id: &TableId, info: StreamSourceInfo) -> Result<()>;
     fn create_table_source(&self, table_id: &TableId, columns: Vec<ColumnDesc>) -> Result<()>;
 
     fn get_source(&self, source_id: &TableId) -> Result<SourceDesc>;
@@ -53,6 +55,8 @@ pub struct SourceColumnDesc {
     pub name: String,
     pub data_type: DataType,
     pub column_id: ColumnId,
+    pub fields: Vec<ColumnDesc>,
+    /// Now `skip_parse` is used to indicate whether the column is a row id column.
     pub skip_parse: bool,
 }
 
@@ -62,7 +66,20 @@ impl From<&ColumnDesc> for SourceColumnDesc {
             name: c.name.clone(),
             data_type: c.data_type.clone(),
             column_id: c.column_id,
+            fields: c.field_descs.clone(),
             skip_parse: false,
+        }
+    }
+}
+
+impl From<&SourceColumnDesc> for ColumnDesc {
+    fn from(s: &SourceColumnDesc) -> Self {
+        ColumnDesc {
+            data_type: s.data_type.clone(),
+            column_id: s.column_id,
+            name: s.name.clone(),
+            field_descs: s.fields.clone(),
+            type_name: "".to_string(),
         }
     }
 }
@@ -73,6 +90,7 @@ pub struct SourceDesc {
     pub source: SourceRef,
     pub format: SourceFormat,
     pub columns: Vec<SourceColumnDesc>,
+    pub metrics: Arc<SourceMetrics>,
 
     // The column index of row ID. By default it's 0, which means the first column is row ID.
     // TODO: change to Option<usize> when pk supported in the future.
@@ -84,6 +102,11 @@ impl SourceDesc {
     pub fn next_row_id(&self) -> RowId {
         self.row_id_generator.as_ref().lock().next()
     }
+
+    pub fn next_row_id_batch(&self, length: usize) -> Vec<RowId> {
+        let mut guard = self.row_id_generator.as_ref().lock();
+        guard.next_batch(length)
+    }
 }
 
 pub type SourceManagerRef = Arc<dyn SourceManager>;
@@ -93,10 +116,13 @@ pub struct MemSourceManager {
     sources: Mutex<HashMap<TableId, SourceDesc>>,
     /// Located worker id.
     worker_id: u32,
+    /// local source metrics
+    metrics: Arc<SourceMetrics>,
 }
 
+#[async_trait]
 impl SourceManager for MemSourceManager {
-    fn create_source(&self, source_id: &TableId, info: StreamSourceInfo) -> Result<()> {
+    async fn create_source(&self, source_id: &TableId, info: StreamSourceInfo) -> Result<()> {
         let format = match info.get_row_format()? {
             RowFormatType::Json => SourceFormat::Json,
             RowFormatType::Protobuf => SourceFormat::Protobuf,
@@ -109,22 +135,25 @@ impl SourceManager for MemSourceManager {
                 "protobuf file location not provided".to_string(),
             )));
         }
-
-        let parser =
-            SourceParserImpl::create(&format, &info.properties, info.row_schema_location.as_str())?;
+        let source_parser_rs =
+            SourceParserImpl::create(&format, &info.properties, info.row_schema_location.as_str())
+                .await;
+        let parser = if let Ok(source_parser) = source_parser_rs {
+            source_parser
+        } else {
+            return Err(source_parser_rs.err().unwrap());
+        };
 
         let columns = info
             .columns
             .iter()
             .enumerate()
             .map(|(idx, c)| {
-                let c = c.column_desc.as_ref().unwrap().clone();
-                SourceColumnDesc {
-                    name: c.name.clone(),
-                    data_type: DataType::from(&c.column_type.unwrap()),
-                    column_id: ColumnId::from(c.column_id),
-                    skip_parse: idx as i32 == info.row_id_index,
-                }
+                let mut col = SourceColumnDesc::from(&ColumnDesc::from(
+                    c.column_desc.as_ref().unwrap().clone(),
+                ));
+                col.skip_parse = idx as i32 == info.row_id_index;
+                col
             })
             .collect::<Vec<SourceColumnDesc>>();
 
@@ -135,8 +164,11 @@ impl SourceManager for MemSourceManager {
         );
         let row_id_index = info.row_id_index as usize;
 
+        let config = ConnectorProperties::extract(info.properties)
+            .map_err(|e| RwError::from(ConnectorError(e.to_string())))?;
+
         let source = SourceImpl::Connector(ConnectorSource {
-            config: ConnectorProperties::new(info.properties)?,
+            config,
             columns: columns.clone(),
             parser,
         });
@@ -150,6 +182,7 @@ impl SourceManager for MemSourceManager {
                 self.worker_id,
                 *UNIX_SINGULARITY_DATE_EPOCH,
             ))),
+            metrics: self.metrics.clone(),
         };
 
         let mut tables = self.get_sources()?;
@@ -185,6 +218,7 @@ impl SourceManager for MemSourceManager {
                 self.worker_id,
                 *UNIX_SINGULARITY_DATE_EPOCH,
             ))),
+            metrics: self.metrics.clone(),
         };
 
         sources.insert(*table_id, desc);
@@ -217,10 +251,11 @@ impl SourceManager for MemSourceManager {
 }
 
 impl MemSourceManager {
-    pub fn new(worker_id: u32) -> Self {
+    pub fn new(worker_id: u32, metrics: Arc<SourceMetrics>) -> Self {
         MemSourceManager {
             sources: Mutex::new(HashMap::new()),
             worker_id,
+            metrics,
         }
     }
 
@@ -231,11 +266,10 @@ impl MemSourceManager {
 
 #[cfg(test)]
 mod tests {
-
     use risingwave_common::catalog::{ColumnDesc, ColumnId, Field, Schema, TableId};
     use risingwave_common::error::Result;
     use risingwave_common::types::DataType;
-    use risingwave_connector::kinesis::config::kinesis_demo_properties;
+    use risingwave_connector::source::kinesis::config::kinesis_demo_properties;
     use risingwave_pb::catalog::StreamSourceInfo;
     use risingwave_pb::plan_common::ColumnCatalog;
     use risingwave_storage::memory::MemoryStateStore;
@@ -268,7 +302,7 @@ mod tests {
         let source_id = TableId::default();
 
         let mem_source_manager = MemSourceManager::default();
-        let source = mem_source_manager.create_source(&source_id, info);
+        let source = mem_source_manager.create_source(&source_id, info).await;
 
         assert!(source.is_ok());
 

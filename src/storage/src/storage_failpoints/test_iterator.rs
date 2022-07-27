@@ -15,7 +15,6 @@
 use std::ops::Bound::Unbounded;
 use std::sync::Arc;
 
-use futures::executor::block_on;
 use risingwave_hummock_sdk::key::user_key;
 
 use crate::hummock::iterator::test_utils::{
@@ -27,13 +26,14 @@ use crate::hummock::iterator::{
     BoxedBackwardHummockIterator, BoxedForwardHummockIterator, ConcatIterator, Forward,
     HummockIterator, MergeIterator, UserIterator,
 };
+use crate::hummock::sstable::SstableIteratorReadOptions;
 use crate::hummock::test_utils::default_builder_opt_for_test;
-use crate::hummock::{BackwardSSTableIterator, SSTableIterator};
-use crate::monitor::StateStoreMetrics;
+use crate::hummock::{BackwardSstableIterator, SstableIterator};
+use crate::monitor::{StateStoreMetrics, StoreLocalStatistic};
 
 #[tokio::test]
 #[cfg(feature = "failpoints")]
-async fn test_failpoint_concat_read_err() {
+async fn test_failpoints_concat_read_err() {
     fail::cfg("disable_block_cache", "return").unwrap();
     fail::cfg("disable_bloom_filter", "return").unwrap();
     let mem_read_err = "mem_read_err";
@@ -57,6 +57,7 @@ async fn test_failpoint_concat_read_err() {
     let mut iter = ConcatIterator::new(
         vec![table0.get_sstable_info(), table1.get_sstable_info()],
         sstable_store,
+        Arc::new(SstableIteratorReadOptions::default()),
     );
     iter.rewind().await.unwrap();
     fail::cfg(mem_read_err, "return").unwrap();
@@ -93,7 +94,7 @@ async fn test_failpoint_concat_read_err() {
 }
 #[tokio::test]
 #[cfg(feature = "failpoints")]
-async fn test_failpoint_backward_concat_read_err() {
+async fn test_failpoints_backward_concat_read_err() {
     fail::cfg("disable_block_cache", "return").unwrap();
     fail::cfg("disable_bloom_filter", "return").unwrap();
     let mem_read_err = "mem_read_err";
@@ -117,6 +118,7 @@ async fn test_failpoint_backward_concat_read_err() {
     let mut iter = BackwardConcatIterator::new(
         vec![table1.get_sstable_info(), table0.get_sstable_info()],
         sstable_store.clone(),
+        Arc::new(SstableIteratorReadOptions::default()),
     );
     iter.rewind().await.unwrap();
     fail::cfg(mem_read_err, "return").unwrap();
@@ -149,7 +151,7 @@ async fn test_failpoint_backward_concat_read_err() {
 }
 #[tokio::test]
 #[cfg(feature = "failpoints")]
-async fn test_failpoint_merge_invalid_key() {
+async fn test_failpoints_merge_invalid_key() {
     fail::cfg("disable_block_cache", "return").unwrap();
     fail::cfg("disable_bloom_filter", "return").unwrap();
     let mem_read_err = "mem_read_err";
@@ -172,14 +174,21 @@ async fn test_failpoint_merge_invalid_key() {
     .await;
     let tables = vec![table0, table1];
     let mut mi = MergeIterator::new(
-        tables
-            .iter()
-            .map(|table| -> Box<dyn HummockIterator<Direction = Forward>> {
-                Box::new(SSTableIterator::new(
-                    block_on(sstable_store.sstable(table.id)).unwrap(),
+        {
+            let mut iters = vec![];
+            for table in &tables {
+                iters.push(Box::new(SstableIterator::new(
+                    sstable_store
+                        .sstable(table.id, &mut StoreLocalStatistic::default())
+                        .await
+                        .unwrap(),
                     sstable_store.clone(),
+                    Arc::new(SstableIteratorReadOptions::default()),
                 ))
-            }),
+                    as Box<dyn HummockIterator<Direction = Forward>>);
+            }
+            iters
+        },
         Arc::new(StateStoreMetrics::unused()),
     );
     mi.rewind().await.unwrap();
@@ -198,7 +207,7 @@ async fn test_failpoint_merge_invalid_key() {
 }
 #[tokio::test]
 #[cfg(feature = "failpoints")]
-async fn test_failpoint_backward_merge_invalid_key() {
+async fn test_failpoints_backward_merge_invalid_key() {
     fail::cfg("disable_block_cache", "return").unwrap();
     fail::cfg("disable_bloom_filter", "return").unwrap();
     let mem_read_err = "mem_read_err";
@@ -221,14 +230,20 @@ async fn test_failpoint_backward_merge_invalid_key() {
     .await;
     let tables = vec![table0, table1];
     let mut mi = BackwardMergeIterator::new(
-        tables
-            .iter()
-            .map(|table| -> Box<dyn HummockIterator<Direction = Backward>> {
-                Box::new(BackwardSSTableIterator::new(
-                    block_on(sstable_store.sstable(table.id)).unwrap(),
+        {
+            let mut iters = vec![];
+            for table in &tables {
+                iters.push(Box::new(BackwardSstableIterator::new(
+                    sstable_store
+                        .sstable(table.id, &mut StoreLocalStatistic::default())
+                        .await
+                        .unwrap(),
                     sstable_store.clone(),
                 ))
-            }),
+                    as Box<dyn HummockIterator<Direction = Backward>>);
+            }
+            iters
+        },
         Arc::new(StateStoreMetrics::unused()),
     );
     mi.rewind().await.unwrap();
@@ -247,7 +262,7 @@ async fn test_failpoint_backward_merge_invalid_key() {
 }
 #[tokio::test]
 #[cfg(feature = "failpoints")]
-async fn test_failpoint_user_read_err() {
+async fn test_failpoints_user_read_err() {
     fail::cfg("disable_block_cache", "return").unwrap();
     fail::cfg("disable_bloom_filter", "return").unwrap();
     let mem_read_err = "mem_read_err";
@@ -268,14 +283,17 @@ async fn test_failpoint_user_read_err() {
         200,
     )
     .await;
+    let mut stats = StoreLocalStatistic::default();
     let iters: Vec<BoxedForwardHummockIterator> = vec![
-        Box::new(SSTableIterator::new(
-            block_on(sstable_store.sstable(table0.id)).unwrap(),
+        Box::new(SstableIterator::new(
+            sstable_store.sstable(table0.id, &mut stats).await.unwrap(),
             sstable_store.clone(),
+            Arc::new(SstableIteratorReadOptions::default()),
         )),
-        Box::new(SSTableIterator::new(
-            block_on(sstable_store.sstable(table1.id)).unwrap(),
+        Box::new(SstableIterator::new(
+            sstable_store.sstable(table1.id, &mut stats).await.unwrap(),
             sstable_store.clone(),
+            Arc::new(SstableIteratorReadOptions::default()),
         )),
     ];
 
@@ -303,9 +321,10 @@ async fn test_failpoint_user_read_err() {
     assert!(!ui.is_valid());
     fail::remove(mem_read_err);
 }
+
 #[tokio::test]
 #[cfg(feature = "failpoints")]
-async fn test_failpoint_backward_user_read_err() {
+async fn test_failpoints_backward_user_read_err() {
     fail::cfg("disable_block_cache", "return").unwrap();
     fail::cfg("disable_bloom_filter", "return").unwrap();
     let mem_read_err = "mem_read_err";
@@ -326,13 +345,14 @@ async fn test_failpoint_backward_user_read_err() {
         200,
     )
     .await;
+    let mut stats = StoreLocalStatistic::default();
     let iters: Vec<BoxedBackwardHummockIterator> = vec![
-        Box::new(BackwardSSTableIterator::new(
-            block_on(sstable_store.sstable(table0.id)).unwrap(),
+        Box::new(BackwardSstableIterator::new(
+            sstable_store.sstable(table0.id, &mut stats).await.unwrap(),
             sstable_store.clone(),
         )),
-        Box::new(BackwardSSTableIterator::new(
-            block_on(sstable_store.sstable(table1.id)).unwrap(),
+        Box::new(BackwardSstableIterator::new(
+            sstable_store.sstable(table1.id, &mut stats).await.unwrap(),
             sstable_store.clone(),
         )),
     ];

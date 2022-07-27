@@ -5,6 +5,7 @@ package task_service;
 import "batch_plan.proto";
 import "common.proto";
 import "data.proto";
+import "stream_plan.proto";
 
 option optimize_for = SPEED;
 
@@ -13,14 +14,6 @@ message TaskId {
   string query_id = 1;
   uint32 stage_id = 2;
   uint32 task_id = 3;
-}
-
-// Every task will create N buffers (channels) for parent operators to fetch results from,
-// where N is the parallelism of parent stage.
-message TaskOutputId {
-  TaskId task_id = 1;
-  // The id of output channel to fetch from
-  uint32 output_id = 2;
 }
 
 message TaskInfo {
@@ -32,6 +25,8 @@ message TaskInfo {
     CANCELLING = 4;
     FINISHED = 5;
     FAILED = 6;
+    ABORTED = 7;
+    ABORTING = 8;
   }
   batch_plan.TaskId task_id = 1;
   TaskStatus task_status = 2;
@@ -49,7 +44,6 @@ message CreateTaskResponse {
 
 message AbortTaskRequest {
   batch_plan.TaskId task_id = 1;
-  bool force = 2;
 }
 
 message AbortTaskResponse {
@@ -71,14 +65,23 @@ message GetDataResponse {
 }
 
 message GetStreamRequest {
-  uint32 up_fragment_id = 1;
-  uint32 down_fragment_id = 2;
+  uint32 up_actor_id = 1;
+  uint32 down_actor_id = 2;
+  uint32 up_fragment_id = 3;
+  uint32 down_fragment_id = 4;
+}
+
+message ExecuteRequest {
+  batch_plan.TaskId task_id = 1;
+  batch_plan.PlanFragment plan = 2;
+  uint64 epoch = 3;
 }
 
 service TaskService {
   rpc CreateTask(CreateTaskRequest) returns (CreateTaskResponse);
   rpc GetTaskInfo(GetTaskInfoRequest) returns (GetTaskInfoResponse);
   rpc AbortTask(AbortTaskRequest) returns (AbortTaskResponse);
+  rpc Execute(ExecuteRequest) returns (stream GetDataResponse);
 }
 
 message GetDataRequest {
@@ -86,7 +89,7 @@ message GetDataRequest {
 }
 
 message GetStreamResponse {
-  data.StreamMessage message = 1;
+  stream_plan.StreamMessage message = 1;
 }
 
 service ExchangeService {

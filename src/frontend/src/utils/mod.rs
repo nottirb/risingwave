@@ -16,6 +16,8 @@ mod column_index_mapping;
 pub use column_index_mapping::*;
 mod condition;
 pub use condition::*;
+mod connected_components;
+pub(crate) use connected_components::*;
 
 use crate::expr::{Expr, ExprImpl, ExprRewriter, InputRef};
 
@@ -27,8 +29,8 @@ pub struct Substitute {
 impl ExprRewriter for Substitute {
     fn rewrite_input_ref(&mut self, input_ref: InputRef) -> ExprImpl {
         assert_eq!(
-            self.mapping[input_ref.index()].return_type(),
             input_ref.return_type(),
+            self.mapping[input_ref.index()].return_type(),
             "Type mismatch when substituting {:?} with {:?}",
             input_ref,
             self.mapping[input_ref.index()],

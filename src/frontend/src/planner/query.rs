@@ -17,7 +17,7 @@ use risingwave_common::error::Result;
 
 use crate::binder::BoundQuery;
 use crate::optimizer::plan_node::{LogicalLimit, LogicalTopN};
-use crate::optimizer::property::{Distribution, Order};
+use crate::optimizer::property::{Order, RequiredDist};
 use crate::optimizer::PlanRoot;
 use crate::planner::Planner;
 
@@ -43,9 +43,13 @@ impl Planner {
                 LogicalTopN::create(plan, limit, offset, order.clone())
             }
         }
-        let dist = Distribution::Single;
+        let dist = RequiredDist::single();
         let mut out_fields = FixedBitSet::with_capacity(plan.schema().len());
         out_fields.insert_range(..plan.schema().len() - extra_order_exprs_len);
+        if plan.as_logical_project_set().is_some() {
+            // Do not output projected_row_id hidden column.
+            out_fields.set(0, false);
+        }
         let root = PlanRoot::new(plan, dist, order, out_fields, out_names);
         Ok(root)
     }

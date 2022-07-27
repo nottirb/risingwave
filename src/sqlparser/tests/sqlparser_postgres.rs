@@ -16,7 +16,6 @@
 
 #[macro_use]
 mod test_utils;
-use risingwave_sqlparser::ast::Expr::{Identifier, MapAccess};
 use risingwave_sqlparser::ast::*;
 use risingwave_sqlparser::parser::ParserError;
 use test_utils::*;
@@ -26,9 +25,9 @@ fn parse_create_table_with_defaults() {
     let sql = "CREATE TABLE public.customer (
             customer_id integer DEFAULT nextval(public.customer_customer_id_seq),
             store_id smallint NOT NULL,
-            first_name character varying(45) NOT NULL,
-            last_name character varying(45) COLLATE \"es_ES\" NOT NULL,
-            email character varying(50),
+            first_name character varying NOT NULL,
+            last_name character varying COLLATE \"es_ES\" NOT NULL,
+            email character varying,
             address_id smallint NOT NULL,
             activebool boolean DEFAULT true NOT NULL,
             create_date date DEFAULT now()::text NOT NULL,
@@ -48,64 +47,59 @@ fn parse_create_table_with_defaults() {
             assert_eq!(
                 columns,
                 vec![
-                    ColumnDef {
-                        name: "customer_id".into(),
-                        data_type: DataType::Int(None),
-                        collation: None,
-                        options: vec![ColumnOptionDef {
+                    ColumnDef::new(
+                        "customer_id".into(),
+                        DataType::Int(None),
+                        None,
+                        vec![ColumnOptionDef {
                             name: None,
                             option: ColumnOption::Default(verified_expr(
                                 "nextval(public.customer_customer_id_seq)"
                             ))
                         }],
-                    },
-                    ColumnDef {
-                        name: "store_id".into(),
-                        data_type: DataType::SmallInt(None),
-                        collation: None,
-                        options: vec![ColumnOptionDef {
+                    ),
+                    ColumnDef::new(
+                        "store_id".into(),
+                        DataType::SmallInt(None),
+                        None,
+                        vec![ColumnOptionDef {
                             name: None,
                             option: ColumnOption::NotNull,
                         }],
-                    },
-                    ColumnDef {
-                        name: "first_name".into(),
-                        data_type: DataType::Varchar(Some(45)),
-                        collation: None,
-                        options: vec![ColumnOptionDef {
+                    ),
+                    ColumnDef::new(
+                        "first_name".into(),
+                        DataType::Varchar,
+                        None,
+                        vec![ColumnOptionDef {
                             name: None,
                             option: ColumnOption::NotNull,
                         }],
-                    },
-                    ColumnDef {
-                        name: "last_name".into(),
-                        data_type: DataType::Varchar(Some(45)),
-                        collation: Some(ObjectName(vec![Ident::with_quote('"', "es_ES")])),
-                        options: vec![ColumnOptionDef {
+                    ),
+                    ColumnDef::new(
+                        "last_name".into(),
+                        DataType::Varchar,
+                        Some(ObjectName(vec![Ident::with_quote('"', "es_ES")])),
+                        vec![ColumnOptionDef {
                             name: None,
                             option: ColumnOption::NotNull,
                         }],
-                    },
-                    ColumnDef {
-                        name: "email".into(),
-                        data_type: DataType::Varchar(Some(50)),
-                        collation: None,
-                        options: vec![],
-                    },
-                    ColumnDef {
-                        name: "address_id".into(),
-                        data_type: DataType::SmallInt(None),
-                        collation: None,
-                        options: vec![ColumnOptionDef {
+                    ),
+                    ColumnDef::new("email".into(), DataType::Varchar, None, vec![],),
+                    ColumnDef::new(
+                        "address_id".into(),
+                        DataType::SmallInt(None),
+                        None,
+                        vec![ColumnOptionDef {
                             name: None,
                             option: ColumnOption::NotNull
                         }],
-                    },
-                    ColumnDef {
-                        name: "activebool".into(),
-                        data_type: DataType::Boolean,
-                        collation: None,
-                        options: vec![
+                    ),
+                    ColumnDef::new(
+                        "activebool".into(),
+                        DataType::Boolean,
+                        None,
+                        vec![
                             ColumnOptionDef {
                                 name: None,
                                 option: ColumnOption::Default(Expr::Value(Value::Boolean(true))),
@@ -115,12 +109,12 @@ fn parse_create_table_with_defaults() {
                                 option: ColumnOption::NotNull,
                             }
                         ],
-                    },
-                    ColumnDef {
-                        name: "create_date".into(),
-                        data_type: DataType::Date,
-                        collation: None,
-                        options: vec![
+                    ),
+                    ColumnDef::new(
+                        "create_date".into(),
+                        DataType::Date,
+                        None,
+                        vec![
                             ColumnOptionDef {
                                 name: None,
                                 option: ColumnOption::Default(verified_expr("CAST(now() AS TEXT)"))
@@ -130,12 +124,12 @@ fn parse_create_table_with_defaults() {
                                 option: ColumnOption::NotNull,
                             }
                         ],
-                    },
-                    ColumnDef {
-                        name: "last_update".into(),
-                        data_type: DataType::Timestamp(false),
-                        collation: None,
-                        options: vec![
+                    ),
+                    ColumnDef::new(
+                        "last_update".into(),
+                        DataType::Timestamp(false),
+                        None,
+                        vec![
                             ColumnOptionDef {
                                 name: None,
                                 option: ColumnOption::Default(verified_expr("now()")),
@@ -145,16 +139,16 @@ fn parse_create_table_with_defaults() {
                                 option: ColumnOption::NotNull,
                             }
                         ],
-                    },
-                    ColumnDef {
-                        name: "active".into(),
-                        data_type: DataType::Int(None),
-                        collation: None,
-                        options: vec![ColumnOptionDef {
+                    ),
+                    ColumnDef::new(
+                        "active".into(),
+                        DataType::Int(None),
+                        None,
+                        vec![ColumnOptionDef {
                             name: None,
                             option: ColumnOption::NotNull
                         }],
-                    },
+                    ),
                 ]
             );
             assert!(constraints.is_empty());
@@ -162,15 +156,15 @@ fn parse_create_table_with_defaults() {
                 with_options,
                 vec![
                     SqlOption {
-                        name: "fillfactor".into(),
+                        name: vec!["fillfactor".into()].into(),
                         value: number("20")
                     },
                     SqlOption {
-                        name: "user_catalog_table".into(),
+                        name: vec!["user_catalog_table".into()].into(),
                         value: Value::Boolean(true)
                     },
                     SqlOption {
-                        name: "autovacuum_vacuum_threshold".into(),
+                        name: vec!["autovacuum_vacuum_threshold".into()].into(),
                         value: number("100")
                     },
                 ]
@@ -185,8 +179,8 @@ fn parse_create_table_from_pg_dump() {
     let sql = "CREATE TABLE public.customer (
             customer_id integer DEFAULT nextval('public.customer_customer_id_seq'::regclass) NOT NULL,
             store_id smallint NOT NULL,
-            first_name character varying(45) NOT NULL,
-            last_name character varying(45) NOT NULL,
+            first_name character varying NOT NULL,
+            last_name character varying NOT NULL,
             info text[],
             address_id smallint NOT NULL,
             activebool boolean DEFAULT true NOT NULL,
@@ -199,8 +193,8 @@ fn parse_create_table_from_pg_dump() {
     one_statement_parses_to(sql, "CREATE TABLE public.customer (\
             customer_id INT DEFAULT nextval(CAST('public.customer_customer_id_seq' AS REGCLASS)) NOT NULL, \
             store_id SMALLINT NOT NULL, \
-            first_name CHARACTER VARYING(45) NOT NULL, \
-            last_name CHARACTER VARYING(45) NOT NULL, \
+            first_name CHARACTER VARYING NOT NULL, \
+            last_name CHARACTER VARYING NOT NULL, \
             info TEXT[], \
             address_id SMALLINT NOT NULL, \
             activebool BOOLEAN DEFAULT true NOT NULL, \
@@ -693,54 +687,6 @@ fn parse_pg_regex_match_ops() {
             select.projection[0]
         );
     }
-}
-
-#[test]
-fn parse_map_access_expr() {
-    let zero = "0".to_string();
-    let sql = "SELECT foo[0] FROM foos";
-    let select = verified_only_select(sql);
-    assert_eq!(
-        &MapAccess {
-            column: Box::new(Identifier(Ident {
-                value: "foo".to_string(),
-                quote_style: None
-            })),
-            keys: vec![Expr::Value(Value::Number(zero.clone(), false))]
-        },
-        expr_from_projection(only(&select.projection)),
-    );
-    let sql = "SELECT foo[0][0] FROM foos";
-    let select = verified_only_select(sql);
-    assert_eq!(
-        &MapAccess {
-            column: Box::new(Identifier(Ident {
-                value: "foo".to_string(),
-                quote_style: None
-            })),
-            keys: vec![
-                Expr::Value(Value::Number(zero.clone(), false)),
-                Expr::Value(Value::Number(zero.clone(), false))
-            ]
-        },
-        expr_from_projection(only(&select.projection)),
-    );
-    let sql = r#"SELECT bar[0]["baz"]["fooz"] FROM foos"#;
-    let select = verified_only_select(sql);
-    assert_eq!(
-        &MapAccess {
-            column: Box::new(Identifier(Ident {
-                value: "bar".to_string(),
-                quote_style: None
-            })),
-            keys: vec![
-                Expr::Value(Value::Number(zero, false)),
-                Expr::Value(Value::SingleQuotedString("baz".to_string())),
-                Expr::Value(Value::SingleQuotedString("fooz".to_string()))
-            ]
-        },
-        expr_from_projection(only(&select.projection)),
-    );
 }
 
 #[test]

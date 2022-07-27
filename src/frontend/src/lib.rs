@@ -12,19 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(clippy::derive_partial_eq_without_eq)]
 #![warn(clippy::dbg_macro)]
 #![warn(clippy::disallowed_methods)]
 #![warn(clippy::doc_markdown)]
 #![warn(clippy::explicit_into_iter_loop)]
 #![warn(clippy::explicit_iter_loop)]
 #![warn(clippy::inconsistent_struct_constructor)]
+#![warn(clippy::unused_async)]
 #![warn(clippy::map_flatten)]
 #![warn(clippy::no_effect_underscore_binding)]
 #![warn(clippy::await_holding_lock)]
 #![deny(unused_must_use)]
 #![deny(rustdoc::broken_intra_doc_links)]
 #![feature(map_try_insert)]
-#![feature(let_chains)]
 #![feature(negative_impls)]
 #![feature(generators)]
 #![feature(proc_macro_hygiene, stmt_expr_attributes)]
@@ -32,6 +33,10 @@
 #![feature(trait_alias)]
 #![feature(drain_filter)]
 #![feature(if_let_guard)]
+#![feature(assert_matches)]
+#![feature(map_first_last)]
+#![feature(lint_reasons)]
+
 #[macro_use]
 pub mod catalog;
 pub mod binder;
@@ -40,14 +45,18 @@ pub mod handler;
 pub mod observer;
 pub mod optimizer;
 pub mod planner;
-mod scheduler;
+#[expect(dead_code)]
+pub mod scheduler;
 pub mod session;
+pub mod stream_fragmenter;
 pub mod utils;
 extern crate log;
 mod meta_client;
 pub mod test_utils;
 extern crate core;
 extern crate risingwave_common;
+
+pub mod user;
 
 use std::ffi::OsString;
 use std::iter;
@@ -85,8 +94,15 @@ impl Default for FrontendOpts {
     }
 }
 
+use std::future::Future;
+use std::pin::Pin;
+
 /// Start frontend
-pub async fn start(opts: FrontendOpts) {
-    let session_mgr = Arc::new(SessionManagerImpl::new(&opts).await.unwrap());
-    pg_serve(&opts.host, session_mgr).await.unwrap();
+pub fn start(opts: FrontendOpts) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    // WARNING: don't change the function signature. Making it `async fn` will cause
+    // slow compile in release mode.
+    Box::pin(async move {
+        let session_mgr = Arc::new(SessionManagerImpl::new(&opts).await.unwrap());
+        pg_serve(&opts.host, session_mgr).await.unwrap();
+    })
 }

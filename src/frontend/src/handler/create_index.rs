@@ -23,10 +23,12 @@ use risingwave_pb::catalog::Table as ProstTable;
 use risingwave_sqlparser::ast::{ObjectName, OrderByExpr};
 
 use crate::binder::Binder;
+use crate::catalog::check_schema_writable;
 use crate::optimizer::plan_node::{LogicalScan, StreamTableScan};
-use crate::optimizer::property::{Distribution, FieldOrder, Order};
+use crate::optimizer::property::{FieldOrder, Order, RequiredDist};
 use crate::optimizer::{PlanRef, PlanRoot};
 use crate::session::{OptimizerContext, OptimizerContextRef, SessionImpl};
+use crate::stream_fragmenter::StreamFragmenter;
 
 pub(crate) fn gen_create_index_plan(
     session: &SessionImpl,
@@ -80,7 +82,7 @@ pub(crate) fn gen_create_index_plan(
         .enumerate()
         .map(|(x, y)| (y.name.clone(), x))
         .collect::<HashMap<_, _>>();
-    let arrange_keys = columns
+    let arrange_key = columns
         .iter()
         .map(|x| {
             let x = x.to_string();
@@ -93,25 +95,27 @@ pub(crate) fn gen_create_index_plan(
 
     // Manually assemble the materialization plan for the index MV.
     let materialize = {
-        let scan_node = StreamTableScan::new(LogicalScan::new(
+        let mut required_cols = FixedBitSet::with_capacity(table_desc.columns.len());
+        required_cols.toggle_range(..);
+        required_cols.toggle(0);
+        let mut out_names: Vec<String> =
+            table_desc.columns.iter().map(|c| c.name.clone()).collect();
+        out_names.remove(0);
+
+        let scan_node = StreamTableScan::new(LogicalScan::create(
             table_name,
-            (0..table_desc.columns.len()).into_iter().collect(),
+            false,
             table_desc,
             // indexes are only used by DeltaJoin rule, and we don't need to provide them here.
             vec![],
             context,
         ));
-        let mut required_cols = FixedBitSet::with_capacity(scan_node.schema().len());
-        required_cols.toggle_range(..);
-        required_cols.toggle(0);
-        let mut out_names = scan_node.schema().names();
-        out_names.remove(0);
 
         PlanRoot::new(
             scan_node.into(),
-            Distribution::AnyShard,
+            RequiredDist::AnyShard,
             Order::new(
-                arrange_keys
+                arrange_key
                     .iter()
                     .map(|id| FieldOrder::ascending(*id))
                     .collect(),
@@ -123,6 +127,7 @@ pub(crate) fn gen_create_index_plan(
     };
 
     let (index_schema_name, index_table_name) = Binder::resolve_table_name(index_name)?;
+    check_schema_writable(&index_schema_name)?;
     let (index_database_id, index_schema_id) = session
         .env()
         .catalog_reader()
@@ -148,7 +153,7 @@ pub async fn handle_create_index(
 ) -> Result<PgResponse> {
     let session = context.session_ctx.clone();
 
-    let (plan, table) = {
+    let (graph, table) = {
         let (plan, table) = gen_create_index_plan(
             &session,
             context.into(),
@@ -157,18 +162,21 @@ pub async fn handle_create_index(
             columns,
         )?;
         let plan = plan.to_stream_prost();
+        let graph = StreamFragmenter::build_graph(plan);
 
-        (plan, table)
+        (graph, table)
     };
 
     log::trace!(
-        "name={}, plan=\n{}",
+        "name={}, graph=\n{}",
         table_name,
-        serde_json::to_string_pretty(&plan).unwrap()
+        serde_json::to_string_pretty(&graph).unwrap()
     );
 
     let catalog_writer = session.env().catalog_writer();
-    catalog_writer.create_materialized_view(table, plan).await?;
+    catalog_writer
+        .create_materialized_view(table, graph)
+        .await?;
 
     Ok(PgResponse::empty_result(StatementType::CREATE_TABLE))
 }

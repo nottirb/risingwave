@@ -19,7 +19,6 @@ risedev:
     - use: meta-node
       enable-dashboard-v2: false
       unsafe-disable-recovery: true
-      checkpoint-interval: 100
     - use: compute-node
     - use: frontend
 
@@ -39,6 +38,26 @@ risedev:
     #   persist-data: true
     # - use: kafka
     #   persist-data: true
+
+  default-v6:
+    - use: meta-node
+      address: "[::1]"
+      listen-address: "[::]"
+    - use: compute-node
+      address: "[::1]"
+      listen-address: "[::]"
+    - use: frontend
+      address: "[::1]"
+      listen-address: "[::]"
+
+  # The minimum config to use with risectl.
+  for-ctl:
+    - use: minio
+    - use: meta-node
+      unsafe-disable-recovery: true
+    - use: compute-node
+    - use: frontend
+    - use: compactor
 
   # `dev-compute-node` have the same settings as default except the the compute node will be started by user.
   dev-compute-node:
@@ -73,6 +92,23 @@ risedev:
     - use: kafka
       persist-data: true
 
+  full-benchmark:
+    - use: minio
+    - use: etcd
+    - use: meta-node
+    - use: compute-node
+    - use: frontend
+    - use: compactor
+    - use: prometheus
+      remote-write: true
+      remote-write-region: "ap-southeast-1"
+      remote-write-url: "https://aps-workspaces.ap-southeast-1.amazonaws.com/workspaces/ws-f3841dad-6a5c-420f-8f62-8f66487f512a/api/v1/remote_write"
+    - use: grafana
+    - use: zookeeper
+      persist-data: true
+    - use: kafka
+      persist-data: true
+
   ##########################################
   ### Configuration used for ./risedev p ###
   ##########################################
@@ -81,8 +117,37 @@ risedev:
     - use: meta-node
       enable-dashboard-v2: false
       unsafe-disable-recovery: true
+      max-idle-secs-to-exit: 1800
     - use: compute-node
     - use: frontend
+
+  docker-playground:
+    - use: meta-node
+      enable-dashboard-v2: false
+      unsafe-disable-recovery: true
+      listen-address: "0.0.0.0"
+      address: "127.0.0.1"
+    - use: compute-node
+      listen-address: "0.0.0.0"
+      address: "127.0.0.1"
+    - use: frontend
+      listen-address: "0.0.0.0"
+      address: "127.0.0.1"
+
+  # The profile for the online playground
+  online-docker-playground:
+    - use: meta-node
+      enable-dashboard-v2: false
+      unsafe-disable-recovery: true
+      max-idle-secs-to-exit: 1800
+      listen-address: "0.0.0.0"
+      address: "127.0.0.1"
+    - use: compute-node
+      listen-address: "0.0.0.0"
+      address: "127.0.0.1"
+    - use: frontend
+      listen-address: "0.0.0.0"
+      address: "127.0.0.1"
 
   ######################################
   ### Configurations used in Compose ###
@@ -128,13 +193,33 @@ risedev:
       listen-address: "0.0.0.0"
       address: ${id}
 
-  # special config for deployment, see related PR for more information
-  compose-3node-host-deploy:
-    - use: minio
-      id: minio-0
-      address: rw-source
+    - use: grafana
       listen-address: "0.0.0.0"
-      console-address: "0.0.0.0"
+      address: ${id}
+      id: grafana-0
+
+    - use: etcd
+      listen-address: "0.0.0.0"
+      address: ${id}
+      id: etcd-0
+
+  # special config for deployment, see related PR for more information
+  compose-3node-deploy:
+    # - use: minio
+    #   id: minio-0
+    #   address: ${dns-host:rw-source-0}
+    #   listen-address: "0.0.0.0"
+    #   console-address: "0.0.0.0"
+
+    - use: aws-s3
+      bucket: ${terraform:s3-bucket}
+
+    # Not enabled by default as all previous benchmarks are not done with etcd.
+    # Also we currently only support node-level docker volume tear down.
+    # - use: etcd
+    #   listen-address: "0.0.0.0"
+    #   address: ${dns-host:rw-meta-0}
+    #   id: etcd-0
 
     - use: meta-node
       # Id must starts with `meta-node`, therefore to be picked up by other
@@ -143,42 +228,46 @@ risedev:
 
       # Advertise address can be `id`, so as to use docker's DNS. If running
       # in host network mode, we should use IP directly in this field.
-      address: rw-meta
-
+      address: ${dns-host:rw-meta-0}
       listen-address: "0.0.0.0"
 
     - use: compute-node
       id: compute-node-0
       listen-address: "0.0.0.0"
-      address: rw-compute-1
+      address: ${dns-host:rw-compute-0}
 
     - use: compute-node
       id: compute-node-1
       listen-address: "0.0.0.0"
-      address: rw-compute-2
+      address: ${dns-host:rw-compute-1}
 
     - use: compute-node
       id: compute-node-2
       listen-address: "0.0.0.0"
-      address: rw-compute-3
+      address: ${dns-host:rw-compute-2}
 
     - use: frontend
       id: frontend-node-0
       listen-address: "0.0.0.0"
-      address: rw-meta
+      address: ${dns-host:rw-meta-0}
 
     - use: compactor
       id: compactor-0
       listen-address: "0.0.0.0"
-      address: rw-source
+      address: ${dns-host:rw-source-0}
 
     - use: redpanda
-      address: rw-source
+      address: ${dns-host:rw-source-0}
 
     - use: prometheus
       id: prometheus-0
       listen-address: "0.0.0.0"
-      address: rw-meta
+      address: ${dns-host:rw-meta-0}
+
+    - use: grafana
+      listen-address: "0.0.0.0"
+      address: ${dns-host:rw-meta-0}
+      id: grafana-0
 
   #################################
   ### Configurations used on CI ###
@@ -228,14 +317,11 @@ risedev:
 
 compose:
   risingwave: "ghcr.io/singularity-data/risingwave:latest"
-  compute-node: "ghcr.io/singularity-data/compute-node:latest"
-  meta-node: "ghcr.io/singularity-data/meta-node:latest"
-  compactor-node: "ghcr.io/singularity-data/compactor-node:latest"
-  frontend-node: "ghcr.io/singularity-data/frontend-node:latest"
   prometheus: "prom/prometheus:latest"
   minio: "quay.io/minio/minio:latest"
   redpanda: "docker.vectorized.io/vectorized/redpanda:latest"
   grafana: "grafana/grafana-oss:latest"
+  etcd: "quay.io/coreos/etcd:latest"
 
 # The `use` field specified in the above `risedev` section will refer to the templates below.
 template:
@@ -286,6 +372,9 @@ template:
     # Peer listen port of the single-node etcd.
     peer-port: 2389
 
+    # Prometheus exporter listen port
+    exporter-port: 2379
+
     # Whether to enable fsync (NEVER SET TO TRUE IN PRODUCTION ENVIRONMENT!)
     unsafe-no-fsync: false
 
@@ -325,9 +414,6 @@ template:
 
     # If `user-managed` is true, this service will be started by user with the above config
     user-managed: false
-
-    # Whether to enable in-memory pure KV state backend
-    enable-in-memory-kv-state-backend: false
 
   meta-node:
     # Meta-node advertise address
@@ -373,6 +459,15 @@ template:
     # Id of this instance
     id: prometheus
 
+    # If `remote_write` is true, this Prometheus instance will push metrics to remote instance
+    remote-write: false
+
+    # AWS region of remote write
+    remote-write-region: ""
+
+    # Remote write url of this instance
+    remote-write-url: ""
+
     # Compute-nodes used by this Prometheus instance
     provide-compute-node: "compute-node*"
 
@@ -384,6 +479,12 @@ template:
 
     # Compactors used by this Prometheus instance
     provide-compactor: "compactor*"
+
+    # Etcd used by this Prometheus instance
+    provide-etcd: "etcd*"
+
+    # Redpanda used by this Prometheus instance
+    provide-redpanda: "redpanda*"
 
   frontend:
     # Advertise address of frontend
@@ -434,6 +535,9 @@ template:
 
   grafana:
     # Listen address of Grafana
+    listen-address: ${address}
+
+    # Advertise address of Grafana
     address: "127.0.0.1"
 
     # Listen port of Grafana
@@ -521,3 +625,9 @@ template:
 
     # Connect address
     address: ${id}
+
+    # Number of CPUs to use
+    cpus: 8
+
+    # Memory limit for Redpanda
+    memory: 16G

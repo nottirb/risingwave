@@ -11,11 +11,45 @@ option optimize_for = SPEED;
 
 message RowSeqScanNode {
   plan_common.CellBasedTableDesc table_desc = 1;
+  repeated int32 column_ids = 2;
+  // All the ranges need to be read. i.e., they are OR'ed.
+  //
+  // Empty `scan_ranges` means full table scan.
+  repeated ScanRange scan_ranges = 3;
+  // The partition to read for scan tasks.
+  //
+  // Will be filled by the scheduler.
+  common.Buffer vnode_bitmap = 4;
+}
+
+message SysRowSeqScanNode {
+  string table_name = 1;
   repeated plan_common.ColumnDesc column_descs = 2;
 }
 
+// The range to scan, which specifies a consecutive range of the PK
+// and can represent: (Suppose there are N columns in the PK)
+// - full table scan: Should not occur. Use an empty `Vec<ScanRange>` instead.
+// - index range scan: `eq_conds` includes i (between 0 and N-1, inclusive) values,
+//     and `lower_bound` & `upper_bound` is the range for the (i+1)th column
+// - index point get: `eq_conds` includes N values, and `lower_bound` & `upper_bound` are `None`
+message ScanRange {
+  // The i-th element represents the value of the i-th PK column.
+  repeated bytes eq_conds = 1;
+
+  // `None` represent unbounded.
+  message Bound {
+    bytes value = 1;
+    bool inclusive = 2;
+  }
+  //  The lower bound of the next PK column subsequent to those in `eq_conds`.
+  Bound lower_bound = 2;
+  //  The upper bound of the next PK column subsequent to those in `eq_conds`.
+  Bound upper_bound = 3;
+}
+
 message SourceScanNode {
-  plan_common.TableRefId table_ref_id = 1;
+  uint32 table_id = 1;
   // timestamp_ms is used for offset synchronization of high level consumer groups, this field will be deprecated if a more elegant approach is available in the future
   int64 timestamp_ms = 2;
   repeated int32 column_ids = 3;
@@ -29,19 +63,18 @@ message FilterNode {
   expr.ExprNode search_condition = 1;
 }
 
-message FilterScanNode {
-  plan_common.TableRefId table_ref_id = 1;
-  repeated int32 column_ids = 2;
-}
-
 message InsertNode {
-  plan_common.TableRefId table_source_ref_id = 1;
+  uint32 table_source_id = 1;
   repeated int32 column_ids = 2;
-  bool frontend_v2 = 3;
 }
 
 message DeleteNode {
-  plan_common.TableRefId table_source_ref_id = 1;
+  uint32 table_source_id = 1;
+}
+
+message UpdateNode {
+  uint32 table_source_id = 1;
+  repeated expr.ExprNode exprs = 2;
 }
 
 message ValuesNode {
@@ -50,20 +83,6 @@ message ValuesNode {
   }
   repeated ExprTuple tuples = 1;
   repeated plan_common.Field fields = 2;
-}
-
-message CreateTableNode {
-  plan_common.TableRefId table_ref_id = 1;
-  repeated plan_common.ColumnDesc column_descs = 2;
-  // Other fields not included yet:
-  // primarykey_col_ids, dist_type, distkey_col_id, append_only
-
-
-  // We re-use the CreateTableNode for creating materialized views.
-  oneof info {
-    plan_common.TableSourceInfo table_source = 3;
-    plan_common.MaterializedViewInfo materialized_view = 4;
-  }
 }
 
 message OrderByNode {
@@ -81,32 +100,30 @@ message LimitNode {
   uint32 offset = 2;
 }
 
-message CreateSourceNode {
-  plan_common.TableRefId table_ref_id = 1;
-  repeated plan_common.ColumnDesc column_descs = 2;
-  plan_common.StreamSourceInfo info = 3;
-}
-
-message DropSourceNode {
-  plan_common.TableRefId table_ref_id = 1;
-}
-
-message DropTableNode {
-  plan_common.TableRefId table_ref_id = 1;
-}
-
 message NestedLoopJoinNode {
   plan_common.JoinType join_type = 1;
   expr.ExprNode join_cond = 2;
+  repeated uint32 output_indices = 3;
 }
 
 message HashAggNode {
-  repeated uint32 group_keys = 1;
+  repeated uint32 group_key = 1;
   repeated expr.AggCall agg_calls = 2;
 }
 
+message ExpandNode {
+  message Subset {
+    repeated uint32 column_indices = 1;
+  }
+  repeated Subset column_subsets = 1;
+}
+
+message ProjectSetNode {
+  repeated expr.ProjectSetSelectItem select_list = 1;
+}
+
 message SortAggNode {
-  repeated expr.ExprNode group_keys = 1;
+  repeated expr.ExprNode group_key = 1;
   repeated expr.AggCall agg_calls = 2;
 }
 
@@ -115,31 +132,26 @@ message HashJoinNode {
   repeated int32 left_key = 2;
   repeated int32 right_key = 3;
   expr.ExprNode condition = 4;
+  repeated uint32 output_indices = 5;
 }
 
 message SortMergeJoinNode {
   plan_common.JoinType join_type = 1;
-  repeated int32 left_keys = 2;
-  repeated int32 right_keys = 3;
+  repeated int32 left_key = 2;
+  repeated int32 right_key = 3;
   plan_common.OrderType direction = 4;
+  repeated uint32 output_indices = 5;
 }
 
 message HopWindowNode {
   expr.InputRefExpr time_col = 1;
   data.IntervalUnit window_slide = 2;
   data.IntervalUnit window_size = 3;
+  repeated uint32 output_indices = 4;
 }
 
-message GenerateInt32SeriesNode {
-  int32 start = 1;
-  int32 stop = 2;
-  int32 step = 3;
-}
-
-message GenerateTimeSeriesNode {
-  string start = 1;
-  string stop = 2;
-  data.IntervalUnit step = 3;
+message TableFunctionNode {
+  expr.TableFunction table_function = 1;
 }
 
 // Task is a running instance of Stage.
@@ -157,10 +169,18 @@ message TaskOutputId {
   uint32 output_id = 2;
 }
 
+message LocalExecutePlan {
+  batch_plan.PlanFragment plan = 1;
+  uint64 epoch = 2;
+}
+
 // ExchangeSource describes where to read results from children operators
 message ExchangeSource {
   TaskOutputId task_output_id = 1;
   common.HostAddress host = 2;
+  oneof local_execute_plan {
+    LocalExecutePlan plan = 3;
+  }
 }
 
 message ExchangeNode {
@@ -173,33 +193,43 @@ message MergeSortExchangeNode {
   repeated plan_common.ColumnOrder column_orders = 2;
 }
 
+message LookupJoinNode {
+  plan_common.JoinType join_type = 1;
+  expr.ExprNode condition = 2;
+  repeated int32 build_side_key = 3;
+  plan_common.CellBasedTableDesc probe_side_table_desc = 4;
+  repeated uint32 probe_side_vnode_mapping = 5;
+  repeated int32 probe_side_column_ids = 6;
+  repeated uint32 output_indices = 7;
+  repeated common.WorkerNode worker_nodes = 8;
+}
+
 message PlanNode {
   repeated PlanNode children = 1;
   oneof node_body {
     InsertNode insert = 2;
     DeleteNode delete = 3;
-    ProjectNode project = 4;
-    CreateTableNode create_table = 5;
-    DropTableNode drop_table = 6;
+    UpdateNode update = 4;
+    ProjectNode project = 5;
     HashAggNode hash_agg = 7;
     FilterNode filter = 8;
     ExchangeNode exchange = 9;
     OrderByNode order_by = 10;
     NestedLoopJoinNode nested_loop_join = 11;
-    CreateSourceNode create_source = 12;
-    SourceScanNode source_scan = 13;
     TopNNode top_n = 14;
     SortAggNode sort_agg = 15;
     RowSeqScanNode row_seq_scan = 16;
     LimitNode limit = 17;
     ValuesNode values = 18;
     HashJoinNode hash_join = 19;
-    DropSourceNode drop_source = 20;
     MergeSortExchangeNode merge_sort_exchange = 21;
     SortMergeJoinNode sort_merge_join = 22;
-    GenerateInt32SeriesNode generate_int32_series = 23;
     HopWindowNode hop_window = 25;
-    GenerateTimeSeriesNode generate_time_series = 26;
+    TableFunctionNode table_function = 26;
+    SysRowSeqScanNode sys_row_seq_scan = 27;
+    ExpandNode expand = 28;
+    LookupJoinNode lookup_join = 29;
+    ProjectSetNode project_set = 30;
   }
   string identity = 24;
 }
@@ -220,7 +250,7 @@ message ExchangeInfo {
   }
   message HashInfo {
     uint32 output_count = 1;
-    repeated uint32 keys = 3;
+    repeated uint32 key = 3;
   }
   DistributionMode mode = 1;
   oneof distribution {
