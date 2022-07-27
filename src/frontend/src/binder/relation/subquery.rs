@@ -17,7 +17,7 @@ use risingwave_sqlparser::ast::{Query, TableAlias};
 
 use crate::binder::{Binder, BoundQuery, UNNAMED_SUBQUERY};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BoundSubquery {
     pub query: BoundQuery,
 }
@@ -35,7 +35,7 @@ impl Binder {
         let query = self.bind_query(query)?;
         let sub_query_id = self.next_subquery_id();
 
-        self.bind_context(
+        self.bind_table_to_context(
             query
                 .body
                 .schema()

@@ -12,23 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use futures::channel::mpsc::{Receiver, Sender};
-use madsim::collections::HashMap;
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::{Mutex, MutexGuard, RwLock};
 use risingwave_common::error::{ErrorCode, Result, RwError};
 use risingwave_common::util::addr::HostAddr;
+use risingwave_pb::common::ActorInfo;
+use risingwave_rpc_client::ComputeClientPool;
+use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::executor::Message;
 
 mod barrier_manager;
-mod compute_client_pool;
 mod env;
 mod stream_manager;
 
 pub use barrier_manager::*;
-pub use compute_client_pool::*;
 pub use env::*;
 pub use stream_manager::*;
 
@@ -36,10 +36,11 @@ pub use stream_manager::*;
 pub const LOCAL_OUTPUT_CHANNEL_SIZE: usize = 16;
 
 pub type ConsumableChannelPair = (Option<Sender<Message>>, Option<Receiver<Message>>);
-pub type ConsumableChannelVecPair = (Vec<Sender<Message>>, Vec<Receiver<Message>>);
 pub type ActorId = u32;
+pub type FragmentId = u32;
 pub type DispatcherId = u64;
 pub type UpDownActorIds = (ActorId, ActorId);
+pub type UpDownFragmentIds = (FragmentId, FragmentId);
 
 /// Stores the information which may be modified from the data plane.
 pub struct SharedContext {
@@ -62,12 +63,20 @@ pub struct SharedContext {
     /// is on the server-side and we will also introduce backpressure.
     pub(crate) channel_map: Mutex<HashMap<UpDownActorIds, ConsumableChannelPair>>,
 
+    /// Stores all actor information.
+    pub(crate) actor_infos: RwLock<HashMap<ActorId, ActorInfo>>,
+
     /// Stores the local address.
     ///
     /// It is used to test whether an actor is local or not,
     /// thus determining whether we should setup local channel only or remote rpc connection
     /// between two actors/actors.
     pub(crate) addr: HostAddr,
+
+    /// The pool of compute clients.
+    // TODO: currently the client pool won't be cleared. Should remove compute clients when
+    // disconnected.
+    pub(crate) compute_client_pool: ComputeClientPool,
 
     pub(crate) barrier_manager: Arc<Mutex<LocalBarrierManager>>,
 }
@@ -83,45 +92,22 @@ impl std::fmt::Debug for SharedContext {
 impl SharedContext {
     pub fn new(addr: HostAddr) -> Self {
         Self {
-            channel_map: Mutex::new(HashMap::new()),
+            channel_map: Default::default(),
+            actor_infos: Default::default(),
             addr,
+            compute_client_pool: ComputeClientPool::new(u64::MAX),
             barrier_manager: Arc::new(Mutex::new(LocalBarrierManager::new())),
         }
     }
 
     #[cfg(test)]
     pub fn for_test() -> Self {
-        Self {
-            channel_map: Mutex::new(HashMap::new()),
-            addr: LOCAL_TEST_ADDR.clone(),
-            barrier_manager: Arc::new(Mutex::new(LocalBarrierManager::for_test())),
-        }
+        Self::new(LOCAL_TEST_ADDR.clone())
     }
 
     #[inline]
     fn lock_channel_map(&self) -> MutexGuard<HashMap<UpDownActorIds, ConsumableChannelPair>> {
         self.channel_map.lock()
-    }
-
-    /// Create a notifier for Create MV DDL finish. When an executor/actor (essentially a
-    /// [`crate::executor::ChainExecutor`]) finishes its DDL job, it can report that using this
-    /// notifier. Note that a DDL of MV always corresponds to an epoch in our system.
-    ///
-    /// Creation of an MV may last for several epochs to finish.
-    /// Therefore, when the [`crate::executor::ChainExecutor`] finds that the creation is
-    /// finished, it will send the DDL epoch using this notifier, which can be collected by the
-    /// barrier manager and reported to the meta service soon.
-    pub fn register_finish_create_mview_notifier(
-        &self,
-        actor_id: ActorId,
-    ) -> FinishCreateMviewNotifier {
-        debug!("register finish create mview notifier: {}", actor_id);
-
-        let barrier_manager = self.barrier_manager.clone();
-        FinishCreateMviewNotifier {
-            barrier_manager,
-            actor_id,
-        }
     }
 
     pub fn lock_barrier_manager(&self) -> MutexGuard<LocalBarrierManager> {
@@ -170,10 +156,14 @@ impl SharedContext {
 
     #[inline]
     pub fn add_channel_pairs(&self, ids: UpDownActorIds, channels: ConsumableChannelPair) {
-        self.lock_channel_map().insert(ids, channels);
+        assert!(
+            self.lock_channel_map().insert(ids, channels).is_none(),
+            "channel already exists: {:?}",
+            ids
+        );
     }
 
-    pub fn retain<F>(&self, mut f: F)
+    pub fn retain_channel<F>(&self, mut f: F)
     where
         F: FnMut(&(u32, u32)) -> bool,
     {
@@ -181,9 +171,12 @@ impl SharedContext {
             .retain(|up_down_ids, _| f(up_down_ids));
     }
 
-    #[cfg(test)]
-    pub fn get_channel_pair_number(&self) -> u32 {
-        self.lock_channel_map().len() as u32
+    pub fn get_actor_info(&self, actor_id: &ActorId) -> Result<ActorInfo> {
+        self.actor_infos
+            .read()
+            .get(actor_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("actor {} not found in info table", actor_id).into())
     }
 }
 

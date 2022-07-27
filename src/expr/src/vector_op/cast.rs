@@ -12,17 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use core::convert::From;
 use std::any::type_name;
 use std::str::FromStr;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
 use num_traits::ToPrimitive;
-use risingwave_common::error::ErrorCode::{InternalError, InvalidInputSyntax};
-use risingwave_common::error::{parse_error, Result, RwError};
 use risingwave_common::types::{
     Decimal, NaiveDateTimeWrapper, NaiveDateWrapper, NaiveTimeWrapper, OrderedF32, OrderedF64,
 };
+
+use crate::{ExprError, Result};
 
 /// String literals for bool type.
 ///
@@ -37,31 +36,10 @@ const PARSE_ERROR_STR_TO_TIME: &str =
 const PARSE_ERROR_STR_TO_DATE: &str = "Can't cast string to date (expected format is YYYY-MM-DD)";
 
 #[inline(always)]
-pub fn num_up<T, R>(n: T) -> Result<R>
-where
-    T: Into<R>,
-{
-    Ok(n.into())
-}
-
-#[inline(always)]
-pub fn float_up(n: OrderedF32) -> Result<OrderedF64> {
-    Ok((n.0 as f64).into())
-}
-
-/// Cast between different precision/length.
-/// Eg. Char(5) -> Char(10)
-/// Currently no-op. TODO: implement padding and overflow check (#2137)
-#[inline(always)]
-pub fn str_to_str(n: &str) -> Result<String> {
-    Ok(n.into())
-}
-
-#[inline(always)]
 pub fn str_to_date(elem: &str) -> Result<NaiveDateWrapper> {
     Ok(NaiveDateWrapper::new(
         NaiveDate::parse_from_str(elem, "%Y-%m-%d")
-            .map_err(|_| parse_error(PARSE_ERROR_STR_TO_DATE))?,
+            .map_err(|_| ExprError::Parse(PARSE_ERROR_STR_TO_DATE))?,
     ))
 }
 
@@ -73,7 +51,7 @@ pub fn str_to_time(elem: &str) -> Result<NaiveTimeWrapper> {
     if let Ok(time) = NaiveTime::parse_from_str(elem, "%H:%M") {
         return Ok(NaiveTimeWrapper::new(time));
     }
-    Err(parse_error(PARSE_ERROR_STR_TO_TIME))
+    Err(ExprError::Parse(PARSE_ERROR_STR_TO_TIME))
 }
 
 #[inline(always)]
@@ -87,18 +65,14 @@ pub fn str_to_timestamp(elem: &str) -> Result<NaiveDateTimeWrapper> {
     if let Ok(date) = NaiveDate::parse_from_str(elem, "%Y-%m-%d") {
         return Ok(NaiveDateTimeWrapper::new(date.and_hms(0, 0, 0)));
     }
-    Err(parse_error(PARSE_ERROR_STR_TO_TIMESTAMP))
+    Err(ExprError::Parse(PARSE_ERROR_STR_TO_TIMESTAMP))
 }
 
 #[inline(always)]
 pub fn str_to_timestampz(elem: &str) -> Result<i64> {
     DateTime::parse_from_str(elem, "%Y-%m-%d %H:%M:%S %:z")
         .map(|ret| ret.timestamp_nanos() / 1000)
-        .map_err(|_| {
-            parse_error(
-                "Can't cast string to timestamp (expected format is YYYY-MM-DD HH:MM:SS[.MS])",
-            )
-        })
+        .map_err(|_| ExprError::Parse(PARSE_ERROR_STR_TO_TIMESTAMP))
 }
 
 #[inline(always)]
@@ -107,14 +81,8 @@ where
     T: FromStr,
     <T as FromStr>::Err: std::fmt::Display,
 {
-    elem.parse().map_err(|e| {
-        RwError::from(InternalError(format!(
-            "Can't cast {:?} to {:?}: {}",
-            elem,
-            type_name::<T>(),
-            e
-        )))
-    })
+    elem.parse()
+        .map_err(|_| ExprError::Cast(type_name::<str>(), type_name::<T>()))
 }
 
 #[inline(always)]
@@ -144,11 +112,10 @@ macro_rules! define_cast_to_primitive {
             {
                 elem.[<to_ $ty>]()
                     .ok_or_else(|| {
-                        RwError::from(InternalError(format!(
-                            "Can't cast {:?} to {}",
-                            elem,
+                        ExprError::Cast(
+                            std::any::type_name::<T>(),
                             std::any::type_name::<$ty>()
-                        )))
+                        )
                     })
                     .map(Into::into)
             }
@@ -185,14 +152,8 @@ where
     T1: TryInto<T2> + std::fmt::Debug + Copy,
     <T1 as TryInto<T2>>::Error: std::fmt::Display,
 {
-    elem.try_into().map_err(|e| {
-        RwError::from(InternalError(format!(
-            "Can't cast {:?} to {:?}: {}",
-            &elem,
-            type_name::<T2>(),
-            e
-        )))
-    })
+    elem.try_into()
+        .map_err(|_| ExprError::Cast(std::any::type_name::<T1>(), std::any::type_name::<T2>()))
 }
 
 #[inline(always)]
@@ -205,19 +166,11 @@ pub fn str_to_bool(input: &str) -> Result<bool> {
         Ok(true)
     } else if FALSE_BOOL_LITERALS
         .iter()
-        .any(|s| trimmed_input.eq_ignore_ascii_case(*s))
+        .any(|s| trimmed_input.eq_ignore_ascii_case(s))
     {
         Ok(false)
     } else {
-        Err(InvalidInputSyntax(format!("'{}' is not a valid bool", input)).into())
-    }
-}
-
-#[inline(always)]
-pub fn bool_to_str(input: bool) -> Result<String> {
-    match input {
-        true => Ok("true".into()),
-        false => Ok("false".into()),
+        Err(ExprError::Parse("Invalid bool"))
     }
 }
 
@@ -225,8 +178,20 @@ pub fn int32_to_bool(input: i32) -> Result<bool> {
     Ok(input != 0)
 }
 
+pub fn general_to_string<T: std::fmt::Display>(elem: T) -> Result<String> {
+    Ok(elem.to_string())
+}
+
+/// `bool_out` is different from `general_to_string<bool>` to produce a single char. `PostgreSQL`
+/// uses different variants of bool-to-string in different situations.
+pub fn bool_out(input: bool) -> Result<String> {
+    Ok(if input { "t".into() } else { "f".into() })
+}
+
 #[cfg(test)]
 mod tests {
+    use num_traits::FromPrimitive;
+
     #[test]
     fn parse_str() {
         use super::*;
@@ -240,7 +205,7 @@ mod tests {
             str_to_timestamp("1999-01-08 04:05:06AA")
                 .unwrap_err()
                 .to_string(),
-            parse_error(PARSE_ERROR_STR_TO_TIMESTAMP).to_string()
+            ExprError::Parse(PARSE_ERROR_STR_TO_TIMESTAMP).to_string()
         );
         assert_eq!(
             str_to_date("1999-01-08AA").unwrap_err().to_string(),
@@ -248,7 +213,7 @@ mod tests {
         );
         assert_eq!(
             str_to_time("AA04:05:06").unwrap_err().to_string(),
-            parse_error(PARSE_ERROR_STR_TO_TIME).to_string()
+            ExprError::Parse(PARSE_ERROR_STR_TO_TIME).to_string()
         );
     }
 
@@ -258,5 +223,37 @@ mod tests {
         assert!(int32_to_bool(32).unwrap());
         assert!(int32_to_bool(-32).unwrap());
         assert!(!int32_to_bool(0).unwrap());
+    }
+
+    #[test]
+    fn number_to_string() {
+        use super::*;
+
+        assert_eq!(general_to_string(true).unwrap(), "true");
+        assert_eq!(general_to_string(false).unwrap(), "false");
+
+        assert_eq!(general_to_string(32).unwrap(), "32");
+        assert_eq!(general_to_string(-32).unwrap(), "-32");
+        assert_eq!(general_to_string(i32::MIN).unwrap(), "-2147483648");
+        assert_eq!(general_to_string(i32::MAX).unwrap(), "2147483647");
+
+        assert_eq!(general_to_string(i16::MIN).unwrap(), "-32768");
+        assert_eq!(general_to_string(i16::MAX).unwrap(), "32767");
+
+        assert_eq!(general_to_string(i64::MIN).unwrap(), "-9223372036854775808");
+        assert_eq!(general_to_string(i64::MAX).unwrap(), "9223372036854775807");
+
+        assert_eq!(general_to_string(32.12).unwrap(), "32.12");
+        assert_eq!(general_to_string(-32.14).unwrap(), "-32.14");
+
+        assert_eq!(general_to_string(32.12_f32).unwrap(), "32.12");
+        assert_eq!(general_to_string(-32.14_f32).unwrap(), "-32.14");
+
+        assert_eq!(
+            general_to_string(Decimal::from_f64(1.222).unwrap()).unwrap(),
+            "1.222"
+        );
+
+        assert_eq!(general_to_string(Decimal::NaN).unwrap(), "NaN");
     }
 }

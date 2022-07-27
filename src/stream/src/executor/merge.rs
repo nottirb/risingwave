@@ -12,102 +12,155 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use async_trait::async_trait;
-use futures::channel::mpsc::{Receiver, Sender};
-use futures::future::select_all;
-use futures::{SinkExt, StreamExt};
-use futures_async_stream::{for_await, try_stream};
-use itertools::Itertools;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use futures::{pin_mut, Stream, StreamExt};
+use futures_async_stream::try_stream;
 use risingwave_common::catalog::Schema;
-use risingwave_common::error::Result;
-use risingwave_pb::task_service::GetStreamResponse;
-use risingwave_rpc_client::ComputeClient;
-use tonic::Streaming;
-use tracing_futures::Instrument;
 
 use super::error::StreamExecutorError;
+use super::exchange::input::BoxedInput;
 use super::*;
-use crate::task::UpDownActorIds;
-
-/// Receive data from `gRPC` and forwards to `MergerExecutor`/`ReceiverExecutor`
-pub struct RemoteInput {
-    stream: Streaming<GetStreamResponse>,
-    sender: Sender<Message>,
-}
-
-impl RemoteInput {
-    /// Create a remote input from compute client and related info. Should provide the corresponding
-    /// compute client of where the actor is placed.
-    pub async fn create(
-        client: ComputeClient,
-        up_down_ids: UpDownActorIds,
-        sender: Sender<Message>,
-    ) -> Result<Self> {
-        let stream = client.get_stream(up_down_ids.0, up_down_ids.1).await?;
-        Ok(Self { stream, sender })
-    }
-
-    pub async fn run(mut self) {
-        #[for_await]
-        for data_res in self.stream {
-            match data_res {
-                Ok(stream_msg) => {
-                    let msg_res = Message::from_protobuf(
-                        stream_msg
-                            .get_message()
-                            .expect("no message in stream response!"),
-                    );
-                    match msg_res {
-                        Ok(msg) => {
-                            self.sender.send(msg).await.unwrap();
-                        }
-                        Err(e) => {
-                            error!("RemoteInput forward message error:{}", e);
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("RemoteInput tonic error status:{}", e);
-                    break;
-                }
-            }
-        }
-    }
-}
+use crate::executor::exchange::input::new_input;
+use crate::executor::monitor::StreamingMetrics;
+use crate::task::{FragmentId, SharedContext};
 
 /// `MergeExecutor` merges data from multiple channels. Dataflow from one channel
 /// will be stopped on barrier.
 pub struct MergeExecutor {
     /// Upstream channels.
-    upstreams: Vec<Receiver<Message>>,
+    upstreams: Vec<BoxedInput>,
 
     /// Belonged actor id.
-    actor_id: u32,
+    actor_id: ActorId,
+
+    /// Belonged fragment id.
+    fragment_id: FragmentId,
+
+    /// Upstream fragment id.
+    upstream_fragment_id: FragmentId,
 
     info: ExecutorInfo,
+
+    /// Actor operator context.
+    status: OperatorInfoStatus,
+
+    /// Shared context of the stream manager.
+    context: Arc<SharedContext>,
+
+    /// Streaming metrics.
+    metrics: Arc<StreamingMetrics>,
 }
 
 impl MergeExecutor {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         schema: Schema,
         pk_indices: PkIndices,
-        actor_id: u32,
-        inputs: Vec<Receiver<Message>>,
+        actor_id: ActorId,
+        fragment_id: FragmentId,
+        upstream_fragment_id: FragmentId,
+        inputs: Vec<BoxedInput>,
+        context: Arc<SharedContext>,
+        actor_context: ActorContextRef,
+        receiver_id: u64,
+        metrics: Arc<StreamingMetrics>,
     ) -> Self {
         Self {
             upstreams: inputs,
             actor_id,
+            fragment_id,
+            upstream_fragment_id,
             info: ExecutorInfo {
                 schema,
                 pk_indices,
                 identity: "MergeExecutor".to_string(),
             },
+            status: OperatorInfoStatus::new(actor_context, receiver_id),
+            context,
+            metrics,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn for_test(inputs: Vec<tokio::sync::mpsc::Receiver<Message>>) -> Self {
+        use super::exchange::input::LocalInput;
+
+        Self::new(
+            Schema::default(),
+            vec![],
+            114,
+            514,
+            1919,
+            inputs.into_iter().map(LocalInput::for_test).collect(),
+            SharedContext::for_test().into(),
+            ActorContext::create(),
+            810,
+            StreamingMetrics::unused().into(),
+        )
+    }
+
+    #[try_stream(ok = Message, error = StreamExecutorError)]
+    async fn execute_inner(mut self: Box<Self>) {
+        // Futures of all active upstreams.
+        let select_all = SelectReceivers::new(self.actor_id, self.upstreams);
+        let actor_id_str = self.actor_id.to_string();
+
+        // Channels that're blocked by the barrier to align.
+        pin_mut!(select_all);
+        while let Some(msg) = select_all.next().await {
+            let msg: Message = msg?;
+            self.status.next_message(&msg);
+
+            match &msg {
+                Message::Chunk(chunk) => {
+                    self.metrics
+                        .actor_in_record_cnt
+                        .with_label_values(&[&actor_id_str])
+                        .inc_by(chunk.cardinality() as _);
+                }
+                Message::Barrier(barrier) => {
+                    if let Some(update) = barrier.as_update_merge(self.actor_id) {
+                        // Create new upstreams receivers.
+                        let new_upstreams = update
+                            .added_upstream_actor_id
+                            .iter()
+                            .map(|&upstream_actor_id| {
+                                new_input(
+                                    &self.context,
+                                    self.metrics.clone(),
+                                    self.actor_id,
+                                    self.fragment_id,
+                                    upstream_actor_id,
+                                    self.upstream_fragment_id,
+                                )
+                            })
+                            .try_collect()
+                            .map_err(|_| anyhow::anyhow!("failed to create upstream receivers"))?;
+
+                        // Poll the first barrier from the new upstreams. It must be the same as the
+                        // one we polled from original upstreams.
+                        let mut select_new = SelectReceivers::new(self.actor_id, new_upstreams);
+                        let new_barrier = expect_first_barrier(&mut select_new).await?;
+                        assert_eq!(barrier, &new_barrier);
+
+                        // Add the new upstreams to select.
+                        select_all.add_upstreams_from(select_new);
+
+                        // Remove upstreams.
+                        select_all.remove_upstreams(
+                            &update.removed_upstream_actor_id.iter().copied().collect(),
+                        );
+                    }
+                }
+            }
+
+            yield msg;
         }
     }
 }
 
-#[async_trait]
 impl Executor for MergeExecutor {
     fn execute(self: Box<Self>) -> BoxedMessageStream {
         self.execute_inner().boxed()
@@ -126,103 +179,134 @@ impl Executor for MergeExecutor {
     }
 }
 
-impl MergeExecutor {
-    #[try_stream(ok = Message, error = StreamExecutorError)]
-    async fn execute_inner(self) {
-        let mut upstreams = self.upstreams;
+pub struct SelectReceivers {
+    blocks: Vec<BoxedInput>,
+    upstreams: Vec<BoxedInput>,
+    barrier: Option<Barrier>,
+    last_base: usize,
+    actor_id: u32,
+}
 
-        loop {
-            // Futures of all active upstreams.
-            let mut active = upstreams
-                .into_iter()
-                .map(|ch| ch.into_future())
-                .collect_vec();
-            // Channels that're blocked by the barrier to align.
-            let mut blocked = Vec::with_capacity(active.len());
-            // The current barrier to align.
-            let mut current_barrier = None;
+impl SelectReceivers {
+    fn new(actor_id: u32, upstreams: Vec<BoxedInput>) -> Self {
+        Self {
+            blocks: Vec::with_capacity(upstreams.len()),
+            upstreams,
+            last_base: 0,
+            actor_id,
+            barrier: None,
+        }
+    }
 
-            // 1. Align the barriers.
-            while !active.is_empty() {
-                // Poll upstreams and get a message from the ready one.
-                let ((message, from), _id, remainings) = select_all(active)
-                    .instrument(tracing::trace_span!("idle"))
-                    .await;
+    /// Consume `other` and add its upstreams to `self`.
+    fn add_upstreams_from(&mut self, other: Self) {
+        assert!(self.blocks.is_empty() && self.barrier.is_none());
+        assert!(other.blocks.is_empty() && other.barrier.is_none());
+        assert_eq!(self.actor_id, other.actor_id);
 
-                // Panic on channel close.
-                let message = message.expect(
-                    "upstream channel closed unexpectedly, please check error in upstream executors"
-                );
-                // Put back the remainings.
-                active = remainings;
+        self.upstreams.extend(other.upstreams);
+        self.last_base = 0;
+    }
 
-                match message {
-                    Message::Chunk(_) => {
-                        // We may still receive message from this channel.
-                        active.push(from.into_future());
-                        yield message;
-                    }
-                    Message::Barrier(barrier) => {
-                        // Align the barrier.
-                        if let Some(current_barrier) = current_barrier.as_ref() {
-                            if &barrier != current_barrier {
-                                return Err(StreamExecutorError::align_barrier(
-                                    current_barrier.clone(),
-                                    barrier,
-                                ));
+    /// Remove upstreams from `self` in `upstream_actor_ids`.
+    fn remove_upstreams(&mut self, upstream_actor_ids: &HashSet<ActorId>) {
+        assert!(self.blocks.is_empty() && self.barrier.is_none());
+
+        self.upstreams
+            .retain(|u| !upstream_actor_ids.contains(&u.actor_id()));
+        self.last_base = 0;
+    }
+}
+
+impl Stream for SelectReceivers {
+    type Item = std::result::Result<Message, StreamExecutorError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut poll_count = 0;
+        while poll_count < self.upstreams.len() {
+            let idx = (poll_count + self.last_base) % self.upstreams.len();
+            match self.upstreams[idx].poll_next_unpin(cx) {
+                Poll::Pending => {
+                    poll_count += 1;
+                    continue;
+                }
+                Poll::Ready(item) => {
+                    let message = item
+                        .expect("upstream closed unexpectedly, please check error in upstream executors")
+                        .expect("upstream error");
+
+                    match message {
+                        Message::Barrier(barrier) => {
+                            let rc = self.upstreams.swap_remove(idx);
+                            self.blocks.push(rc);
+                            if let Some(current_barrier) = self.barrier.as_ref() {
+                                if current_barrier.epoch != barrier.epoch {
+                                    return Poll::Ready(Some(Err(
+                                        StreamExecutorError::align_barrier(
+                                            current_barrier.clone(),
+                                            barrier,
+                                        ),
+                                    )));
+                                }
+                            } else {
+                                self.barrier = Some(barrier);
                             }
-                            assert_eq!(&barrier, current_barrier);
-                        } else {
-                            current_barrier = Some(barrier);
+                            poll_count = 0;
                         }
-                        // We'll not receive message from this channel during this epoch.
-                        blocked.push(from);
+                        Message::Chunk(chunk) => {
+                            let message = Message::Chunk(chunk);
+                            self.last_base = (idx + 1) % self.upstreams.len();
+                            return Poll::Ready(Some(Ok(message)));
+                        }
                     }
                 }
             }
-
-            // 2. Yield the barrier to downstream once all barriers collected from upstream.
-            let barrier = current_barrier.unwrap();
-            let to_stop = barrier.is_to_stop_actor(self.actor_id);
-            yield Message::Barrier(barrier);
-
-            // 3. Put back the upstreams, or close the stream.
-            if to_stop {
-                break;
+        }
+        if self.upstreams.is_empty() {
+            if let Some(barrier) = self.barrier.take() {
+                // If this barrier acquire the executor stop, we do not reset the upstreams
+                // so that the next call would return `Poll::Ready(None)`.
+                if !barrier.is_stop_or_update_drop_actor(self.actor_id) {
+                    self.upstreams = std::mem::take(&mut self.blocks);
+                }
+                let message = Message::Barrier(barrier);
+                Poll::Ready(Some(Ok(message)))
             } else {
-                upstreams = blocked;
+                Poll::Ready(None)
             }
+        } else {
+            Poll::Pending
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
     use assert_matches::assert_matches;
-    use futures::channel::mpsc::channel;
-    use futures::SinkExt;
+    use futures::FutureExt;
     use itertools::Itertools;
-    use madsim::collections::HashSet;
-    use madsim::time::sleep;
     use risingwave_common::array::{Op, StreamChunk};
-    use risingwave_pb::data::StreamMessage;
+    use risingwave_pb::stream_plan::StreamMessage;
     use risingwave_pb::task_service::exchange_service_server::{
         ExchangeService, ExchangeServiceServer,
     };
     use risingwave_pb::task_service::{
         GetDataRequest, GetDataResponse, GetStreamRequest, GetStreamResponse,
     };
-    use risingwave_rpc_client::ComputeClient;
+    use risingwave_rpc_client::ComputeClientPool;
+    use tokio::time::sleep;
     use tokio_stream::wrappers::ReceiverStream;
     use tonic::{Request, Response, Status};
 
     use super::*;
-    use crate::executor::merge::RemoteInput;
+    use crate::executor::exchange::input::RemoteInput;
     use crate::executor::{Barrier, Executor, Mutation};
+    use crate::task::test_utils::{add_local_channels, helper_make_local_actor};
 
     fn build_test_chunk(epoch: u64) -> StreamChunk {
         // The number of items in `ops` is the epoch count.
@@ -230,24 +314,24 @@ mod tests {
         StreamChunk::new(ops, vec![], None)
     }
 
-    #[madsim::test]
+    #[tokio::test]
     async fn test_merger() {
         const CHANNEL_NUMBER: usize = 10;
         let mut txs = Vec::with_capacity(CHANNEL_NUMBER);
         let mut rxs = Vec::with_capacity(CHANNEL_NUMBER);
         for _i in 0..CHANNEL_NUMBER {
-            let (tx, rx) = futures::channel::mpsc::channel(16);
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
             txs.push(tx);
             rxs.push(rx);
         }
-        let merger = MergeExecutor::new(Schema::default(), vec![], 0, rxs);
+        let merger = MergeExecutor::for_test(rxs);
         let mut handles = Vec::with_capacity(CHANNEL_NUMBER);
 
         let epochs = (10..1000u64).step_by(10).collect_vec();
 
-        for mut tx in txs {
+        for tx in txs {
             let epochs = epochs.clone();
-            let handle = madsim::task::spawn(async move {
+            let handle = tokio::spawn(async move {
                 for epoch in epochs {
                     tx.send(Message::Chunk(build_test_chunk(epoch)))
                         .await
@@ -289,8 +373,104 @@ mod tests {
         );
 
         for handle in handles {
-            handle.await;
+            handle.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn test_configuration_change() {
+        let schema = Schema { fields: vec![] };
+
+        let actor_id = 233;
+        let ctx = Arc::new(SharedContext::for_test());
+        let metrics = Arc::new(StreamingMetrics::unused());
+
+        // 1. Register info and channels in context.
+        {
+            let mut actor_infos = ctx.actor_infos.write();
+
+            for local_actor_id in [actor_id, 234, 235, 238] {
+                actor_infos.insert(local_actor_id, helper_make_local_actor(local_actor_id));
+            }
+        }
+        add_local_channels(
+            ctx.clone(),
+            vec![(234, actor_id), (235, actor_id), (238, actor_id)],
+        );
+
+        let inputs: Vec<_> = [234, 235]
+            .into_iter()
+            .map(|upstream_actor_id| {
+                new_input(&ctx, metrics.clone(), actor_id, 0, upstream_actor_id, 0)
+            })
+            .try_collect()
+            .unwrap();
+
+        let merge = MergeExecutor::new(
+            schema,
+            vec![],
+            actor_id,
+            0,
+            0,
+            inputs,
+            ctx.clone(),
+            ActorContext::create(),
+            233,
+            metrics.clone(),
+        )
+        .boxed()
+        .execute();
+
+        pin_mut!(merge);
+
+        // 2. Take downstream receivers.
+        let txs = [234, 235, 238]
+            .into_iter()
+            .map(|id| (id, ctx.take_sender(&(id, actor_id)).unwrap()))
+            .collect::<HashMap<_, _>>();
+        macro_rules! send {
+            ($actors:expr, $msg:expr) => {
+                for actor in $actors {
+                    txs.get(&actor).unwrap().send($msg).await.unwrap();
+                }
+            };
+        }
+        macro_rules! recv {
+            () => {
+                merge.next().now_or_never().flatten().transpose().unwrap()
+            };
+        }
+
+        // 3. Send a chunk.
+        send!([234, 235], Message::Chunk(StreamChunk::default()));
+        recv!().unwrap().as_chunk().unwrap(); // We should be able to receive the chunk twice.
+        recv!().unwrap().as_chunk().unwrap();
+        assert!(recv!().is_none());
+
+        // 4. Send a configuration change barrier.
+        let merge_updates = maplit::hashmap! {
+            actor_id => MergeUpdate {
+                added_upstream_actor_id: vec![238],
+                removed_upstream_actor_id: vec![235],
+            }
+        };
+
+        let b1 = Barrier::new_test_barrier(1).with_mutation(Mutation::Update {
+            dispatchers: Default::default(),
+            merges: merge_updates,
+            dropped_actors: Default::default(),
+        });
+        send!([234, 235], Message::Barrier(b1.clone()));
+        assert!(recv!().is_none()); // We should not receive the barrier, since merger is waiting for the new upstream 238.
+
+        send!([238], Message::Barrier(b1.clone()));
+        recv!().unwrap().as_barrier().unwrap(); // We should now receive the barrier.
+
+        // 5. Send a chunk.
+        send!([234, 238], Message::Chunk(StreamChunk::default()));
+        recv!().unwrap().as_chunk().unwrap(); // We should be able to receive the chunk twice, since 235 is removed.
+        recv!().unwrap().as_chunk().unwrap();
+        assert!(recv!().is_none());
     }
 
     struct FakeExchangeService {
@@ -320,7 +500,7 @@ mod tests {
             tx.send(Ok(GetStreamResponse {
                 message: Some(StreamMessage {
                     stream_message: Some(
-                        risingwave_pb::data::stream_message::StreamMessage::StreamChunk(
+                        risingwave_pb::stream_plan::stream_message::StreamMessage::StreamChunk(
                             stream_chunk,
                         ),
                     ),
@@ -333,7 +513,7 @@ mod tests {
             tx.send(Ok(GetStreamResponse {
                 message: Some(StreamMessage {
                     stream_message: Some(
-                        risingwave_pb::data::stream_message::StreamMessage::Barrier(
+                        risingwave_pb::stream_plan::stream_message::StreamMessage::Barrier(
                             barrier.to_protobuf(),
                         ),
                     ),
@@ -345,24 +525,24 @@ mod tests {
         }
     }
 
-    #[madsim::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_stream_exchange_client() {
         let rpc_called = Arc::new(AtomicBool::new(false));
         let server_run = Arc::new(AtomicBool::new(false));
         let addr = "127.0.0.1:12348".parse().unwrap();
 
         // Start a server.
-        let (shutdown_send, mut shutdown_recv) = tokio::sync::mpsc::unbounded_channel();
+        let (shutdown_send, shutdown_recv) = tokio::sync::oneshot::channel();
         let exchange_svc = ExchangeServiceServer::new(FakeExchangeService {
             rpc_called: rpc_called.clone(),
         });
         let cp_server_run = server_run.clone();
-        let join_handle = madsim::task::spawn(async move {
+        let join_handle = tokio::spawn(async move {
             cp_server_run.store(true, Ordering::SeqCst);
             tonic::transport::Server::builder()
                 .add_service(exchange_svc)
                 .serve_with_shutdown(addr, async move {
-                    shutdown_recv.recv().await;
+                    shutdown_recv.await.unwrap();
                 })
                 .await
                 .unwrap();
@@ -370,26 +550,32 @@ mod tests {
 
         sleep(Duration::from_secs(1)).await;
         assert!(server_run.load(Ordering::SeqCst));
-        let (tx, mut rx) = channel(16);
-        let input_handle = madsim::task::spawn(async move {
-            let remote_input =
-                RemoteInput::create(ComputeClient::new(addr.into()).await.unwrap(), (0, 0), tx)
-                    .await
-                    .unwrap();
-            remote_input.run().await
-        });
-        assert_matches!(rx.next().await.unwrap(), Message::Chunk(chunk) => {
+
+        let remote_input = {
+            let pool = ComputeClientPool::new(u64::MAX);
+            RemoteInput::new(
+                pool,
+                addr.into(),
+                (0, 0),
+                (0, 0),
+                Arc::new(StreamingMetrics::unused()),
+            )
+        };
+
+        pin_mut!(remote_input);
+
+        assert_matches!(remote_input.next().await.unwrap().unwrap(), Message::Chunk(chunk) => {
             let (ops, columns, visibility) = chunk.into_inner();
             assert_eq!(ops.len() as u64, 0);
             assert_eq!(columns.len() as u64, 0);
             assert_eq!(visibility, None);
         });
-        assert_matches!(rx.next().await.unwrap(), Message::Barrier(Barrier { epoch: barrier_epoch, mutation: _, .. }) => {
+        assert_matches!(remote_input.next().await.unwrap().unwrap(), Message::Barrier(Barrier { epoch: barrier_epoch, mutation: _, .. }) => {
             assert_eq!(barrier_epoch.curr, 12345);
         });
         assert!(rpc_called.load(Ordering::SeqCst));
-        input_handle.await;
+
         shutdown_send.send(()).unwrap();
-        join_handle.await;
+        join_handle.await.unwrap();
     }
 }

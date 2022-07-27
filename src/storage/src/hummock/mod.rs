@@ -16,6 +16,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use risingwave_common::config::StorageConfig;
@@ -24,33 +25,37 @@ use risingwave_rpc_client::HummockMetaClient;
 
 mod block_cache;
 pub use block_cache::*;
-mod sstable;
+pub mod sstable;
 pub use sstable::*;
-mod cache;
+
+pub mod compaction_executor;
+pub mod compaction_group_client;
 pub mod compactor;
-#[cfg(test)]
-mod compactor_tests;
-mod conflict_detector;
+pub mod conflict_detector;
 mod error;
 pub mod hummock_meta_client;
 pub mod iterator;
 mod local_version;
 pub mod local_version_manager;
 pub mod shared_buffer;
-#[cfg(test)]
-mod snapshot_tests;
-mod sstable_store;
+pub mod sstable_store;
 mod state_store;
-#[cfg(test)]
-mod state_store_tests;
-pub mod test_runner;
-#[cfg(test)]
-pub(crate) mod test_utils;
+#[cfg(any(test, feature = "test"))]
+pub mod test_utils;
 mod utils;
-mod vacuum;
+pub mod vacuum;
 pub mod value;
-pub use cache::{CachableEntry, LookupResult, LruCache};
+
+#[cfg(target_os = "linux")]
+pub mod file_cache;
+
+use std::collections::HashMap;
+
 pub use error::*;
+use parking_lot::RwLock;
+pub use risingwave_common::cache::{CachableEntry, LookupResult, LruCache};
+use risingwave_common::catalog::TableId;
+use risingwave_hummock_sdk::slice_transform::SliceTransformImpl;
 use value::*;
 
 use self::iterator::HummockIterator;
@@ -58,8 +63,13 @@ use self::key::user_key;
 pub use self::sstable_store::*;
 pub use self::state_store::HummockStateStoreIter;
 use super::monitor::StateStoreMetrics;
+use crate::hummock::compaction_group_client::CompactionGroupClient;
 use crate::hummock::conflict_detector::ConflictDetector;
 use crate::hummock::local_version_manager::LocalVersionManager;
+use crate::hummock::sstable::SstableIteratorReadOptions;
+use crate::hummock::sstable_store::{SstableStoreRef, TableHolder};
+use crate::monitor::StoreLocalStatistic;
+use crate::store::ReadOptions;
 
 /// Hummock is the state store backend.
 #[derive(Clone)]
@@ -74,6 +84,8 @@ pub struct HummockStorage {
 
     /// Statistics
     stats: Arc<StateStoreMetrics>,
+
+    compaction_group_client: Arc<dyn CompactionGroupClient>,
 }
 
 impl HummockStorage {
@@ -83,8 +95,17 @@ impl HummockStorage {
         sstable_store: SstableStoreRef,
         hummock_meta_client: Arc<dyn HummockMetaClient>,
         hummock_metrics: Arc<StateStoreMetrics>,
+        compaction_group_client: Arc<dyn CompactionGroupClient>,
     ) -> HummockResult<Self> {
-        Self::new(options, sstable_store, hummock_meta_client, hummock_metrics).await
+        Self::new(
+            options,
+            sstable_store,
+            hummock_meta_client,
+            hummock_metrics,
+            compaction_group_client,
+            Arc::new(RwLock::new(HashMap::new())),
+        )
+        .await
     }
 
     /// Creates a [`HummockStorage`].
@@ -94,6 +115,8 @@ impl HummockStorage {
         hummock_meta_client: Arc<dyn HummockMetaClient>,
         // TODO: separate `HummockStats` from `StateStoreMetrics`.
         stats: Arc<StateStoreMetrics>,
+        compaction_group_client: Arc<dyn CompactionGroupClient>,
+        table_id_to_slice_transform: Arc<RwLock<HashMap<u32, SliceTransformImpl>>>,
     ) -> HummockResult<Self> {
         // For conflict key detection. Enabled by setting `write_conflict_detection_enabled` to
         // true in `StorageConfig`
@@ -105,6 +128,7 @@ impl HummockStorage {
             stats.clone(),
             hummock_meta_client.clone(),
             write_conflict_detector,
+            table_id_to_slice_transform,
         )
         .await;
 
@@ -114,34 +138,33 @@ impl HummockStorage {
             hummock_meta_client,
             sstable_store,
             stats,
+            compaction_group_client,
         };
         Ok(instance)
     }
 
-    fn get_builder(options: &StorageConfig) -> SSTableBuilder {
-        SSTableBuilder::new(SSTableBuilderOptions {
-            capacity: options.sstable_size as usize,
-            block_capacity: options.block_size as usize,
-            restart_interval: DEFAULT_RESTART_INTERVAL,
-            bloom_false_positive: options.bloom_false_positive,
-            // TODO: Make this configurable.
-            compression_algorithm: CompressionAlgorithm::None,
-        })
-    }
-
     async fn get_from_table(
         &self,
-        table: TableHolder,
+        sstable: TableHolder,
         internal_key: &[u8],
         key: &[u8],
-    ) -> HummockResult<Option<Bytes>> {
-        if table.value().surely_not_have_user_key(key) {
-            self.stats.bloom_filter_true_negative_counts.inc();
+        _read_options: &ReadOptions,
+        stats: &mut StoreLocalStatistic,
+    ) -> HummockResult<Option<Option<Bytes>>> {
+        // TODO: via read_options to determine whether to check bloom_filter next PR
+        if sstable.value().surely_not_have_user_key(key) {
+            stats.bloom_filter_true_negative_count += 1;
             return Ok(None);
         }
         // Might have the key, take it as might positive.
-        self.stats.bloom_filter_might_positive_counts.inc();
-        let mut iter = SSTableIterator::new(table, self.sstable_store.clone());
+        stats.bloom_filter_might_positive_count += 1;
+        // TODO: now SstableIterator does not use prefetch through SstableIteratorReadOptions, so we
+        // use default before refinement.
+        let mut iter = SstableIterator::create(
+            sstable,
+            self.sstable_store.clone(),
+            Arc::new(SstableIteratorReadOptions::default()),
+        );
         iter.seek(internal_key).await?;
         // Iterator has seeked passed the borders.
         if !iter.is_valid() {
@@ -151,9 +174,10 @@ impl HummockStorage {
         // Iterator gets us the key, we tell if it's the key we want
         // or key next to it.
         let value = match user_key(iter.key()) == key {
-            true => iter.value().into_user_value().map(Bytes::copy_from_slice),
+            true => Some(iter.value().into_user_value().map(Bytes::copy_from_slice)),
             false => None,
         };
+        iter.collect_local_statistic(stats);
         Ok(value)
     }
 
@@ -171,6 +195,22 @@ impl HummockStorage {
 
     pub fn local_version_manager(&self) -> &Arc<LocalVersionManager> {
         &self.local_version_manager
+    }
+
+    async fn get_compaction_group_id(&self, table_id: TableId) -> HummockResult<CompactionGroupId> {
+        match tokio::time::timeout(
+            Duration::from_secs(10),
+            self.compaction_group_client
+                .get_compaction_group_id(table_id.table_id),
+        )
+        .await
+        {
+            Err(_) => Err(HummockError::other(format!(
+                "get_compaction_group_id {} timeout",
+                table_id
+            ))),
+            Ok(resp) => resp,
+        }
     }
 }
 

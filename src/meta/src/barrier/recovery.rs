@@ -12,17 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::iter::Map;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::try_join_all;
+use itertools::Itertools;
 use log::{debug, error};
-use risingwave_common::error::{ErrorCode, Result, RwError, ToRwResult};
+use risingwave_common::error::{ErrorCode, Result, RwError};
+use risingwave_common::types::VIRTUAL_NODE_COUNT;
+use risingwave_common::util::compress::decompress_data;
 use risingwave_common::util::epoch::Epoch;
-use risingwave_pb::common::ActorInfo;
+use risingwave_pb::common::worker_node::State;
+use risingwave_pb::common::{ActorInfo, WorkerNode, WorkerType};
 use risingwave_pb::data::Epoch as ProstEpoch;
-use risingwave_pb::stream_service::inject_barrier_response::FinishedCreateMview;
+use risingwave_pb::stream_service::barrier_complete_response::CreateMviewProgress;
 use risingwave_pb::stream_service::{
     BroadcastActorInfoTableRequest, BuildActorsRequest, ForceStopActorsRequest, SyncSourcesRequest,
     UpdateActorsRequest,
@@ -32,11 +37,12 @@ use uuid::Uuid;
 
 use crate::barrier::command::CommandContext;
 use crate::barrier::info::BarrierActorInfo;
-use crate::barrier::{Command, GlobalBarrierManager};
+use crate::barrier::{CheckpointControl, Command, GlobalBarrierManager};
+use crate::cluster::WorkerId;
 use crate::model::ActorId;
 use crate::storage::MetaStore;
 
-pub type RecoveryResult = (Epoch, HashSet<ActorId>, Vec<FinishedCreateMview>);
+pub type RecoveryResult = (Epoch, HashSet<ActorId>, Vec<CreateMviewProgress>);
 
 impl<S> GlobalBarrierManager<S>
 where
@@ -63,12 +69,23 @@ where
         debug!("recovery start!");
         let retry_strategy = Self::get_retry_strategy();
         let (new_epoch, responses) = tokio_retry::Retry::spawn(retry_strategy, || async {
-            let info = self.resolve_actor_info(None).await;
+            let mut info = self.resolve_actor_info(&CheckpointControl::new()).await;
             let mut new_epoch = prev_epoch.next();
 
+            if self.enable_migrate {
+                // Migrate expired actors to newly joined node by changing actor_map
+                self.migrate_actors(&info).await?;
+                info = self.resolve_actor_info(&CheckpointControl::new()).await;
+            }
+
             // Reset all compute nodes, stop and drop existing actors.
-            self.reset_compute_nodes(&info, &prev_epoch, &new_epoch)
-                .await;
+            if let Err(err) = self
+                .reset_compute_nodes(&info, &prev_epoch, &new_epoch)
+                .await
+            {
+                error!("reset compute nodes failed: {}", err);
+                return Err(err);
+            }
 
             // Refresh sources in local source manger of compute node.
             if let Err(err) = self.sync_sources(&info).await {
@@ -89,24 +106,30 @@ where
             let prev_epoch = new_epoch;
             new_epoch = prev_epoch.next();
             // checkpoint, used as init barrier to initialize all executors.
-            let command_ctx = CommandContext::new(
+            let command_ctx = Arc::new(CommandContext::new(
                 self.fragment_manager.clone(),
-                self.env.stream_clients_ref(),
-                &info,
-                &prev_epoch,
-                &new_epoch,
+                self.env.stream_client_pool_ref(),
+                info,
+                prev_epoch,
+                new_epoch,
                 Command::checkpoint(),
-            );
+            ));
 
-            match self.inject_barrier(&command_ctx).await {
-                Ok(response) => {
+            let command_ctx_clone = command_ctx.clone();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            if let Err(err) = self.inject_barrier(command_ctx_clone, tx).await {
+                error!("inject_barrier failed: {}", err);
+                return Err(err);
+            }
+            match rx.recv().await.unwrap() {
+                (_, Ok(response)) => {
                     if let Err(err) = command_ctx.post_collect().await {
                         error!("post_collect failed: {}", err);
                         return Err(err);
                     }
                     Ok((new_epoch, response))
                 }
-                Err(err) => {
+                (_, Err(err)) => {
                     error!("inject_barrier failed: {}", err);
                     Err(err)
                 }
@@ -116,20 +139,103 @@ where
         .expect("Retry until recovery success.");
         debug!("recovery success");
 
-        return (
+        (
             new_epoch,
             self.fragment_manager.all_chain_actor_ids().await,
             responses
                 .into_iter()
-                .flat_map(|r| r.finished_create_mviews)
+                .flat_map(|r| r.create_mview_progress)
                 .collect(),
-        );
+        )
+    }
+
+    /// map expired CNs to newly joined CNs, so we can migrate actors later
+    /// wait until get a sufficient amount of new CNs
+    /// return "map of `ActorId` in expired CN to new CN id" and "map of `WorkerId` to
+    /// `WorkerNode` struct in new CNs"
+    async fn get_migrate_map_plan(
+        &self,
+        info: &BarrierActorInfo,
+        expired_workers: &Vec<WorkerId>,
+    ) -> (HashMap<ActorId, WorkerId>, HashMap<WorkerId, WorkerNode>) {
+        let workers_size = expired_workers.len();
+        let mut cur = 0;
+        let mut migrate_map = HashMap::new();
+        let mut node_map = HashMap::new();
+        while cur < workers_size {
+            let current_nodes = self
+                .cluster_manager
+                .list_worker_node(WorkerType::ComputeNode, Some(State::Running))
+                .await;
+            let new_nodes = current_nodes
+                .iter()
+                .filter(|&node| {
+                    !info.node_map.contains_key(&node.id) && !node_map.contains_key(&node.id)
+                })
+                .collect_vec();
+            for new_node in new_nodes {
+                let actors = info.actor_map.get(&expired_workers[cur]).unwrap();
+                let actors_len = actors.len();
+                for actor in actors.iter().take(actors_len) {
+                    migrate_map.insert(*actor, new_node.id);
+                }
+                node_map.insert(new_node.id, new_node.clone());
+                cur += 1;
+                debug!(
+                    "got new worker {} , migrate process ({}/{})",
+                    new_node.id, cur, workers_size
+                );
+            }
+            // wait to get newly joined CN
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        (migrate_map, node_map)
+    }
+
+    async fn migrate_actors(&self, info: &BarrierActorInfo) -> Result<()> {
+        debug!("start migrate actors.");
+        // get expired workers
+        let expired_workers = info
+            .actor_map
+            .iter()
+            .filter(|(&worker, actors)| !actors.is_empty() && !info.node_map.contains_key(&worker))
+            .map(|(&worker, _)| worker)
+            .collect_vec();
+        if expired_workers.is_empty() {
+            debug!("no expired workers, skipping.");
+            return Ok(());
+        }
+        debug!("got expired workers {:#?}", expired_workers);
+        let (migrate_map, node_map) = self.get_migrate_map_plan(info, &expired_workers).await;
+        // migrate actors in fragments, return updated fragments and pu to pu migrate plan
+        let (new_fragments, migrate_map) = self
+            .fragment_manager
+            .migrate_actors(&migrate_map, &node_map)
+            .await?;
+        debug!("got parallel unit migrate plan {:#?}", migrate_map);
+        // update mapping in table and notify frontends
+        let res = self
+            .catalog_manager
+            .update_table_mapping(&new_fragments, &migrate_map)
+            .await;
+        // update hash mapping
+        for fragments in new_fragments {
+            for (fragment_id, fragment) in fragments.fragments {
+                let mapping = fragment.vnode_mapping.as_ref().unwrap();
+                let vnode_mapping = decompress_data(&mapping.original_indices, &mapping.data);
+                assert_eq!(vnode_mapping.len(), VIRTUAL_NODE_COUNT);
+                self.env
+                    .hash_mapping_manager()
+                    .set_fragment_hash_mapping(fragment_id, vnode_mapping);
+            }
+        }
+        debug!("migrate actors succeed.");
+        res
     }
 
     /// Sync all sources in compute nodes, the local source manager in compute nodes may be dirty
     /// already.
     async fn sync_sources(&self, info: &BarrierActorInfo) -> Result<()> {
-        // Attention, using catalog v2 here, it's not compatible with Java frontend.
         let catalog_guard = self.catalog_manager.get_catalog_core_guard().await;
         let sources = catalog_guard.list_sources().await?;
 
@@ -138,12 +244,8 @@ where
                 sources: sources.clone(),
             };
             async move {
-                let client = &self.env.stream_clients().get(node).await?;
-                client
-                    .to_owned()
-                    .sync_sources(request)
-                    .await
-                    .to_rw_result()?;
+                let client = &self.env.stream_client_pool().get(node).await?;
+                client.to_owned().sync_sources(request).await?;
 
                 Ok::<_, RwError>(())
             }
@@ -177,15 +279,14 @@ where
         let node_actors = self.fragment_manager.all_node_actors(false).await;
         for (node_id, actors) in &info.actor_map {
             let node = info.node_map.get(node_id).unwrap();
-            let client = self.env.stream_clients().get(node).await?;
+            let client = self.env.stream_client_pool().get(node).await?;
 
             client
                 .to_owned()
                 .broadcast_actor_info_table(BroadcastActorInfoTableRequest {
                     info: actor_infos.clone(),
                 })
-                .await
-                .to_rw_result_with(|| format!("failed to connect to {}", node_id))?;
+                .await?;
 
             let request_id = Uuid::new_v4().to_string();
             tracing::debug!(request_id = request_id.as_str(), actors = ?actors, "update actors");
@@ -196,8 +297,7 @@ where
                     actors: node_actors.get(node_id).cloned().unwrap_or_default(),
                     ..Default::default()
                 })
-                .await
-                .to_rw_result_with(|| format!("failed to connect to {}", node_id))?;
+                .await?;
         }
 
         Ok(())
@@ -207,7 +307,7 @@ where
     async fn build_actors(&self, info: &BarrierActorInfo) -> Result<()> {
         for (node_id, actors) in &info.actor_map {
             let node = info.node_map.get(node_id).unwrap();
-            let client = self.env.stream_clients().get(node).await?;
+            let client = self.env.stream_client_pool().get(node).await?;
 
             let request_id = Uuid::new_v4().to_string();
             tracing::debug!(request_id = request_id.as_str(), actors = ?actors, "build actors");
@@ -217,8 +317,7 @@ where
                     request_id,
                     actor_id: actors.to_owned(),
                 })
-                .await
-                .to_rw_result_with(|| format!("failed to connect to {}", node_id))?;
+                .await?;
         }
 
         Ok(())
@@ -230,34 +329,26 @@ where
         info: &BarrierActorInfo,
         prev_epoch: &Epoch,
         new_epoch: &Epoch,
-    ) {
-        let futures = info.node_map.iter().map(|(_, worker_node)| {
-            let retry_strategy = Self::get_retry_strategy();
-
-            async move {
-                tokio_retry::Retry::spawn(retry_strategy, || async {
-                    let client = self.env.stream_clients().get(worker_node).await?;
-                    debug!("force stop actors: {}", worker_node.id);
-                    client
-                        .to_owned()
-                        .force_stop_actors(ForceStopActorsRequest {
-                            request_id: Uuid::new_v4().to_string(),
-                            epoch: Some(ProstEpoch {
-                                curr: new_epoch.0,
-                                prev: prev_epoch.0,
-                            }),
-                        })
-                        .await
-                        .to_rw_result()
+    ) -> Result<()> {
+        let futures = info.node_map.iter().map(|(_, worker_node)| async move {
+            let client = self.env.stream_client_pool().get(worker_node).await?;
+            debug!("force stop actors: {}", worker_node.id);
+            client
+                .to_owned()
+                .force_stop_actors(ForceStopActorsRequest {
+                    request_id: Uuid::new_v4().to_string(),
+                    epoch: Some(ProstEpoch {
+                        curr: new_epoch.0,
+                        prev: prev_epoch.0,
+                    }),
                 })
                 .await
-                .expect("Force stop actors until success");
-
-                Ok::<_, RwError>(())
-            }
+                .map_err(RwError::from)
         });
 
-        try_join_all(futures).await.unwrap();
+        try_join_all(futures).await?;
         debug!("all compute nodes have been reset.");
+
+        Ok(())
     }
 }

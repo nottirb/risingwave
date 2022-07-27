@@ -15,6 +15,7 @@
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 
+use risingwave_common::catalog::{NON_RESERVED_PG_CATALOG_TABLE_ID, NON_RESERVED_USER_ID};
 use risingwave_common::error::Result;
 use tokio::sync::RwLock;
 
@@ -116,7 +117,7 @@ where
 type IdCategoryType = u8;
 
 // TODO: Use enum to replace this once [feature(adt_const_params)](https://github.com/rust-lang/rust/issues/95174) get completed.
-#[allow(non_snake_case, non_upper_case_globals)]
+#[expect(non_snake_case, non_upper_case_globals)]
 pub mod IdCategory {
     use super::IdCategoryType;
 
@@ -129,9 +130,11 @@ pub mod IdCategory {
     pub const Fragment: IdCategoryType = 5;
     pub const Actor: IdCategoryType = 6;
     pub const HummockSnapshot: IdCategoryType = 7;
-    pub const HummockSSTableId: IdCategoryType = 8;
+    pub const HummockSstableId: IdCategoryType = 8;
     pub const ParallelUnit: IdCategoryType = 9;
     pub const Source: IdCategoryType = 10;
+    pub const HummockCompactionTask: IdCategoryType = 11;
+    pub const User: IdCategoryType = 12;
 }
 
 pub type IdGeneratorManagerRef<S> = Arc<IdGeneratorManager<S>>;
@@ -147,8 +150,10 @@ pub struct IdGeneratorManager<S> {
     worker: Arc<StoredIdGenerator<S>>,
     fragment: Arc<StoredIdGenerator<S>>,
     actor: Arc<StoredIdGenerator<S>>,
+    user: Arc<StoredIdGenerator<S>>,
     hummock_snapshot: Arc<StoredIdGenerator<S>>,
     hummock_ss_table_id: Arc<StoredIdGenerator<S>>,
+    hummock_compaction_task: Arc<StoredIdGenerator<S>>,
     parallel_unit: Arc<StoredIdGenerator<S>>,
 }
 
@@ -162,7 +167,14 @@ where
             test: Arc::new(StoredIdGenerator::new(meta_store.clone(), "test", None).await),
             database: Arc::new(StoredIdGenerator::new(meta_store.clone(), "database", None).await),
             schema: Arc::new(StoredIdGenerator::new(meta_store.clone(), "schema", None).await),
-            table: Arc::new(StoredIdGenerator::new(meta_store.clone(), "table", None).await),
+            table: Arc::new(
+                StoredIdGenerator::new(
+                    meta_store.clone(),
+                    "table",
+                    Some(NON_RESERVED_PG_CATALOG_TABLE_ID),
+                )
+                .await,
+            ),
             worker: Arc::new(
                 StoredIdGenerator::new(meta_store.clone(), "worker", Some(META_NODE_ID as i32 + 1))
                     .await,
@@ -171,11 +183,19 @@ where
                 StoredIdGenerator::new(meta_store.clone(), "fragment", Some(1)).await,
             ),
             actor: Arc::new(StoredIdGenerator::new(meta_store.clone(), "actor", Some(1)).await),
+            user: Arc::new(
+                StoredIdGenerator::new(meta_store.clone(), "user", Some(NON_RESERVED_USER_ID))
+                    .await,
+            ),
             hummock_snapshot: Arc::new(
                 StoredIdGenerator::new(meta_store.clone(), "hummock_snapshot", Some(1)).await,
             ),
             hummock_ss_table_id: Arc::new(
                 StoredIdGenerator::new(meta_store.clone(), "hummock_ss_table_id", Some(1)).await,
+            ),
+            hummock_compaction_task: Arc::new(
+                StoredIdGenerator::new(meta_store.clone(), "hummock_compaction_task", Some(1))
+                    .await,
             ),
             parallel_unit: Arc::new(
                 StoredIdGenerator::new(meta_store.clone(), "parallel_unit", None).await,
@@ -192,10 +212,12 @@ where
             IdCategory::Table => &self.table,
             IdCategory::Fragment => &self.fragment,
             IdCategory::Actor => &self.actor,
+            IdCategory::User => &self.user,
             IdCategory::HummockSnapshot => &self.hummock_snapshot,
             IdCategory::Worker => &self.worker,
-            IdCategory::HummockSSTableId => &self.hummock_ss_table_id,
+            IdCategory::HummockSstableId => &self.hummock_ss_table_id,
             IdCategory::ParallelUnit => &self.parallel_unit,
+            IdCategory::HummockCompactionTask => &self.hummock_compaction_task,
             _ => unreachable!(),
         }
     }
@@ -288,15 +310,6 @@ mod tests {
         let ids = future::join_all((0..10000).map(|_i| {
             let manager = &manager;
             async move { manager.generate::<{ IdCategory::Test }>().await }
-        }))
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?;
-        assert_eq!(ids, (0..10000).collect::<Vec<_>>());
-
-        let ids = future::join_all((0..10000).map(|_i| {
-            let manager = &manager;
-            async move { manager.generate::<{ IdCategory::Table }>().await }
         }))
         .await
         .into_iter()

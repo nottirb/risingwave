@@ -12,25 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use fixedbitset::FixedBitSet;
 use itertools::Itertools;
-use risingwave_common::catalog::{ColumnDesc, Field, OrderedColumnDesc, Schema, TableId};
+use risingwave_common::catalog::{ColumnDesc, DatabaseId, SchemaId, TableId};
 use risingwave_common::error::ErrorCode::InternalError;
 use risingwave_common::error::Result;
-use risingwave_common::util::sort_util::OrderType;
-use risingwave_pb::expr::InputRefExpr;
-use risingwave_pb::plan_common::ColumnOrder;
 use risingwave_pb::stream_plan::stream_node::NodeBody as ProstStreamNode;
 
 use super::{PlanRef, PlanTreeNodeUnary, ToStreamProst};
 use crate::catalog::column_catalog::ColumnCatalog;
 use crate::catalog::table_catalog::TableCatalog;
-use crate::catalog::{gen_row_id_column_name, is_row_id_column_name, ColumnId};
+use crate::catalog::ColumnId;
 use crate::optimizer::plan_node::{PlanBase, PlanNode};
-use crate::optimizer::property::{Distribution, Order};
+use crate::optimizer::property::{Direction, Distribution, FieldOrder, Order, RequiredDist};
 
 /// Materializes a stream.
 #[derive(Debug, Clone)]
@@ -45,7 +42,7 @@ impl StreamMaterialize {
     fn derive_plan_base(input: &PlanRef) -> Result<PlanBase> {
         let ctx = input.ctx();
 
-        let schema = Self::derive_schema(input.schema())?;
+        let schema = input.schema().clone();
         let pk_indices = input.pk_indices();
 
         // Materialize executor won't change the append-only behavior of the stream, so it depends
@@ -57,28 +54,6 @@ impl StreamMaterialize {
             input.distribution().clone(),
             input.append_only(),
         ))
-    }
-
-    fn derive_schema(schema: &Schema) -> Result<Schema> {
-        let mut row_id_count = 0;
-        let fields = schema
-            .fields()
-            .iter()
-            .map(|field| match is_row_id_column_name(&field.name) {
-                true => {
-                    let field = Field::with_struct(
-                        field.data_type.clone(),
-                        gen_row_id_column_name(row_id_count),
-                        field.sub_fields.clone(),
-                        field.type_name.clone(),
-                    );
-                    row_id_count += 1;
-                    field
-                }
-                false => field.clone(),
-            })
-            .collect();
-        Ok(Schema { fields })
     }
 
     #[must_use]
@@ -99,60 +74,66 @@ impl StreamMaterialize {
         out_names: Vec<String>,
         is_index_on: Option<TableId>,
     ) -> Result<Self> {
-        // ensure the same pk will not shuffle to different node
-        let input = match input.distribution() {
-            Distribution::Single => input,
-            _ => Distribution::HashShard(if is_index_on.is_some() {
-                user_order_by.field_order.iter().map(|x| x.index).collect()
-            } else {
-                input.pk_indices().to_vec()
-            })
-            .enforce_if_not_satisfies(input, Order::any())?,
+        let required_dist = match input.distribution() {
+            Distribution::Single => RequiredDist::single(),
+            _ => {
+                if is_index_on.is_some() {
+                    RequiredDist::PhysicalDist(Distribution::HashShard(
+                        user_order_by.field_order.iter().map(|x| x.index).collect(),
+                    ))
+                } else {
+                    // ensure the same pk will not shuffle to different node
+                    RequiredDist::shard_by_key(input.schema().len(), input.pk_indices())
+                }
+            }
         };
 
+        let input = required_dist.enforce_if_not_satisfies(input, &Order::any())?;
         let base = Self::derive_plan_base(&input)?;
         let schema = &base.schema;
         let pk_indices = &base.pk_indices;
 
         let mut col_names = HashSet::new();
         for name in &out_names {
-            if !col_names.insert(name) {
+            if !col_names.insert(name.clone()) {
                 return Err(
                     InternalError(format!("column {} specified more than once", name)).into(),
                 );
             }
         }
         let mut out_name_iter = out_names.into_iter();
-        let mut columns = schema
+        let columns = schema
             .fields()
             .iter()
             .enumerate()
             .map(|(i, field)| {
                 let mut c = ColumnCatalog {
-                    column_desc: ColumnDesc::from_field_without_column_id(field),
+                    column_desc: ColumnDesc::from_field_with_column_id(field, i as i32),
                     is_hidden: !user_cols.contains(i),
                 };
-                if !c.is_hidden {
-                    let name = out_name_iter.next().unwrap();
-                    c.column_desc.name = name;
-                }
+                c.column_desc.name = if !c.is_hidden {
+                    out_name_iter.next().unwrap()
+                } else {
+                    let mut name = field.name.clone();
+                    let mut count = 0;
+
+                    while !col_names.insert(name.clone()) {
+                        count += 1;
+                        name = field.name.clone() + "#" + &count.to_string();
+                    }
+
+                    name
+                };
                 c
             })
             .collect_vec();
 
-        // Since the `field.into()` only generate same ColumnId,
-        // so rewrite ColumnId for each `column_desc` and `column_desc.field_desc`.
-        ColumnCatalog::generate_increment_id(&mut columns);
-
         let mut in_order = FixedBitSet::with_capacity(schema.len());
-        let mut order_desc = vec![];
+        let mut order_keys = vec![];
 
         for field in &user_order_by.field_order {
             let idx = field.index;
-            order_desc.push(OrderedColumnDesc {
-                column_desc: columns[idx].column_desc.clone(),
-                order: field.direct.into(),
-            });
+            order_keys.push(field.clone());
             in_order.insert(idx);
         }
 
@@ -160,9 +141,9 @@ impl StreamMaterialize {
             if in_order.contains(idx) {
                 continue;
             }
-            order_desc.push(OrderedColumnDesc {
-                column_desc: columns[idx].column_desc.clone(),
-                order: OrderType::Ascending,
+            order_keys.push(FieldOrder {
+                index: idx,
+                direct: Direction::Asc,
             });
             in_order.insert(idx);
         }
@@ -172,10 +153,15 @@ impl StreamMaterialize {
             associated_source_id: None,
             name: mv_name,
             columns,
-            order_desc,
-            pks: pk_indices.clone(),
+            order_key: order_keys,
+            pk: pk_indices.clone(),
             is_index_on,
-            distribution_keys: base.dist.dist_column_indices().to_vec(),
+            distribution_key: base.dist.dist_column_indices().to_vec(),
+            appendonly: input.append_only(),
+            owner: risingwave_common::catalog::DEFAULT_SUPER_USER_ID,
+            vnode_mapping: None,
+            properties: HashMap::default(),
+            read_pattern_prefix_column: 0,
         };
 
         Ok(Self { base, input, table })
@@ -193,6 +179,7 @@ impl StreamMaterialize {
 
     /// XXX(st1page): this function is used for potential DDL demand in future, and please try your
     /// best not convert `ColumnId` to `usize(col_index`)
+    #[expect(dead_code)]
     fn col_id_to_idx(&self, id: ColumnId) -> usize {
         id.get_id() as usize
     }
@@ -209,30 +196,26 @@ impl fmt::Display for StreamMaterialize {
             .join(", ");
 
         let pk_column_names = table
-            .pks
+            .pk
             .iter()
             .map(|&pk| &table.columns[pk].column_desc.name)
             .join(", ");
 
         let order_descs = table
-            .order_desc
+            .order_key
             .iter()
-            .map(|order| &order.column_desc.name)
+            .map(|order| table.columns()[order.index].column_desc.name.clone())
             .join(", ");
 
+        let mut builder = f.debug_struct("StreamMaterialize");
+        builder
+            .field("columns", &format_args!("[{}]", column_names))
+            .field("pk_columns", &format_args!("[{}]", pk_column_names));
+
         if pk_column_names != order_descs {
-            write!(
-                f,
-                "StreamMaterialize {{ columns: [{}], pk_columns: [{}], order_descs: [{}] }}",
-                column_names, pk_column_names, order_descs
-            )
-        } else {
-            write!(
-                f,
-                "StreamMaterialize {{ columns: [{}], pk_columns: [{}] }}",
-                column_names, pk_column_names
-            )
+            builder.field("order_descs", &format_args!("[{}]", order_descs));
         }
+        builder.finish()
     }
 }
 
@@ -258,36 +241,17 @@ impl ToStreamProst for StreamMaterialize {
         ProstStreamNode::Materialize(MaterializeNode {
             // We don't need table id for materialize node in frontend. The id will be generated on
             // meta catalog service.
-            table_ref_id: None,
-            associated_table_ref_id: None,
-            column_ids: self
-                .table()
-                .columns()
-                .iter()
-                .map(|col| ColumnId::get_id(&col.column_desc.column_id))
-                .collect(),
+            table_id: 0,
             column_orders: self
                 .table()
-                .order_desc()
+                .order_key()
                 .iter()
-                .map(|col| {
-                    let idx = self.col_id_to_idx(col.column_desc.column_id);
-                    ColumnOrder {
-                        order_type: col.order.to_prost() as i32,
-                        input_ref: Some(InputRefExpr {
-                            column_idx: idx as i32,
-                        }),
-                        return_type: Some(col.column_desc.data_type.to_protobuf()),
-                    }
-                })
+                .map(FieldOrder::to_protobuf)
                 .collect(),
-            distribution_keys: self
-                .base
-                .dist
-                .dist_column_indices()
-                .iter()
-                .map(|idx| *idx as i32)
-                .collect_vec(),
+            table: Some(self.table().to_prost(
+                SchemaId::placeholder() as u32,
+                DatabaseId::placeholder() as u32,
+            )),
         })
     }
 }

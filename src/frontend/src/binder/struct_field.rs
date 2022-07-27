@@ -38,8 +38,8 @@ impl Binder {
             // For CompoundIdentifier, we will use first ident as table name and second ident as
             // column name to get `column_desc`.
             Expr::CompoundIdentifier(idents) => {
-                let (table_name, column): (&String, &String) = match &idents[..] {
-                    [table, column] => (&table.value, &column.value),
+                let (table_name, column): (String, String) = match &idents[..] {
+                    [table, column] => (table.real_value(), column.real_value()),
                     _ => {
                         return Err(ErrorCode::InternalError(format!(
                             "Too many idents: {:?}",
@@ -50,7 +50,7 @@ impl Binder {
                 };
                 let index = self
                     .context
-                    .get_column_binding_index(Some(table_name), column)?;
+                    .get_column_binding_index(&Some(table_name), &column)?;
                 Ok((&self.context.columns[index], ids))
             }
             // For Identifier, we will first use the ident as
@@ -59,24 +59,26 @@ impl Binder {
             // The reason is that in pgsql, for table name v3 have a column name v3 which
             // have a field name v3. Select (v3).v3 from v3 will return the field value instead
             // of column value.
-            Expr::Identifier(ident) => match self.context.indexs_of.get(&ident.value) {
+            Expr::Identifier(ident) => match self.context.indexs_of.get(&ident.real_value()) {
                 Some(indexs) => {
                     if indexs.len() == 1 {
-                        let index = self.context.get_column_binding_index(None, &ident.value)?;
-                        Ok((&self.context.columns[index], ids))
-                    } else {
-                        let column = &ids[0].value;
                         let index = self
                             .context
-                            .get_column_binding_index(Some(&ident.value), column)?;
+                            .get_column_binding_index(&None, &ident.real_value())?;
+                        Ok((&self.context.columns[index], ids))
+                    } else {
+                        let column_name = ids[0].real_value();
+                        let index = self
+                            .context
+                            .get_column_binding_index(&Some(ident.real_value()), &column_name)?;
                         Ok((&self.context.columns[index], ids[1..].to_vec()))
                     }
                 }
                 None => {
-                    let column = &ids[0].value;
+                    let column_name = ids[0].real_value();
                     let index = self
                         .context
-                        .get_column_binding_index(Some(&ident.value), column)?;
+                        .get_column_binding_index(&Some(ident.real_value()), &column_name)?;
                     Ok((&self.context.columns[index], ids[1..].to_vec()))
                 }
             },
@@ -134,7 +136,7 @@ impl Binder {
     ) -> Result<(Vec<ExprImpl>, Field)> {
         match idents.get(0) {
             Some(ident) => {
-                let (field, field_index) = field.sub_field(&ident.value)?;
+                let (field, field_index) = field.sub_field(&ident.real_value())?;
                 let expr = FunctionCall::new_unchecked(
                     ExprType::Field,
                     vec![
@@ -198,13 +200,13 @@ impl Binder {
     pub fn expr_to_field(&self, item: &ExprImpl, name: String) -> Result<Field> {
         if let DataType::Struct { .. } = item.return_type() {
             // Derive the schema of a struct including its fields name.
-            // NOTE: The implementation assumes that only Min/Max/Field/InputRef
-            // will return a STRUCT. Because we assumes the first argument (if in a function form)
-            // must be a STRUCT.
+            // NOTE: The implementation assumes that only Min/Max/Field/InputRef/Struct ExprImpl
+            // will return a STRUCT type. Because we assumes the first argument (if in a function
+            // form) must be a STRUCT type.
             let is_struct_function = match item {
                 ExprImpl::InputRef(_) => true,
                 ExprImpl::FunctionCall(function) => {
-                    matches!(function.get_expr_type(), ExprType::Field)
+                    matches!(function.get_expr_type(), ExprType::Field | ExprType::Row)
                 }
                 ExprImpl::AggCall(agg) => {
                     matches!(agg.agg_kind(), AggKind::Max | AggKind::Min)
@@ -220,13 +222,15 @@ impl Binder {
             }
             let mut visitor = GetFieldDesc::new(self.context.columns.clone());
             visitor.visit_expr(item);
-            let column = visitor.collect()?;
-            Ok(Field::with_struct(
-                item.return_type(),
-                name,
-                column.sub_fields,
-                column.type_name,
-            ))
+            match visitor.collect()? {
+                None => Ok(Field::with_name(item.return_type(), name)),
+                Some(column) => Ok(Field::with_struct(
+                    item.return_type(),
+                    name,
+                    column.sub_fields,
+                    column.type_name,
+                )),
+            }
         } else {
             Ok(Field::with_name(item.return_type(), name))
         }
@@ -244,11 +248,8 @@ impl ExprVisitor for GetFieldDesc {
     /// Only check the first input because now we only accept nested column
     /// as first index.
     fn visit_agg_call(&mut self, agg_call: &AggCall) {
-        match agg_call.inputs().get(0) {
-            Some(input) => {
-                self.visit_expr(input);
-            }
-            None => {}
+        if let Some(input) = agg_call.inputs().get(0) {
+            self.visit_expr(input);
         }
     }
 
@@ -260,6 +261,9 @@ impl ExprVisitor for GetFieldDesc {
     /// `Field{Field,Literal(i32)}`. So we only need to check the first input to get
     /// `column_desc` from bindings. And then we get the `field_desc` by second input.
     fn visit_function_call(&mut self, func_call: &FunctionCall) {
+        if func_call.get_expr_type() == ExprType::Row {
+            return;
+        }
         match func_call.inputs().get(0) {
             Some(ExprImpl::FunctionCall(function)) => {
                 self.visit_function_call(function);
@@ -325,15 +329,10 @@ impl GetFieldDesc {
     }
 
     /// Returns the `field_desc` by the `GetFieldDesc`.
-    fn collect(self) -> Result<Field> {
+    fn collect(self) -> Result<Option<Field>> {
         match self.err {
             Some(err) => Err(err.into()),
-            None => match self.field {
-                Some(field) => Ok(field),
-                None => {
-                    Err(ErrorCode::BindError("Not find field for struct item".to_string()).into())
-                }
-            },
+            None => Ok(self.field),
         }
     }
 }

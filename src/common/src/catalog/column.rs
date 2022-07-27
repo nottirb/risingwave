@@ -13,10 +13,7 @@
 // limitations under the License.
 
 use itertools::Itertools;
-use risingwave_pb::plan_common::{
-    ColumnDesc as ProstColumnDesc, OrderType as ProstOrderType,
-    OrderedColumnDesc as ProstOrderedColumnDesc,
-};
+use risingwave_pb::plan_common::ColumnDesc as ProstColumnDesc;
 
 use crate::catalog::Field;
 use crate::error::ErrorCode;
@@ -71,6 +68,7 @@ pub struct ColumnDesc {
     pub type_name: String,
 }
 
+// Deprecated. To be removed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OrderedColumnDesc {
     pub column_desc: ColumnDesc,
@@ -136,7 +134,6 @@ impl ColumnDesc {
         }
     }
 
-    #[cfg(test)]
     pub fn new_atomic(data_type: DataType, name: &str, column_id: i32) -> Self {
         Self {
             data_type,
@@ -147,7 +144,6 @@ impl ColumnDesc {
         }
     }
 
-    #[cfg(test)]
     pub fn new_struct(
         name: &str,
         column_id: i32,
@@ -170,19 +166,10 @@ impl ColumnDesc {
         }
     }
 
-    /// Generate incremental `column_id` for `column_desc` and `field_descs`
-    pub fn generate_increment_id(&mut self, index: &mut i32) {
-        self.column_id = ColumnId::new(*index);
-        *index += 1;
-        for field in &mut self.field_descs {
-            field.generate_increment_id(index);
-        }
-    }
-
-    pub fn from_field_without_column_id(field: &Field) -> Self {
+    pub fn from_field_with_column_id(field: &Field, id: i32) -> Self {
         Self {
             data_type: field.data_type.clone(),
-            column_id: ColumnId::new(0),
+            column_id: ColumnId::new(id),
             name: field.name.clone(),
             field_descs: field
                 .sub_fields
@@ -191,6 +178,10 @@ impl ColumnDesc {
                 .collect_vec(),
             type_name: field.type_name.clone(),
         }
+    }
+
+    pub fn from_field_without_column_id(field: &Field) -> Self {
+        Self::from_field_with_column_id(field, 0)
     }
 }
 
@@ -225,15 +216,6 @@ impl From<&ColumnDesc> for ProstColumnDesc {
             name: c.name.clone(),
             field_descs: c.field_descs.iter().map(ColumnDesc::to_protobuf).collect(),
             type_name: c.type_name.clone(),
-        }
-    }
-}
-
-impl From<ProstOrderedColumnDesc> for OrderedColumnDesc {
-    fn from(prost: ProstOrderedColumnDesc) -> Self {
-        Self {
-            column_desc: prost.column_desc.unwrap().into(),
-            order: OrderType::from_prost(&ProstOrderType::from_i32(prost.order).unwrap()),
         }
     }
 }

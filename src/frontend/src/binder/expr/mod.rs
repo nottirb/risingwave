@@ -13,11 +13,12 @@
 // limitations under the License.
 
 use itertools::zip_eq;
+use risingwave_common::catalog::{ColumnDesc, ColumnId};
 use risingwave_common::error::{ErrorCode, Result};
 use risingwave_common::types::DataType;
 use risingwave_sqlparser::ast::{
-    BinaryOperator, DataType as AstDataType, DateTimeField, Expr, Query, TrimWhereField,
-    UnaryOperator,
+    BinaryOperator, DataType as AstDataType, DateTimeField, Expr, Query, StructField,
+    TrimWhereField, UnaryOperator,
 };
 
 use crate::binder::Binder;
@@ -38,7 +39,7 @@ impl Binder {
                 let s: ExprImpl = self.bind_string(value)?.into();
                 s.cast_explicit(bind_data_type(&data_type)?)
             }
-            Expr::Row(exprs) => Ok(ExprImpl::Literal(Box::new(self.bind_row(&exprs)?))),
+            Expr::Row(exprs) => self.bind_row(exprs),
             // input ref
             Expr::Identifier(ident) => self.bind_column(&[ident]),
             Expr::CompoundIdentifier(idents) => self.bind_column(&idents),
@@ -49,6 +50,8 @@ impl Binder {
             Expr::UnaryOp { op, expr } => self.bind_unary_expr(op, *expr),
             Expr::BinaryOp { left, op, right } => self.bind_binary_op(*left, op, *right),
             Expr::Nested(expr) => self.bind_expr(*expr),
+            Expr::Array(exprs) => self.bind_array(exprs),
+            Expr::ArrayIndex { obj, indexs } => self.bind_array_index(*obj, indexs),
             Expr::Function(f) => self.bind_function(f),
             // subquery
             Expr::Subquery(q) => self.bind_subquery_expr(*q, SubqueryKind::Scalar),
@@ -66,6 +69,8 @@ impl Binder {
             Expr::IsNotTrue(expr) => self.bind_is_operator(ExprType::IsNotTrue, *expr),
             Expr::IsFalse(expr) => self.bind_is_operator(ExprType::IsFalse, *expr),
             Expr::IsNotFalse(expr) => self.bind_is_operator(ExprType::IsNotFalse, *expr),
+            Expr::IsDistinctFrom(left, right) => self.bind_distinct_from(false, *left, *right),
+            Expr::IsNotDistinctFrom(left, right) => self.bind_distinct_from(true, *left, *right),
             Expr::Case {
                 operand,
                 conditions,
@@ -92,6 +97,12 @@ impl Binder {
                 substring_from,
                 substring_for,
             } => self.bind_substring(*expr, substring_from, substring_for),
+            Expr::Overlay {
+                expr,
+                new_substring,
+                start,
+                count,
+            } => self.bind_overlay(*expr, *new_substring, *start, count),
             _ => Err(ErrorCode::NotImplemented(
                 format!("unsupported expression {:?}", expr),
                 112.into(),
@@ -125,18 +136,32 @@ impl Binder {
         list: Vec<Expr>,
         negated: bool,
     ) -> Result<ExprImpl> {
-        let mut bound_expr_list = vec![self.bind_expr(expr)?];
+        let left = self.bind_expr(expr)?;
+        let mut bound_expr_list = vec![left.clone()];
+        let mut non_const_exprs = vec![];
         for elem in list {
-            bound_expr_list.push(self.bind_expr(elem)?);
+            let expr = self.bind_expr(elem)?;
+            match expr.is_const() {
+                true => bound_expr_list.push(expr),
+                false => non_const_exprs.push(expr),
+            }
         }
-        let in_expr = FunctionCall::new(ExprType::In, bound_expr_list)?;
+        let mut ret = FunctionCall::new(ExprType::In, bound_expr_list)?.into();
+        // Non-const exprs are not part of IN-expr in backend and rewritten into OR-Equal-exprs.
+        for expr in non_const_exprs {
+            ret = FunctionCall::new(
+                ExprType::Or,
+                vec![
+                    ret,
+                    FunctionCall::new(ExprType::Equal, vec![left.clone(), expr])?.into(),
+                ],
+            )?
+            .into();
+        }
         if negated {
-            Ok(
-                FunctionCall::new_unchecked(ExprType::Not, vec![in_expr.into()], DataType::Boolean)
-                    .into(),
-            )
+            Ok(FunctionCall::new_unchecked(ExprType::Not, vec![ret], DataType::Boolean).into())
         } else {
-            Ok(in_expr.into())
+            Ok(ret)
         }
     }
 
@@ -162,6 +187,7 @@ impl Binder {
         let func_type = match op {
             UnaryOperator::Not => ExprType::Not,
             UnaryOperator::Minus => ExprType::Neg,
+            UnaryOperator::PGBitwiseNot => ExprType::BitwiseNot,
             UnaryOperator::Plus => {
                 return self.rewrite_positive(expr);
             }
@@ -184,7 +210,7 @@ impl Binder {
         if return_type.is_numeric() {
             return Ok(expr);
         }
-        return Err(ErrorCode::InvalidInputSyntax(format!("+ {:?}", return_type)).into());
+        Err(ErrorCode::InvalidInputSyntax(format!("+ {:?}", return_type)).into())
     }
 
     pub(super) fn bind_trim(
@@ -225,6 +251,24 @@ impl Binder {
             args.push(self.bind_expr(*expr)?);
         }
         FunctionCall::new(ExprType::Substr, args).map(|f| f.into())
+    }
+
+    fn bind_overlay(
+        &mut self,
+        expr: Expr,
+        new_substring: Expr,
+        start: Expr,
+        count: Option<Box<Expr>>,
+    ) -> Result<ExprImpl> {
+        let mut args = vec![
+            self.bind_expr(expr)?,
+            self.bind_expr(new_substring)?,
+            self.bind_expr(start)?,
+        ];
+        if let Some(count) = count {
+            args.push(self.bind_expr(*count)?);
+        }
+        FunctionCall::new(ExprType::Overlay, args).map(|f| f.into())
     }
 
     /// Bind `expr (not) between low and high`
@@ -302,10 +346,55 @@ impl Binder {
         Ok(FunctionCall::new(func_type, vec![expr])?.into())
     }
 
+    pub(super) fn bind_distinct_from(
+        &mut self,
+        negated: bool,
+        left: Expr,
+        right: Expr,
+    ) -> Result<ExprImpl> {
+        let left = self.bind_expr(left)?;
+        let right = self.bind_expr(right)?;
+
+        let func_call = FunctionCall::new(ExprType::IsDistinctFrom, vec![left, right]);
+
+        if negated {
+            Ok(FunctionCall::new(ExprType::Not, vec![func_call?.into()])?.into())
+        } else {
+            Ok(func_call?.into())
+        }
+    }
+
     pub(super) fn bind_cast(&mut self, expr: Expr, data_type: AstDataType) -> Result<ExprImpl> {
         self.bind_expr(expr)?
             .cast_explicit(bind_data_type(&data_type)?)
     }
+}
+
+/// Given a type `STRUCT<v1 int>`, this function binds the field `v1 int`.
+pub fn bind_struct_field(column_def: &StructField) -> Result<ColumnDesc> {
+    let field_descs = if let AstDataType::Struct(defs) = &column_def.data_type {
+        defs.iter()
+            .map(|f| {
+                Ok(ColumnDesc {
+                    data_type: bind_data_type(&f.data_type)?,
+                    // Literals don't have `column_id`.
+                    column_id: ColumnId::new(0),
+                    name: f.name.real_value(),
+                    field_descs: vec![],
+                    type_name: "".to_string(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        vec![]
+    };
+    Ok(ColumnDesc {
+        data_type: bind_data_type(&column_def.data_type)?,
+        column_id: ColumnId::new(0),
+        name: column_def.name.real_value(),
+        field_descs,
+        type_name: "".to_string(),
+    })
 }
 
 pub fn bind_data_type(data_type: &AstDataType) -> Result<DataType> {
@@ -317,7 +406,7 @@ pub fn bind_data_type(data_type: &AstDataType) -> Result<DataType> {
         AstDataType::Real | AstDataType::Float(Some(1..=24)) => DataType::Float32,
         AstDataType::Double | AstDataType::Float(Some(25..=53) | None) => DataType::Float64,
         AstDataType::Decimal(None, None) => DataType::Decimal,
-        AstDataType::Varchar(_) => DataType::Varchar,
+        AstDataType::Varchar | AstDataType::String => DataType::Varchar,
         AstDataType::Date => DataType::Date,
         AstDataType::Time(false) => DataType::Time,
         AstDataType::Timestamp(false) => DataType::Timestamp,
@@ -330,6 +419,20 @@ pub fn bind_data_type(data_type: &AstDataType) -> Result<DataType> {
             return Err(ErrorCode::NotImplemented(
                 "CHAR is not supported, please use VARCHAR instead\n".to_string(),
                 None.into(),
+            )
+            .into())
+        }
+        AstDataType::Struct(types) => DataType::Struct {
+            fields: types
+                .iter()
+                .map(|f| bind_data_type(&f.data_type))
+                .collect::<Result<Vec<_>>>()?
+                .into(),
+        },
+        AstDataType::Text => {
+            return Err(ErrorCode::NotImplemented(
+                format!("unsupported data type: {:?}", data_type),
+                2535.into(),
             )
             .into())
         }

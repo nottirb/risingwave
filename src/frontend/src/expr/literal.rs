@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use risingwave_common::types::{DataType, Datum, ScalarImpl};
+use risingwave_common::types::{literal_type_match, DataType, Datum, ScalarImpl};
 use risingwave_pb::expr::expr_node::RexNode;
 
 use super::Expr;
@@ -45,6 +45,7 @@ impl std::fmt::Debug for Literal {
 
 impl Literal {
     pub fn new(data: Datum, data_type: DataType) -> Self {
+        assert!(literal_type_match(&data_type, data.as_ref()));
         Literal { data, data_type }
     }
 
@@ -77,24 +78,56 @@ fn literal_to_protobuf(d: &Datum) -> Option<RexNode> {
     let Some(d) = d.as_ref() else {
         return None;
     };
-
     use risingwave_pb::expr::*;
-
-    let body = match d {
-        ScalarImpl::Int16(v) => v.to_be_bytes().to_vec(),
-        ScalarImpl::Int32(v) => v.to_be_bytes().to_vec(),
-        ScalarImpl::Int64(v) => v.to_be_bytes().to_vec(),
-        ScalarImpl::Float32(v) => v.to_be_bytes().to_vec(),
-        ScalarImpl::Float64(v) => v.to_be_bytes().to_vec(),
-        ScalarImpl::Utf8(s) => s.as_bytes().to_vec(),
-        ScalarImpl::Bool(v) => (*v as i8).to_be_bytes().to_vec(),
-        ScalarImpl::Decimal(v) => v.to_string().as_bytes().to_vec(),
-        ScalarImpl::Interval(v) => v.to_protobuf_owned(),
-        ScalarImpl::NaiveDate(_) => todo!(),
-        ScalarImpl::NaiveDateTime(_) => todo!(),
-        ScalarImpl::NaiveTime(_) => todo!(),
-        ScalarImpl::Struct(_) => todo!(),
-        ScalarImpl::List(_) => todo!(),
-    };
+    let body = d.to_protobuf();
     Some(RexNode::Constant(ConstantValue { body }))
+}
+
+#[cfg(test)]
+mod tests {
+    use risingwave_common::array::{ListValue, StructValue};
+    use risingwave_common::types::{DataType, ScalarImpl};
+    use risingwave_pb::expr::expr_node::RexNode;
+
+    use crate::expr::literal::literal_to_protobuf;
+
+    #[test]
+    fn test_struct_to_protobuf() {
+        let value = StructValue::new(vec![
+            Some(ScalarImpl::Utf8("12222".to_string())),
+            Some(2.into()),
+            Some(3.into()),
+        ]);
+        let data = Some(ScalarImpl::Struct(value.clone()));
+        let node = literal_to_protobuf(&data);
+        if let RexNode::Constant(prost) = node.as_ref().unwrap() {
+            let data2 = ScalarImpl::bytes_to_scalar(
+                prost.get_body(),
+                &DataType::Struct {
+                    fields: vec![DataType::Varchar, DataType::Int32, DataType::Int32].into(),
+                }
+                .to_protobuf(),
+            )
+            .unwrap();
+            assert_eq!(ScalarImpl::Struct(value), data2);
+        }
+    }
+
+    #[test]
+    fn test_list_to_protobuf() {
+        let value = ListValue::new(vec![Some(1.into()), Some(2.into()), Some(3.into())]);
+        let data = Some(ScalarImpl::List(value.clone()));
+        let node = literal_to_protobuf(&data);
+        if let RexNode::Constant(prost) = node.as_ref().unwrap() {
+            let data2 = ScalarImpl::bytes_to_scalar(
+                prost.get_body(),
+                &DataType::List {
+                    datatype: Box::new(DataType::Int32),
+                }
+                .to_protobuf(),
+            )
+            .unwrap();
+            assert_eq!(ScalarImpl::List(value), data2);
+        }
+    }
 }

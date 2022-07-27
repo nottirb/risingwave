@@ -377,6 +377,8 @@ fn parse_select_count_wildcard() {
             args: vec![FunctionArg::Unnamed(FunctionArgExpr::Wildcard)],
             over: None,
             distinct: false,
+            order_by: vec![],
+            filter: None
         }),
         expr_from_projection(only(&select.projection))
     );
@@ -395,6 +397,8 @@ fn parse_select_count_distinct() {
             }))],
             over: None,
             distinct: true,
+            order_by: vec![],
+            filter: None
         }),
         expr_from_projection(only(&select.projection))
     );
@@ -413,13 +417,6 @@ fn parse_select_count_distinct() {
 }
 
 #[test]
-fn parse_not() {
-    let sql = "SELECT id FROM customer WHERE NOT salary = ''";
-    let _ast = verified_only_select(sql);
-    // TODO: add assertions
-}
-
-#[test]
 fn parse_invalid_infix_not() {
     let res = parse_sql_statements("SELECT c FROM t WHERE c NOT (");
     assert_eq!(
@@ -435,14 +432,6 @@ fn parse_collate() {
         only(&verified_only_select(sql).projection),
         SelectItem::UnnamedExpr(Expr::Collate { .. })
     );
-}
-
-#[test]
-fn parse_select_string_predicate() {
-    let sql = "SELECT id, fname, lname FROM customer \
-               WHERE salary <> 'Not Provided' AND salary <> ''";
-    let _ast = verified_only_select(sql);
-    // TODO: add assertions
 }
 
 #[test]
@@ -505,6 +494,8 @@ fn parse_compound_expr_1() {
     use self::BinaryOperator::*;
     use self::Expr::*;
     let sql = "a + b * c";
+    let ast = run_parser_method(sql, |parser| parser.parse_expr()).unwrap();
+    assert_eq!("a + (b * c)", &ast.to_string());
     assert_eq!(
         BinaryOp {
             left: Box::new(Identifier(Ident::new("a"))),
@@ -515,7 +506,7 @@ fn parse_compound_expr_1() {
                 right: Box::new(Identifier(Ident::new("c")))
             })
         },
-        verified_expr(sql)
+        ast
     );
 }
 
@@ -524,6 +515,8 @@ fn parse_compound_expr_2() {
     use self::BinaryOperator::*;
     use self::Expr::*;
     let sql = "a * b + c";
+    let ast = run_parser_method(sql, |parser| parser.parse_expr()).unwrap();
+    assert_eq!("(a * b) + c", &ast.to_string());
     assert_eq!(
         BinaryOp {
             left: Box::new(BinaryOp {
@@ -534,7 +527,7 @@ fn parse_compound_expr_2() {
             op: Plus,
             right: Box::new(Identifier(Ident::new("c")))
         },
-        verified_expr(sql)
+        ast
     );
 }
 
@@ -542,6 +535,8 @@ fn parse_compound_expr_2() {
 fn parse_unary_math() {
     use self::Expr::*;
     let sql = "- a + - b";
+    let ast = run_parser_method(sql, |parser| parser.parse_expr()).unwrap();
+    assert_eq!("(- a) + (- b)", &ast.to_string());
     assert_eq!(
         BinaryOp {
             left: Box::new(UnaryOp {
@@ -554,7 +549,7 @@ fn parse_unary_math() {
                 expr: Box::new(Identifier(Ident::new("b"))),
             }),
         },
-        verified_expr(sql)
+        ast
     );
 }
 
@@ -607,8 +602,10 @@ fn parse_is_not_distinct_from() {
 fn parse_not_precedence() {
     // NOT has higher precedence than OR/AND, so the following must parse as (NOT true) OR true
     let sql = "NOT true OR true";
+    let ast = run_parser_method(sql, |parser| parser.parse_expr()).unwrap();
+    assert_eq!("(NOT true) OR true", &ast.to_string());
     assert_matches!(
-        verified_expr(sql),
+        ast,
         Expr::BinaryOp {
             op: BinaryOperator::Or,
             ..
@@ -618,8 +615,10 @@ fn parse_not_precedence() {
     // But NOT has lower precedence than comparison operators, so the following parses as NOT (a IS
     // NULL)
     let sql = "NOT a IS NULL";
+    let ast = run_parser_method(sql, |parser| parser.parse_expr()).unwrap();
+    assert_eq!("NOT (a IS NULL)", &ast.to_string());
     assert_matches!(
-        verified_expr(sql),
+        ast,
         Expr::UnaryOp {
             op: UnaryOperator::Not,
             ..
@@ -643,8 +642,10 @@ fn parse_not_precedence() {
 
     // NOT has lower precedence than LIKE, so the following parses as NOT ('a' NOT LIKE 'b')
     let sql = "NOT 'a' NOT LIKE 'b'";
+    let ast = run_parser_method(sql, |parser| parser.parse_expr()).unwrap();
+    assert_eq!("NOT ('a' NOT LIKE 'b')", &ast.to_string());
     assert_eq!(
-        verified_expr(sql),
+        ast,
         Expr::UnaryOp {
             op: UnaryOperator::Not,
             expr: Box::new(Expr::BinaryOp {
@@ -799,14 +800,14 @@ fn parse_in_subquery() {
 }
 
 #[test]
-fn parse_string_agg() {
+fn parse_string_concat() {
     let sql = "SELECT a || b";
 
     let select = verified_only_select(sql);
     assert_eq!(
         SelectItem::UnnamedExpr(Expr::BinaryOp {
             left: Box::new(Expr::Identifier(Ident::new("a"))),
-            op: BinaryOperator::StringConcat,
+            op: BinaryOperator::Concat,
             right: Box::new(Expr::Identifier(Ident::new("b"))),
         }),
         select.projection[0]
@@ -917,15 +918,15 @@ fn parse_between_with_expr() {
         select.selection.unwrap()
     );
 
-    let sql = "SELECT * FROM t WHERE 1 = 1 AND 1 + x BETWEEN 1 AND 2";
+    let sql = "SELECT * FROM t WHERE (1 = 1) AND 1 + x BETWEEN 1 AND 2";
     let select = verified_only_select(sql);
     assert_eq!(
         Expr::BinaryOp {
-            left: Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Nested(Box::new(Expr::BinaryOp {
                 left: Box::new(Expr::Value(number("1"))),
                 op: BinaryOperator::Eq,
                 right: Box::new(Expr::Value(number("1"))),
-            }),
+            }))),
             op: BinaryOperator::And,
             right: Box::new(Expr::Between {
                 expr: Box::new(Expr::BinaryOp {
@@ -1093,9 +1094,11 @@ fn parse_select_having() {
                 args: vec![FunctionArg::Unnamed(FunctionArgExpr::Wildcard)],
                 over: None,
                 distinct: false,
+                order_by: vec![],
+                filter: None
             })),
             op: BinaryOperator::Gt,
-            right: Box::new(Expr::Value(number("1")))
+            right: Box::new(Expr::Value(number("1"))),
         }),
         select.having
     );
@@ -1212,7 +1215,7 @@ fn parse_extract() {
 #[test]
 fn parse_create_table() {
     let sql = "CREATE TABLE uk_cities (\
-               name VARCHAR(100) NOT NULL,\
+               name VARCHAR NOT NULL,\
                lat DOUBLE NULL,\
                lng DOUBLE,
                constrained INT NULL CONSTRAINT pkey PRIMARY KEY NOT NULL UNIQUE CHECK (constrained > 0),
@@ -1226,7 +1229,7 @@ fn parse_create_table() {
     let ast = one_statement_parses_to(
         sql,
         "CREATE TABLE uk_cities (\
-         name CHARACTER VARYING(100) NOT NULL, \
+         name CHARACTER VARYING NOT NULL, \
          lat DOUBLE NULL, \
          lng DOUBLE, \
          constrained INT NULL CONSTRAINT pkey PRIMARY KEY NOT NULL UNIQUE CHECK (constrained > 0), \
@@ -1250,35 +1253,30 @@ fn parse_create_table() {
             assert_eq!(
                 columns,
                 vec![
-                    ColumnDef {
-                        name: "name".into(),
-                        data_type: DataType::Varchar(Some(100)),
-                        collation: None,
-                        options: vec![ColumnOptionDef {
+                    ColumnDef::new(
+                        "name".into(),
+                        DataType::Varchar,
+                        None,
+                        vec![ColumnOptionDef {
                             name: None,
                             option: ColumnOption::NotNull
                         }],
-                    },
-                    ColumnDef {
-                        name: "lat".into(),
-                        data_type: DataType::Double,
-                        collation: None,
-                        options: vec![ColumnOptionDef {
+                    ),
+                    ColumnDef::new(
+                        "lat".into(),
+                        DataType::Double,
+                        None,
+                        vec![ColumnOptionDef {
                             name: None,
                             option: ColumnOption::Null
                         }],
-                    },
-                    ColumnDef {
-                        name: "lng".into(),
-                        data_type: DataType::Double,
-                        collation: None,
-                        options: vec![],
-                    },
-                    ColumnDef {
-                        name: "constrained".into(),
-                        data_type: DataType::Int(None),
-                        collation: None,
-                        options: vec![
+                    ),
+                    ColumnDef::new("lng".into(), DataType::Double, None, vec![],),
+                    ColumnDef::new(
+                        "constrained".into(),
+                        DataType::Int(None),
+                        None,
+                        vec![
                             ColumnOptionDef {
                                 name: None,
                                 option: ColumnOption::Null
@@ -1300,12 +1298,12 @@ fn parse_create_table() {
                                 option: ColumnOption::Check(verified_expr("constrained > 0")),
                             }
                         ],
-                    },
-                    ColumnDef {
-                        name: "ref".into(),
-                        data_type: DataType::Int(None),
-                        collation: None,
-                        options: vec![ColumnOptionDef {
+                    ),
+                    ColumnDef::new(
+                        "ref".into(),
+                        DataType::Int(None),
+                        None,
+                        vec![ColumnOptionDef {
                             name: None,
                             option: ColumnOption::ForeignKey {
                                 foreign_table: ObjectName(vec!["othertable".into()]),
@@ -1313,13 +1311,13 @@ fn parse_create_table() {
                                 on_delete: None,
                                 on_update: None,
                             }
-                        }]
-                    },
-                    ColumnDef {
-                        name: "ref2".into(),
-                        data_type: DataType::Int(None),
-                        collation: None,
-                        options: vec![ColumnOptionDef {
+                        }],
+                    ),
+                    ColumnDef::new(
+                        "ref2".into(),
+                        DataType::Int(None),
+                        None,
+                        vec![ColumnOptionDef {
                             name: None,
                             option: ColumnOption::ForeignKey {
                                 foreign_table: ObjectName(vec!["othertable2".into()]),
@@ -1327,8 +1325,8 @@ fn parse_create_table() {
                                 on_delete: Some(ReferentialAction::Cascade),
                                 on_update: Some(ReferentialAction::NoAction),
                             }
-                        },]
-                    }
+                        },],
+                    ),
                 ]
             );
             assert_eq!(
@@ -1484,11 +1482,11 @@ fn parse_create_table_with_options() {
             assert_eq!(
                 vec![
                     SqlOption {
-                        name: "foo".into(),
+                        name: vec!["foo".into()].into(),
                         value: Value::SingleQuotedString("bar".into())
                     },
                     SqlOption {
-                        name: "a".into(),
+                        name: vec!["a".into()].into(),
                         value: number("123")
                     },
                 ],
@@ -1563,7 +1561,7 @@ fn parse_alter_table_constraints() {
     check_one("PRIMARY KEY (foo, bar)");
     check_one("UNIQUE (id)");
     check_one("FOREIGN KEY (foo, bar) REFERENCES AnotherTable(foo, bar)");
-    check_one("CHECK (end_date > start_date OR end_date IS NULL)");
+    check_one("CHECK ((end_date > start_date) OR (end_date IS NULL))");
 
     fn check_one(constraint_text: &str) {
         match verified_stmt(&format!("ALTER TABLE tab ADD {}", constraint_text)) {
@@ -1738,16 +1736,23 @@ fn parse_bad_constraint() {
     );
 }
 
-fn run_explain_analyze(query: &str, expected_verbose: bool, expected_analyze: bool) {
+fn run_explain_analyze(
+    query: &str,
+    expected_verbose: bool,
+    expected_analyze: bool,
+    expected_trace: bool,
+) {
     match verified_stmt(query) {
         Statement::Explain {
             describe_alias: _,
             analyze,
             verbose,
+            trace,
             statement,
         } => {
             assert_eq!(verbose, expected_verbose);
             assert_eq!(analyze, expected_analyze);
+            assert_eq!(trace, expected_trace);
             assert_eq!("SELECT sqrt(id) FROM foo", statement.to_string());
         }
         _ => panic!("Unexpected Statement, must be Explain"),
@@ -1756,12 +1761,31 @@ fn run_explain_analyze(query: &str, expected_verbose: bool, expected_analyze: bo
 
 #[test]
 fn parse_explain_analyze_with_simple_select() {
-    run_explain_analyze("EXPLAIN SELECT sqrt(id) FROM foo", false, false);
-    run_explain_analyze("EXPLAIN VERBOSE SELECT sqrt(id) FROM foo", true, false);
-    run_explain_analyze("EXPLAIN ANALYZE SELECT sqrt(id) FROM foo", false, true);
+    run_explain_analyze("EXPLAIN SELECT sqrt(id) FROM foo", false, false, false);
+    run_explain_analyze(
+        "EXPLAIN VERBOSE SELECT sqrt(id) FROM foo",
+        true,
+        false,
+        false,
+    );
+    run_explain_analyze(
+        "EXPLAIN ANALYZE SELECT sqrt(id) FROM foo",
+        false,
+        true,
+        false,
+    );
+    run_explain_analyze("EXPLAIN TRACE SELECT sqrt(id) FROM foo", false, false, true);
     run_explain_analyze(
         "EXPLAIN ANALYZE VERBOSE SELECT sqrt(id) FROM foo",
         true,
+        true,
+        false,
+    );
+
+    run_explain_analyze(
+        "EXPLAIN VERBOSE TRACE SELECT sqrt(id) FROM foo",
+        true,
+        false,
         true,
     );
 }
@@ -1790,6 +1814,8 @@ fn parse_named_argument_function() {
             ],
             over: None,
             distinct: false,
+            order_by: vec![],
+            filter: None,
         }),
         expr_from_projection(only(&select.projection))
     );
@@ -1823,6 +1849,8 @@ fn parse_window_functions() {
                 window_frame: None,
             }),
             distinct: false,
+            order_by: vec![],
+            filter: None,
         }),
         expr_from_projection(&select.projection[0])
     );
@@ -1833,6 +1861,66 @@ fn parse_aggregate_with_group_by() {
     let sql = "SELECT a, COUNT(1), MIN(b), MAX(b) FROM foo GROUP BY a";
     let _ast = verified_only_select(sql);
     // TODO: assertions
+}
+
+#[test]
+fn parse_aggregate_with_order_by() {
+    let sql = "SELECT STRING_AGG(a, b ORDER BY b ASC, a DESC) FROM foo";
+    let select = verified_only_select(sql);
+    assert_eq!(
+        &Expr::Function(Function {
+            name: ObjectName(vec![Ident::new("STRING_AGG")]),
+            args: vec![
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(Ident::new("a")))),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(Ident::new("b")))),
+            ],
+            over: None,
+            distinct: false,
+            order_by: vec![
+                OrderByExpr {
+                    expr: Expr::Identifier(Ident::new("b")),
+                    asc: Some(true),
+                    nulls_first: None,
+                },
+                OrderByExpr {
+                    expr: Expr::Identifier(Ident::new("a")),
+                    asc: Some(false),
+                    nulls_first: None,
+                }
+            ],
+            filter: None,
+        }),
+        expr_from_projection(only(&select.projection))
+    );
+}
+
+#[test]
+fn parse_aggregate_with_filter() {
+    let sql = "SELECT sum(a) FILTER(WHERE (a > 0) AND (a IS NOT NULL)) FROM foo";
+    let select = verified_only_select(sql);
+    assert_eq!(
+        &Expr::Function(Function {
+            name: ObjectName(vec![Ident::new("sum")]),
+            args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                Expr::Identifier(Ident::new("a"))
+            )),],
+            over: None,
+            distinct: false,
+            order_by: vec![],
+            filter: Some(Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Nested(Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Identifier(Ident::new("a"))),
+                    op: BinaryOperator::Gt,
+                    right: Box::new(Expr::Value(Value::Number("0".to_string(), false)))
+                }))),
+                op: BinaryOperator::And,
+                right: Box::new(Expr::Nested(Box::new(Expr::IsNotNull(Box::new(
+                    Expr::Identifier(Ident::new("a"))
+                )))))
+            })),
+        }),
+        expr_from_projection(only(&select.projection)),
+    );
 }
 
 #[test]
@@ -2067,6 +2155,8 @@ fn parse_delimited_identifiers() {
             args: vec![],
             over: None,
             distinct: false,
+            order_by: vec![],
+            filter: None,
         }),
         expr_from_projection(&select.projection[1]),
     );
@@ -2692,6 +2782,39 @@ fn parse_substring() {
 }
 
 #[test]
+fn parse_overlay() {
+    one_statement_parses_to(
+        "SELECT OVERLAY('abc' PLACING 'xyz' FROM 1)",
+        "SELECT OVERLAY('abc' PLACING 'xyz' FROM 1)",
+    );
+
+    one_statement_parses_to(
+        "SELECT OVERLAY('abc' PLACING 'xyz' FROM 1 FOR 2)",
+        "SELECT OVERLAY('abc' PLACING 'xyz' FROM 1 FOR 2)",
+    );
+
+    assert_eq!(
+        parse_sql_statements("SELECT OVERLAY('abc', 'xyz')").unwrap_err(),
+        ParserError::ParserError("Expected PLACING, found: ,".to_owned())
+    );
+
+    assert_eq!(
+        parse_sql_statements("SELECT OVERLAY('abc' PLACING 'xyz')").unwrap_err(),
+        ParserError::ParserError("Expected FROM, found: )".to_owned())
+    );
+
+    assert_eq!(
+        parse_sql_statements("SELECT OVERLAY('abc' PLACING 'xyz' FOR 2)").unwrap_err(),
+        ParserError::ParserError("Expected FROM, found: FOR".to_owned())
+    );
+
+    assert_eq!(
+        parse_sql_statements("SELECT OVERLAY('abc' PLACING 'xyz' FOR 2 FROM 1)").unwrap_err(),
+        ParserError::ParserError("Expected FROM, found: FOR".to_owned())
+    );
+}
+
+#[test]
 fn parse_trim() {
     one_statement_parses_to(
         "SELECT TRIM(BOTH 'xyz' FROM 'xyzfooxyz')",
@@ -2787,11 +2910,11 @@ fn parse_create_view_with_options() {
             assert_eq!(
                 vec![
                     SqlOption {
-                        name: "foo".into(),
+                        name: vec!["foo".into()].into(),
                         value: Value::SingleQuotedString("bar".into())
                     },
                     SqlOption {
-                        name: "a".into(),
+                        name: vec!["a".into()].into(),
                         value: number("123")
                     },
                 ],
@@ -2953,6 +3076,28 @@ fn parse_materialized_drop_view() {
         Statement::Drop(stmt) => {
             assert_eq!(ObjectName(vec![Ident::new("mymview")]), stmt.object_name);
             assert_eq!(ObjectType::MaterializedView, stmt.object_type);
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn parse_create_user() {
+    let sql = "CREATE USER foo WITH NOSUPERUSER CREATEDB LOGIN PASSWORD 'md5827ccb0eea8a706c4c34a16891f84e7b'";
+    match verified_stmt(sql) {
+        Statement::CreateUser(stmt) => {
+            assert_eq!(ObjectName(vec![Ident::new("foo")]), stmt.user_name);
+            assert_eq!(
+                stmt.with_options.0,
+                vec![
+                    CreateUserOption::NoSuperUser,
+                    CreateUserOption::CreateDB,
+                    CreateUserOption::Login,
+                    CreateUserOption::Password(Some(AstString(
+                        "md5827ccb0eea8a706c4c34a16891f84e7b".into()
+                    ))),
+                ]
+            );
         }
         _ => unreachable!(),
     }
@@ -3537,6 +3682,7 @@ fn test_revoke() {
             objects: GrantObjects::Tables(tables),
             grantees,
             cascade,
+            revoke_grant_option,
             granted_by,
         } => {
             assert_eq!(
@@ -3554,6 +3700,7 @@ fn test_revoke() {
                 grantees.iter().map(ToString::to_string).collect::<Vec<_>>()
             );
             assert!(cascade);
+            assert!(!revoke_grant_option);
             assert_eq!(None, granted_by);
         }
         _ => unreachable!(),

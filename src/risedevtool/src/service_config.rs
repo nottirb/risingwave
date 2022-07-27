@@ -35,7 +35,6 @@ pub struct ComputeNodeConfig {
     pub provide_jaeger: Option<Vec<JaegerConfig>>,
     pub provide_compactor: Option<Vec<CompactorConfig>>,
     pub user_managed: bool,
-    pub enable_in_memory_kv_state_backend: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -59,7 +58,7 @@ pub struct MetaNodeConfig {
 
     pub enable_dashboard_v2: bool,
     pub unsafe_disable_recovery: bool,
-    pub checkpoint_interval: Option<u32>,
+    pub max_idle_secs_to_exit: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -139,6 +138,8 @@ pub struct EtcdConfig {
 
     pub peer_port: u16,
     pub unsafe_no_fsync: bool,
+
+    pub exporter_port: u16,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -154,10 +155,16 @@ pub struct PrometheusConfig {
     pub port: u16,
     pub listen_address: String,
 
+    pub remote_write: bool,
+    pub remote_write_region: String,
+    pub remote_write_url: String,
+
     pub provide_compute_node: Option<Vec<ComputeNodeConfig>>,
     pub provide_meta_node: Option<Vec<MetaNodeConfig>>,
     pub provide_minio: Option<Vec<MinioConfig>>,
     pub provide_compactor: Option<Vec<CompactorConfig>>,
+    pub provide_etcd: Option<Vec<EtcdConfig>>,
+    pub provide_redpanda: Option<Vec<RedPandaConfig>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -168,6 +175,7 @@ pub struct GrafanaConfig {
     phantom_use: Option<String>,
     pub id: String,
     pub address: String,
+    pub listen_address: String,
     pub port: u16,
     pub provide_prometheus: Option<Vec<PrometheusConfig>>,
 }
@@ -237,6 +245,8 @@ pub struct RedPandaConfig {
     pub internal_port: u16,
     pub outside_port: u16,
     pub address: String,
+    pub cpus: usize,
+    pub memory: String,
 }
 
 /// All service configuration

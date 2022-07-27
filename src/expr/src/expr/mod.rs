@@ -20,32 +20,37 @@ pub mod expr_binary_nonnull;
 pub mod expr_binary_nullable;
 mod expr_case;
 mod expr_coalesce;
+mod expr_concat_ws;
 mod expr_field;
 mod expr_in;
 mod expr_input_ref;
 mod expr_is_null;
 mod expr_literal;
+mod expr_nested_construct;
+mod expr_quaternary_bytes;
+mod expr_regexp;
 mod expr_ternary_bytes;
 pub mod expr_unary;
-mod pg_sleep;
 mod template;
 
 use std::convert::TryFrom;
-use std::slice;
 use std::sync::Arc;
 
 pub use agg::AggKind;
 pub use expr_input_ref::InputRefExpression;
 pub use expr_literal::*;
 use risingwave_common::array::{ArrayRef, DataChunk, Row};
-use risingwave_common::error::ErrorCode::InternalError;
-use risingwave_common::error::Result;
-use risingwave_common::types::DataType;
+use risingwave_common::types::{DataType, Datum};
 use risingwave_pb::expr::ExprNode;
 
+use super::Result;
 use crate::expr::build_expr_from_prost::*;
 use crate::expr::expr_coalesce::CoalesceExpression;
+use crate::expr::expr_concat_ws::ConcatWsExpression;
 use crate::expr::expr_field::FieldExpression;
+use crate::expr::expr_nested_construct::NestedConstructExpression;
+use crate::expr::expr_regexp::RegexpMatchExpr;
+use crate::ExprError;
 
 pub type ExpressionRef = Arc<dyn Expression>;
 
@@ -53,12 +58,25 @@ pub type ExpressionRef = Arc<dyn Expression>;
 pub trait Expression: std::fmt::Debug + Sync + Send {
     fn return_type(&self) -> DataType;
 
+    /// Eval the result with extra checks.
+    fn eval_checked(&self, input: &DataChunk) -> Result<ArrayRef> {
+        let res = self.eval(input)?;
+
+        // TODO: Decide to use assert or debug_assert by benchmarks.
+        assert_eq!(res.len(), input.capacity());
+
+        Ok(res)
+    }
+
     /// Evaluate the expression
     ///
     /// # Arguments
     ///
     /// * `input` - input data of the Project Executor
     fn eval(&self, input: &DataChunk) -> Result<ArrayRef>;
+
+    /// Evaluate the expression in row-based execution.
+    fn eval_row(&self, input: &Row) -> Result<Datum>;
 
     fn boxed(self) -> BoxedExpression
     where
@@ -73,55 +91,43 @@ pub type BoxedExpression = Box<dyn Expression>;
 pub fn build_from_prost(prost: &ExprNode) -> Result<BoxedExpression> {
     use risingwave_pb::expr::expr_node::Type::*;
 
-    match prost.get_expr_type()? {
-        Cast | Upper | Lower | Not | PgSleep | IsTrue | IsNotTrue | IsFalse | IsNotFalse
-        | IsNull | IsNotNull | Neg | Ascii => build_unary_expr_prost(prost),
+    match prost.get_expr_type().unwrap() {
+        Cast | Upper | Lower | Md5 | Not | IsTrue | IsNotTrue | IsFalse | IsNotFalse | IsNull
+        | IsNotNull | Neg | Ascii | Abs | Ceil | Floor | Round | BitwiseNot | CharLength
+        | BoolOut | OctetLength | BitLength => build_unary_expr_prost(prost),
         Equal | NotEqual | LessThan | LessThanOrEqual | GreaterThan | GreaterThanOrEqual | Add
         | Subtract | Multiply | Divide | Modulus | Extract | RoundDigit | TumbleStart
-        | Position => build_binary_expr_prost(prost),
-        StreamNullByRowCount | And | Or => build_nullable_binary_expr_prost(prost),
-        Coalesce => CoalesceExpression::try_from(prost).map(|d| Box::new(d) as BoxedExpression),
+        | Position | BitwiseShiftLeft | BitwiseShiftRight | BitwiseAnd | BitwiseOr | BitwiseXor
+        | ConcatOp => build_binary_expr_prost(prost),
+        And | Or | IsDistinctFrom | ArrayAccess => build_nullable_binary_expr_prost(prost),
+        ToChar => build_to_char_expr(prost),
+        Coalesce => CoalesceExpression::try_from(prost).map(Expression::boxed),
         Substr => build_substr_expr(prost),
         Length => build_length_expr(prost),
         Replace => build_replace_expr(prost),
+        Overlay => build_overlay_expr(prost),
         Like => build_like_expr(prost),
         Trim => build_trim_expr(prost),
         Ltrim => build_ltrim_expr(prost),
         Rtrim => build_rtrim_expr(prost),
-        ConstantValue => LiteralExpression::try_from(prost).map(|d| Box::new(d) as BoxedExpression),
-        InputRef => InputRefExpression::try_from(prost).map(|d| Box::new(d) as BoxedExpression),
+        Repeat => build_repeat_expr(prost),
+        ConcatWs => ConcatWsExpression::try_from(prost).map(Expression::boxed),
+        SplitPart => build_split_part_expr(prost),
+        ConstantValue => LiteralExpression::try_from(prost).map(Expression::boxed),
+        InputRef => InputRefExpression::try_from(prost).map(Expression::boxed),
         Case => build_case_expr(prost),
         Translate => build_translate_expr(prost),
         In => build_in_expr(prost),
-        Field => FieldExpression::try_from(prost).map(|d| Box::new(d) as BoxedExpression),
-        _ => Err(InternalError(format!(
-            "Unsupported expression type: {:?}",
+        Field => FieldExpression::try_from(prost).map(Expression::boxed),
+        Array => NestedConstructExpression::try_from(prost).map(Expression::boxed),
+        Row => NestedConstructExpression::try_from(prost).map(Expression::boxed),
+        RegexpMatch => RegexpMatchExpr::try_from(prost).map(Expression::boxed),
+        _ => Err(ExprError::UnsupportedFunction(format!(
+            "{:?}",
             prost.get_expr_type()
-        ))
-        .into()),
+        ))),
     }
 }
 
-#[derive(Debug)]
-/// Simply wrap a row level expression as an array level expression
-pub struct RowExpression {
-    expr: BoxedExpression,
-}
-
-impl RowExpression {
-    pub fn new(expr: BoxedExpression) -> Self {
-        Self { expr }
-    }
-
-    pub fn eval(&mut self, row: &Row, data_types: &[DataType]) -> Result<ArrayRef> {
-        let input = DataChunk::from_rows(slice::from_ref(row), data_types)?;
-        self.expr.eval(&input)
-    }
-
-    pub fn return_type(&self) -> DataType {
-        self.expr.return_type()
-    }
-}
-
-#[cfg(test)]
 mod test_utils;
+pub use test_utils::*;

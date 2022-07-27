@@ -31,6 +31,7 @@ mod update_check;
 struct DebugExtraInfo {
     input_pos: usize,
     actor_id: ActorId,
+    executor_id: u64,
     metrics: Arc<StreamingMetrics>,
 }
 
@@ -46,6 +47,7 @@ impl DebugExecutor {
         input: BoxedExecutor,
         input_pos: usize,
         actor_id: ActorId,
+        executor_id: u64,
         metrics: Arc<StreamingMetrics>,
     ) -> Self {
         Self {
@@ -53,34 +55,63 @@ impl DebugExecutor {
             extra: DebugExtraInfo {
                 input_pos,
                 actor_id,
+                executor_id,
                 metrics,
             },
         }
     }
 
-    #[allow(clippy::redundant_clone)]
     #[allow(clippy::let_and_return)]
-    fn wrap(
+    fn wrap_debug(
         info: Arc<ExecutorInfo>,
         extra: DebugExtraInfo,
-        stream: impl MessageStream,
-    ) -> impl MessageStream {
+        stream: impl MessageStream + 'static,
+    ) -> impl MessageStream + 'static {
         // Trace
         let stream = trace::trace(
             info.clone(),
             extra.input_pos,
             extra.actor_id,
+            extra.executor_id,
             extra.metrics,
             stream,
         );
+
         // Schema check
         let stream = schema_check::schema_check(info.clone(), stream);
         // Epoch check
         let stream = epoch_check::epoch_check(info.clone(), stream);
         // Update check
-        let stream = update_check::update_check(info.clone(), stream);
+        let stream = update_check::update_check(info, stream);
 
         stream
+    }
+
+    #[allow(clippy::let_and_return)]
+    fn wrap_release(
+        info: Arc<ExecutorInfo>,
+        extra: DebugExtraInfo,
+        stream: impl MessageStream + 'static,
+    ) -> impl MessageStream + 'static {
+        // Metrics
+        let stream = trace::metrics(extra.actor_id, extra.executor_id, extra.metrics, stream);
+
+        // Epoch check
+        let stream = epoch_check::epoch_check(info, stream);
+
+        stream
+    }
+
+    fn wrap(
+        info: Arc<ExecutorInfo>,
+        extra: DebugExtraInfo,
+        stream: impl MessageStream + 'static,
+    ) -> BoxedMessageStream {
+        if cfg!(debug_assertions) {
+            Self::wrap_debug(info, extra, stream).boxed()
+        } else {
+            Self::wrap_release(info, extra, stream).boxed()
+        }
     }
 }
 

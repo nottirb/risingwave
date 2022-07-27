@@ -18,30 +18,79 @@ use super::PlanRef;
 
 /// A one-to-one transform for the [`PlanNode`](super::plan_node::PlanNode), every [`Rule`] should
 /// downcast and check if the node matches the rule.
-pub trait Rule: Send + Sync {
+pub trait Rule: Send + Sync + Description {
     /// return err(()) if not match
     fn apply(&self, plan: PlanRef) -> Option<PlanRef>;
+}
+
+pub trait Description {
+    fn description(&self) -> &str;
 }
 
 pub(super) type BoxedRule = Box<dyn Rule>;
 
 mod project_join;
 pub use project_join::*;
-mod filter_join;
-pub use filter_join::*;
-mod filter_project;
-pub use filter_project::*;
-mod filter_agg;
-pub use filter_agg::*;
-mod filter_merge;
-pub use filter_merge::*;
 mod project_elim;
 pub use project_elim::*;
 mod project_merge;
 pub use project_merge::*;
-mod unnest_agg_for_loj;
-pub use unnest_agg_for_loj::*;
 mod pull_up_correlated_predicate;
 pub use pull_up_correlated_predicate::*;
 mod index_delta_join;
 pub use index_delta_join::*;
+mod reorder_multijoin;
+pub use reorder_multijoin::*;
+mod apply_agg;
+pub use apply_agg::*;
+mod apply_filter;
+pub use apply_filter::*;
+mod apply_proj;
+pub use apply_proj::*;
+mod apply_scan;
+pub use apply_scan::*;
+mod translate_apply;
+pub use translate_apply::*;
+mod merge_multijoin;
+pub use merge_multijoin::*;
+mod apply_join;
+mod distinct_agg;
+pub use apply_join::*;
+pub use distinct_agg::*;
+
+#[macro_export]
+macro_rules! for_all_rules {
+    ($macro:ident $(, $x:tt)*) => {
+        $macro! {
+            [$($x),*]
+            ,{ApplyAggRule}
+            ,{ApplyFilterRule}
+            ,{ApplyProjRule}
+            ,{ApplyScanRule}
+            ,{ApplyJoinRule}
+            ,{DistinctAggRule}
+            ,{IndexDeltaJoinRule}
+            ,{MergeMultiJoinRule}
+            ,{ProjectEliminateRule}
+            ,{ProjectJoinRule}
+            ,{ProjectMergeRule}
+            ,{PullUpCorrelatedPredicateRule}
+            ,{ReorderMultiJoinRule}
+            ,{TranslateApplyRule}
+        }
+    };
+}
+
+macro_rules! impl_description {
+    ([], $( { $name:ident }),*) => {
+        paste::paste!{
+            $(impl Description for [<$name>] {
+                fn description(&self) -> &str {
+                    stringify!([<$name>])
+                }
+            })*
+        }
+    }
+}
+
+for_all_rules! {impl_description}

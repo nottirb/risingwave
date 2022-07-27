@@ -19,12 +19,23 @@
 
 use std::sync::Arc;
 
-use risingwave_pb::hummock::Level;
+use itertools::Itertools;
+use risingwave_hummock_sdk::key::{user_key, FullKey};
+use risingwave_hummock_sdk::prost_key_range::KeyRangeExt;
+use risingwave_hummock_sdk::{HummockCompactionTaskId, HummockEpoch, VersionedComparator};
+use risingwave_pb::hummock::{CompactionConfig, KeyRange, Level};
 
-use crate::hummock::compaction::compaction_picker::{CompactionPicker, MinOverlappingPicker};
-use crate::hummock::compaction::overlap_strategy::{OverlapStrategy, RangeOverlapStrategy};
-use crate::hummock::compaction::tier_compaction_picker::TierCompactionPicker;
-use crate::hummock::compaction::{CompactionConfig, SearchResult};
+use crate::hummock::compaction::compaction_config::CompactionConfigBuilder;
+use crate::hummock::compaction::manual_compaction_picker::ManualCompactionPicker;
+use crate::hummock::compaction::min_overlap_compaction_picker::MinOverlappingPicker;
+use crate::hummock::compaction::overlap_strategy::OverlapStrategy;
+use crate::hummock::compaction::tier_compaction_picker::{
+    LevelCompactionPicker, TierCompactionPicker,
+};
+use crate::hummock::compaction::{
+    create_overlap_strategy, CompactionInput, CompactionPicker, CompactionTask,
+    ManualCompactionOption,
+};
 use crate::hummock::level_handler::LevelHandler;
 
 const SCORE_BASE: u64 = 100;
@@ -34,10 +45,18 @@ pub trait LevelSelector: Sync + Send {
 
     fn pick_compaction(
         &self,
-        task_id: u64,
+        task_id: HummockCompactionTaskId,
         levels: &[Level],
         level_handlers: &mut [LevelHandler],
-    ) -> Option<SearchResult>;
+    ) -> Option<CompactionTask>;
+
+    fn manual_pick_compaction(
+        &self,
+        task_id: HummockCompactionTaskId,
+        levels: &[Level],
+        level_handlers: &mut [LevelHandler],
+        option: ManualCompactionOption,
+    ) -> Option<CompactionTask>;
 
     fn name(&self) -> &'static str;
 }
@@ -51,7 +70,7 @@ pub struct SelectContext {
     // size of the files in  `base_level` reaches its capacity, we will place data in a higher
     // level, which equals to `base_level -= 1;`.
     base_level: usize,
-    score_levels: Vec<(u64, usize)>,
+    score_levels: Vec<(u64, usize, usize)>,
 }
 
 // TODO: Set these configurations by meta rpc
@@ -62,10 +81,9 @@ pub struct DynamicLevelSelector {
 
 impl Default for DynamicLevelSelector {
     fn default() -> Self {
-        DynamicLevelSelector::new(
-            Arc::new(CompactionConfig::default()),
-            Arc::new(RangeOverlapStrategy::default()),
-        )
+        let config = Arc::new(CompactionConfigBuilder::new().build());
+        let overlap_strategy = create_overlap_strategy(config.compaction_mode());
+        DynamicLevelSelector::new(config, overlap_strategy)
     }
 }
 
@@ -79,21 +97,26 @@ impl DynamicLevelSelector {
 
     fn create_compaction_picker(
         &self,
-        level: usize,
-        base_level: usize,
-        task_id: u64,
+        select_level: usize,
+        target_level: usize,
+        task_id: HummockCompactionTaskId,
     ) -> Box<dyn CompactionPicker> {
-        if level == 0 {
-            Box::new(TierCompactionPicker::new(
-                task_id,
-                base_level,
-                self.config.clone(),
-                self.overlap_strategy.clone(),
-            ))
+        if select_level == 0 {
+            if target_level == 0 {
+                Box::new(TierCompactionPicker::new(task_id, self.config.clone()))
+            } else {
+                Box::new(LevelCompactionPicker::new(
+                    task_id,
+                    target_level,
+                    self.config.clone(),
+                    self.overlap_strategy.clone(),
+                ))
+            }
         } else {
             Box::new(MinOverlappingPicker::new(
                 task_id,
-                level,
+                select_level,
+                select_level + 1,
                 self.overlap_strategy.clone(),
             ))
         }
@@ -110,17 +133,13 @@ impl DynamicLevelSelector {
 
         let mut l0_size = 0;
         for level in levels.iter() {
-            let mut total_file_size = 0;
-            for table in &level.table_infos {
-                total_file_size += table.file_size;
-            }
             if level.level_idx > 0 {
-                if total_file_size > 0 && first_non_empty_level == 0 {
+                if level.total_file_size > 0 && first_non_empty_level == 0 {
                     first_non_empty_level = level.level_idx as usize;
                 }
-                max_level_size = std::cmp::max(max_level_size, total_file_size);
+                max_level_size = std::cmp::max(max_level_size, level.total_file_size);
             } else {
-                l0_size = total_file_size;
+                l0_size = level.total_file_size;
             }
         }
 
@@ -129,7 +148,7 @@ impl DynamicLevelSelector {
 
         if max_level_size == 0 {
             // Use the bottommost level.
-            ctx.base_level = self.config.max_level;
+            ctx.base_level = self.config.max_level as usize;
             return ctx;
         }
 
@@ -137,7 +156,7 @@ impl DynamicLevelSelector {
         let base_bytes_min = base_bytes_max / self.config.max_bytes_for_level_multiplier;
 
         let mut cur_level_size = max_level_size;
-        for _ in first_non_empty_level..self.config.max_level {
+        for _ in first_non_empty_level..self.config.max_level as usize {
             cur_level_size /= self.config.max_bytes_for_level_multiplier;
         }
 
@@ -158,7 +177,7 @@ impl DynamicLevelSelector {
 
         let level_multiplier = self.config.max_bytes_for_level_multiplier as f64;
         let mut level_size = base_level_size;
-        for i in ctx.base_level..=self.config.max_level {
+        for i in ctx.base_level..=self.config.max_level as usize {
             // Don't set any level below base_bytes_max. Otherwise, the LSM can
             // assume an hourglass shape where L1+ sizes are smaller than L0. This
             // causes compaction scoring, which depends on level sizes, to favor L1+
@@ -177,39 +196,27 @@ impl DynamicLevelSelector {
         let mut ctx = self.calculate_level_base_size(levels);
 
         // The bottommost level can not be input level.
-        for level in &levels[..self.config.max_level] {
+        for level in &levels[..self.config.max_level as usize] {
             let level_idx = level.level_idx as usize;
-            let mut total_size = 0;
-            let mut idle_file_count = 0;
-            for table in &level.table_infos {
-                if !handlers[level_idx].is_pending_compact(&table.id) {
-                    total_size += table.file_size;
-                    idle_file_count += 1;
-                }
-            }
+            let idle_file_count =
+                (level.table_infos.len() - handlers[level_idx].get_pending_file_count()) as u64;
+            let total_size = level.total_file_size - handlers[level_idx].get_pending_file_size();
             if total_size == 0 {
                 continue;
             }
             if level_idx == 0 {
-                // The number of files in L0 can grow quickly due to frequent checkpoint. So, if we
-                // set level0_trigger_number too small, the manager will always
-                // compact the files in L0 and it would make the whole tree more unbalanced. So we
-                // set level0_trigger_number a large number to make compaction
-                // manager can trigger compaction jobs of other level but we add a base score
-                // `idle_file_count + 100` so that the manager can trigger L0
-                // compaction when the other levels are all balanced.
-                let score = idle_file_count * SCORE_BASE / self.config.level0_trigger_number as u64
-                    + idle_file_count
-                    + SCORE_BASE;
-                let score = std::cmp::max(
-                    total_size * SCORE_BASE / self.config.max_bytes_for_level_base,
-                    score,
-                );
-                ctx.score_levels.push((score, 0));
+                // trigger intra-l0 compaction at first when the number of files is too large.
+                let score = idle_file_count * SCORE_BASE
+                    / self.config.level0_tier_compact_file_number as u64;
+                ctx.score_levels.push((score, 0, 0));
+                let score = 2 * total_size * SCORE_BASE / self.config.max_bytes_for_level_base
+                    + idle_file_count * SCORE_BASE / self.config.level0_tigger_file_numer as u64;
+                ctx.score_levels.push((score, 0, ctx.base_level));
             } else {
                 ctx.score_levels.push((
                     total_size * SCORE_BASE / ctx.level_max_bytes[level_idx],
                     level_idx,
+                    level_idx + 1,
                 ));
             }
         }
@@ -218,6 +225,69 @@ impl DynamicLevelSelector {
         ctx.score_levels.sort_by(|a, b| b.0.cmp(&a.0));
         ctx
     }
+
+    fn generate_task_by_compaction_config(
+        &self,
+        input: CompactionInput,
+        base_level: usize,
+    ) -> CompactionTask {
+        let target_file_size = if input.target_level == 0 {
+            self.config.target_file_size_base
+        } else {
+            assert!(input.target_level >= base_level);
+            self.config.target_file_size_base << (input.target_level - base_level)
+        };
+        let compression_algorithm = if input.target_level == 0 {
+            self.config.compression_algorithm[0].clone()
+        } else {
+            let idx = input.target_level - base_level + 1;
+            self.config.compression_algorithm[idx].clone()
+        };
+        let mut splits = vec![];
+        const SPLIT_RANGE_STEP: usize = 8;
+        let mut keys = input
+            .input_levels
+            .iter()
+            .flat_map(|level| level.table_infos.iter())
+            .map(|table| {
+                FullKey::from_user_key_slice(
+                    user_key(&table.key_range.as_ref().unwrap().left),
+                    HummockEpoch::MAX,
+                )
+                .into_inner()
+            })
+            .collect_vec();
+        let total_file_size = input
+            .input_levels
+            .iter()
+            .flat_map(|level| level.table_infos.iter())
+            .map(|table| table.file_size)
+            .sum::<u64>();
+
+        if total_file_size > self.config.min_compaction_bytes && keys.len() >= SPLIT_RANGE_STEP * 2
+        {
+            splits.push(KeyRange::new(vec![], vec![]));
+            keys.sort_by(|a, b| VersionedComparator::compare_key(a.as_ref(), b.as_ref()));
+            let concurrency = std::cmp::min(
+                keys.len() / SPLIT_RANGE_STEP,
+                self.config.max_sub_compaction as usize,
+            );
+            let step = (keys.len() + concurrency - 1) / concurrency;
+            assert!(step > 1);
+            for (idx, key) in keys.into_iter().enumerate() {
+                if idx > 0 && idx % step == 0 {
+                    splits.last_mut().unwrap().right = key.clone();
+                    splits.push(KeyRange::new(key, vec![]));
+                }
+            }
+        }
+        CompactionTask {
+            input,
+            compression_algorithm,
+            target_file_size,
+            splits,
+        }
+    }
 }
 
 impl LevelSelector for DynamicLevelSelector {
@@ -225,27 +295,52 @@ impl LevelSelector for DynamicLevelSelector {
         let ctx = self.get_priority_levels(levels, level_handlers);
         ctx.score_levels
             .first()
-            .map(|(score, _)| *score > SCORE_BASE)
+            .map(|(score, _, _)| *score > SCORE_BASE)
             .unwrap_or(false)
     }
 
     fn pick_compaction(
         &self,
-        task_id: u64,
+        task_id: HummockCompactionTaskId,
         levels: &[Level],
         level_handlers: &mut [LevelHandler],
-    ) -> Option<SearchResult> {
+    ) -> Option<CompactionTask> {
         let ctx = self.get_priority_levels(levels, level_handlers);
-        for (score, level_idx) in ctx.score_levels {
+        for (score, select_level, target_level) in ctx.score_levels {
             if score <= SCORE_BASE {
                 return None;
             }
-            let picker = self.create_compaction_picker(level_idx, ctx.base_level, task_id);
+            let picker = self.create_compaction_picker(select_level, target_level, task_id);
             if let Some(ret) = picker.pick_compaction(levels, level_handlers) {
-                return Some(ret);
+                return Some(self.generate_task_by_compaction_config(ret, ctx.base_level));
             }
         }
         None
+    }
+
+    fn manual_pick_compaction(
+        &self,
+        task_id: HummockCompactionTaskId,
+        levels: &[Level],
+        level_handlers: &mut [LevelHandler],
+        option: ManualCompactionOption,
+    ) -> Option<CompactionTask> {
+        let ctx = self.get_priority_levels(levels, level_handlers);
+        let target_level = if option.level == 0 {
+            ctx.base_level
+        } else {
+            option.level + 1
+        };
+
+        let picker = ManualCompactionPicker::new(
+            task_id,
+            self.overlap_strategy.clone(),
+            option,
+            target_level,
+        );
+
+        let ret = picker.pick_compaction(levels, level_handlers)?;
+        Some(self.generate_task_by_compaction_config(ret, ctx.base_level))
     }
 
     fn name(&self) -> &'static str {
@@ -258,11 +353,33 @@ pub mod tests {
     use std::ops::Range;
 
     use itertools::Itertools;
-    use risingwave_pb::hummock::{LevelType, SstableInfo};
+    use risingwave_common::config::constant::hummock::CompactionFilterFlag;
+    use risingwave_pb::hummock::compaction_config::CompactionMode;
+    use risingwave_pb::hummock::{KeyRange, Level, LevelType, SstableInfo};
 
     use super::*;
+    use crate::hummock::compaction::compaction_config::CompactionConfigBuilder;
     use crate::hummock::compaction::overlap_strategy::RangeOverlapStrategy;
-    use crate::hummock::compaction::tier_compaction_picker::tests::generate_table;
+    use crate::hummock::test_utils::iterator_test_key_of_epoch;
+
+    pub fn generate_table(
+        id: u64,
+        table_prefix: u64,
+        left: usize,
+        right: usize,
+        epoch: u64,
+    ) -> SstableInfo {
+        SstableInfo {
+            id,
+            key_range: Some(KeyRange {
+                left: iterator_test_key_of_epoch(table_prefix, left, epoch),
+                right: iterator_test_key_of_epoch(table_prefix, right, epoch),
+                inf: false,
+            }),
+            file_size: (right - left + 1) as u64,
+            table_ids: vec![],
+        }
+    }
 
     pub fn generate_tables(
         ids: Range<u64>,
@@ -282,16 +399,28 @@ pub mod tests {
         tables
     }
 
+    pub fn generate_level(level_idx: u32, table_infos: Vec<SstableInfo>) -> Level {
+        let total_file_size = table_infos.iter().map(|sst| sst.file_size).sum();
+        Level {
+            level_idx,
+            level_type: LevelType::Nonoverlapping as i32,
+            table_infos,
+            total_file_size,
+        }
+    }
+
     #[test]
     fn test_dynamic_level() {
-        let config = CompactionConfig {
-            max_bytes_for_level_base: 100,
-            max_level: 4,
-            max_bytes_for_level_multiplier: 5,
-            max_compaction_bytes: 0,
-            level0_max_file_number: 0,
-            level0_trigger_number: 2,
-        };
+        let config = CompactionConfigBuilder::new()
+            .max_bytes_for_level_base(100)
+            .max_level(4)
+            .max_bytes_for_level_multiplier(5)
+            .max_compaction_bytes(1)
+            .min_compaction_bytes(0)
+            .level0_tigger_file_numer(1)
+            .level0_tier_compact_file_number(2)
+            .compaction_mode(CompactionMode::Range as i32)
+            .build();
         let selector =
             DynamicLevelSelector::new(Arc::new(config), Arc::new(RangeOverlapStrategy::default()));
         let mut levels = vec![
@@ -299,27 +428,12 @@ pub mod tests {
                 level_idx: 0,
                 level_type: LevelType::Overlapping as i32,
                 table_infos: vec![],
+                total_file_size: 0,
             },
-            Level {
-                level_idx: 1,
-                level_type: LevelType::Nonoverlapping as i32,
-                table_infos: vec![],
-            },
-            Level {
-                level_idx: 2,
-                level_type: LevelType::Nonoverlapping as i32,
-                table_infos: generate_tables(0..5, 0..1000, 3, 10),
-            },
-            Level {
-                level_idx: 3,
-                level_type: LevelType::Nonoverlapping as i32,
-                table_infos: generate_tables(5..10, 0..1000, 2, 50),
-            },
-            Level {
-                level_idx: 4,
-                level_type: LevelType::Nonoverlapping as i32,
-                table_infos: generate_tables(10..15, 0..1000, 1, 200),
-            },
+            generate_level(1, vec![]),
+            generate_level(2, generate_tables(0..5, 0..1000, 3, 10)),
+            generate_level(3, generate_tables(5..10, 0..1000, 2, 50)),
+            generate_level(4, generate_tables(10..15, 0..1000, 1, 200)),
         ];
         let ctx = selector.calculate_level_base_size(&levels);
         assert_eq!(ctx.base_level, 2);
@@ -330,6 +444,12 @@ pub mod tests {
         levels[4]
             .table_infos
             .append(&mut generate_tables(15..20, 2000..3000, 1, 400));
+        levels[4].total_file_size = levels[4]
+            .table_infos
+            .iter()
+            .map(|sst| sst.file_size)
+            .sum::<u64>();
+
         let ctx = selector.calculate_level_base_size(&levels);
         // data size increase, so we need increase one level to place more data.
         assert_eq!(ctx.base_level, 1);
@@ -342,6 +462,12 @@ pub mod tests {
         levels[0]
             .table_infos
             .append(&mut generate_tables(20..26, 0..1000, 1, 100));
+        levels[0].total_file_size = levels[0]
+            .table_infos
+            .iter()
+            .map(|sst| sst.file_size)
+            .sum::<u64>();
+
         let ctx = selector.calculate_level_base_size(&levels);
         assert_eq!(ctx.base_level, 2);
         assert_eq!(ctx.level_max_bytes[2], 600);
@@ -349,7 +475,14 @@ pub mod tests {
         assert_eq!(ctx.level_max_bytes[4], 3025);
 
         levels[0].table_infos.clear();
+        levels[0].total_file_size = 0;
         levels[1].table_infos = generate_tables(26..32, 0..1000, 1, 100);
+        levels[1].total_file_size = levels[1]
+            .table_infos
+            .iter()
+            .map(|sst| sst.file_size)
+            .sum::<u64>();
+
         let ctx = selector.calculate_level_base_size(&levels);
         assert_eq!(ctx.base_level, 1);
         assert_eq!(ctx.level_max_bytes[1], 100);
@@ -360,51 +493,58 @@ pub mod tests {
 
     #[test]
     fn test_pick_compaction() {
-        let config = CompactionConfig {
-            max_bytes_for_level_base: 100,
-            max_level: 4,
-            max_bytes_for_level_multiplier: 5,
-            max_compaction_bytes: 10000,
-            level0_max_file_number: 0,
-            level0_trigger_number: 2,
-        };
-        let selector =
-            DynamicLevelSelector::new(Arc::new(config), Arc::new(RangeOverlapStrategy::default()));
+        let config = CompactionConfigBuilder::new()
+            .max_bytes_for_level_base(200)
+            .max_level(4)
+            .max_bytes_for_level_multiplier(5)
+            .max_compaction_bytes(10000)
+            .min_compaction_bytes(200)
+            .level0_tigger_file_numer(8)
+            .level0_tier_compact_file_number(4)
+            .compaction_mode(CompactionMode::Range as i32)
+            .build();
         let mut levels = vec![
-            Level {
-                level_idx: 0,
-                level_type: LevelType::Overlapping as i32,
-                table_infos: generate_tables(15..20, 0..600, 3, 10),
-            },
-            Level {
-                level_idx: 1,
-                level_type: LevelType::Nonoverlapping as i32,
-                table_infos: vec![],
-            },
-            Level {
-                level_idx: 2,
-                level_type: LevelType::Nonoverlapping as i32,
-                table_infos: generate_tables(0..5, 0..1000, 3, 10),
-            },
-            Level {
-                level_idx: 3,
-                level_type: LevelType::Nonoverlapping as i32,
-                table_infos: generate_tables(5..10, 0..1000, 2, 50),
-            },
-            Level {
-                level_idx: 4,
-                level_type: LevelType::Nonoverlapping as i32,
-                table_infos: generate_tables(10..15, 0..1000, 1, 200),
-            },
+            generate_level(0, generate_tables(15..25, 0..600, 3, 10)),
+            generate_level(1, vec![]),
+            generate_level(2, generate_tables(0..5, 0..1000, 3, 10)),
+            generate_level(3, generate_tables(5..10, 0..1000, 2, 50)),
+            generate_level(4, generate_tables(10..15, 0..1000, 1, 200)),
         ];
+        levels[0].level_type = LevelType::Overlapping as i32;
+
+        let selector = DynamicLevelSelector::new(
+            Arc::new(config.clone()),
+            Arc::new(RangeOverlapStrategy::default()),
+        );
         let mut levels_handlers = (0..5).into_iter().map(LevelHandler::new).collect_vec();
         let compaction = selector
             .pick_compaction(1, &levels, &mut levels_handlers)
             .unwrap();
-        assert_eq!(compaction.select_level.level_idx, 0);
-        assert_eq!(compaction.target_level.level_idx, 2);
-        assert_eq!(compaction.select_level.table_infos.len(), 5);
-        assert_eq!(compaction.target_level.table_infos.len(), 3);
+        assert_eq!(compaction.input.input_levels[0].level_idx, 0);
+        assert_eq!(compaction.input.target_level, 0);
+        assert_eq!(compaction.input.input_levels[0].table_infos.len(), 10);
+
+        let compaction_filter_flag = CompactionFilterFlag::STATE_CLEAN | CompactionFilterFlag::TTL;
+        let config = CompactionConfigBuilder::new_with(config)
+            .min_compaction_bytes(1)
+            .max_bytes_for_level_base(100)
+            .level0_tigger_file_numer(8)
+            .compaction_filter_mask(compaction_filter_flag.into())
+            .build();
+        let selector = DynamicLevelSelector::new(
+            Arc::new(config.clone()),
+            Arc::new(RangeOverlapStrategy::default()),
+        );
+        let mut levels_handlers = (0..5).into_iter().map(LevelHandler::new).collect_vec();
+        let compaction = selector
+            .pick_compaction(1, &levels, &mut levels_handlers)
+            .unwrap();
+        assert_eq!(compaction.input.input_levels[0].level_idx, 0);
+        assert_eq!(compaction.input.target_level, 2);
+        assert_eq!(compaction.input.input_levels[0].table_infos.len(), 10);
+        assert_eq!(compaction.input.input_levels[1].table_infos.len(), 3);
+        assert_eq!(compaction.target_file_size, config.target_file_size_base);
+
         levels_handlers[0].remove_task(1);
         levels_handlers[2].remove_task(1);
         levels[0].table_infos.clear();
@@ -412,11 +552,15 @@ pub mod tests {
         let compaction = selector
             .pick_compaction(2, &levels, &mut levels_handlers)
             .unwrap();
-        assert_eq!(compaction.select_level.level_idx, 3);
-        assert_eq!(compaction.target_level.level_idx, 4);
-        assert_eq!(compaction.select_level.table_infos.len(), 1);
-        assert_eq!(compaction.target_level.table_infos.len(), 1);
-
+        assert_eq!(compaction.input.input_levels[0].level_idx, 3);
+        assert_eq!(compaction.input.target_level, 4);
+        assert_eq!(compaction.input.input_levels[0].table_infos.len(), 1);
+        assert_eq!(compaction.input.input_levels[1].table_infos.len(), 1);
+        assert_eq!(
+            compaction.target_file_size,
+            config.target_file_size_base * 4
+        );
+        assert_eq!(compaction.compression_algorithm.as_str(), "Lz4",);
         // no compaction need to be scheduled because we do not calculate the size of pending files
         // to score.
         let compaction = selector.pick_compaction(2, &levels, &mut levels_handlers);

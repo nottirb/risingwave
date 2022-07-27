@@ -13,22 +13,27 @@
 // limitations under the License.
 
 use std::cmp::Ordering::{Equal, Less};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use risingwave_hummock_sdk::VersionedComparator;
 
 use super::super::{HummockResult, HummockValue};
 use crate::hummock::iterator::{Forward, HummockIterator};
-use crate::hummock::{BlockIterator, SstableStoreRef, TableHolder};
+use crate::hummock::sstable::SstableIteratorReadOptions;
+use crate::hummock::{BlockHolder, BlockIterator, SstableStoreRef, TableHolder};
+use crate::monitor::StoreLocalStatistic;
 
-pub trait SSTableIteratorType {
-    type SSTableIterator: HummockIterator;
-
-    fn new(table: TableHolder, sstable_store: SstableStoreRef) -> Self::SSTableIterator;
+pub trait SstableIteratorType: HummockIterator + 'static {
+    fn create(
+        sstable: TableHolder,
+        sstable_store: SstableStoreRef,
+        read_options: Arc<SstableIteratorReadOptions>,
+    ) -> Self;
 }
 
-/// Iterates on a table.
-pub struct SSTableIterator {
+/// Iterates on a sstable.
+pub struct SstableIterator {
     /// The iterator of the current block.
     block_iter: Option<BlockIterator>,
 
@@ -39,15 +44,21 @@ pub struct SSTableIterator {
     pub sst: TableHolder,
 
     sstable_store: SstableStoreRef,
+    stats: StoreLocalStatistic,
 }
 
-impl SSTableIterator {
-    pub fn new(table: TableHolder, sstable_store: SstableStoreRef) -> Self {
+impl SstableIterator {
+    pub fn new(
+        sstable: TableHolder,
+        sstable_store: SstableStoreRef,
+        _options: Arc<SstableIteratorReadOptions>,
+    ) -> Self {
         Self {
             block_iter: None,
             cur_idx: 0,
-            sst: table,
+            sst: sstable,
             sstable_store,
+            stats: StoreLocalStatistic::default(),
         }
     }
 
@@ -55,21 +66,31 @@ impl SSTableIterator {
     async fn seek_idx(&mut self, idx: usize, seek_key: Option<&[u8]>) -> HummockResult<()> {
         tracing::trace!(
             target: "events::storage::sstable::block_seek",
-            "table iterator seek: table_id = {}, block_id = {}",
+            "table iterator seek: sstable_id = {}, block_id = {}",
             self.sst.value().id,
             idx,
         );
+
+        // When all data are in block cache, it is highly possible that this iterator will stay on a
+        // worker thread for a full time. Therefore, we use tokio's unstable API consume_budget to
+        // do cooperative scheduling.
+        tokio::task::consume_budget().await;
+
         if idx >= self.sst.value().block_count() {
             self.block_iter = None;
         } else {
-            let block = self
-                .sstable_store
-                .get(
-                    self.sst.value(),
-                    idx as u64,
-                    crate::hummock::CachePolicy::Fill,
-                )
-                .await?;
+            let block = if idx < self.sst.value().blocks.len() {
+                BlockHolder::from_ref_block(self.sst.value().blocks[idx].clone())
+            } else {
+                self.sstable_store
+                    .get(
+                        self.sst.value(),
+                        idx as u64,
+                        crate::hummock::CachePolicy::Fill,
+                        &mut self.stats,
+                    )
+                    .await?
+            };
             let mut block_iter = BlockIterator::new(block);
             if let Some(key) = seek_key {
                 block_iter.seek(key);
@@ -86,10 +107,11 @@ impl SSTableIterator {
 }
 
 #[async_trait]
-impl HummockIterator for SSTableIterator {
+impl HummockIterator for SstableIterator {
     type Direction = Forward;
 
     async fn next(&mut self) -> HummockResult<()> {
+        self.stats.scan_key_count += 1;
         let block_iter = self.block_iter.as_mut().expect("no block iter");
         block_iter.next();
 
@@ -142,13 +164,19 @@ impl HummockIterator for SSTableIterator {
 
         Ok(())
     }
+
+    fn collect_local_statistic(&self, stats: &mut StoreLocalStatistic) {
+        stats.add(&self.stats);
+    }
 }
 
-impl SSTableIteratorType for SSTableIterator {
-    type SSTableIterator = SSTableIterator;
-
-    fn new(table: TableHolder, sstable_store: SstableStoreRef) -> Self::SSTableIterator {
-        SSTableIterator::new(table, sstable_store)
+impl SstableIteratorType for SstableIterator {
+    fn create(
+        sstable: TableHolder,
+        sstable_store: SstableStoreRef,
+        options: Arc<SstableIteratorReadOptions>,
+    ) -> Self {
+        SstableIterator::new(sstable, sstable_store, options)
     }
 }
 
@@ -163,24 +191,18 @@ mod tests {
     use crate::hummock::iterator::test_utils::mock_sstable_store;
     use crate::hummock::test_utils::{
         create_small_table_cache, default_builder_opt_for_test, gen_default_test_sstable,
-        test_key_of, test_value_of, TEST_KEYS_COUNT,
+        gen_test_sstable_data, test_key_of, test_value_of, TEST_KEYS_COUNT,
     };
+    use crate::hummock::{CachePolicy, Sstable};
 
-    #[tokio::test]
-    async fn test_table_iterator() {
-        // Build remote table
-        let sstable_store = mock_sstable_store();
-        let table =
-            gen_default_test_sstable(default_builder_opt_for_test(), 0, sstable_store.clone())
-                .await;
-        // We should have at least 10 blocks, so that table iterator test could cover more code
+    async fn inner_test_forward_iterator(sstable_store: SstableStoreRef, handle: TableHolder) {
+        // We should have at least 10 blocks, so that sstable iterator test could cover more code
         // path.
-        assert!(table.meta.block_metas.len() > 10);
-
-        let cache = create_small_table_cache();
-        let handle = cache.insert(0, 0, 1, Box::new(table));
-
-        let mut sstable_iter = SSTableIterator::new(handle, sstable_store);
+        let mut sstable_iter = SstableIterator::create(
+            handle,
+            sstable_store,
+            Arc::new(SstableIteratorReadOptions::default()),
+        );
         let mut cnt = 0;
         sstable_iter.rewind().await.unwrap();
 
@@ -197,18 +219,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_table_seek() {
+    async fn test_table_iterator() {
+        // Build remote sstable
         let sstable_store = mock_sstable_store();
-        let table =
+        let sstable =
             gen_default_test_sstable(default_builder_opt_for_test(), 0, sstable_store.clone())
                 .await;
-        // We should have at least 10 blocks, so that table iterator test could cover more code
+        // We should have at least 10 blocks, so that sstable iterator test could cover more code
         // path.
-        assert!(table.meta.block_metas.len() > 10);
-        let cache = create_small_table_cache();
-        let handle = cache.insert(0, 0, 1, Box::new(table));
+        assert!(sstable.meta.block_metas.len() > 10);
 
-        let mut sstable_iter = SSTableIterator::new(handle, sstable_store);
+        let cache = create_small_table_cache();
+        let handle = cache.insert(0, 0, 1, Box::new(sstable));
+        inner_test_forward_iterator(sstable_store.clone(), handle).await;
+
+        let kv_iter =
+            (0..TEST_KEYS_COUNT).map(|i| (test_key_of(i), HummockValue::put(test_value_of(i))));
+        let (data, meta, _) = gen_test_sstable_data(default_builder_opt_for_test(), kv_iter);
+        let sstable = Sstable::new_with_data(0, meta, data).unwrap();
+        let handle = cache.insert(0, 0, 1, Box::new(sstable));
+        inner_test_forward_iterator(sstable_store, handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_table_seek() {
+        let sstable_store = mock_sstable_store();
+        let sstable =
+            gen_default_test_sstable(default_builder_opt_for_test(), 0, sstable_store.clone())
+                .await;
+        // We should have at least 10 blocks, so that sstable iterator test could cover more code
+        // path.
+        assert!(sstable.meta.block_metas.len() > 10);
+        let cache = create_small_table_cache();
+        let handle = cache.insert(0, 0, 1, Box::new(sstable));
+
+        let mut sstable_iter = SstableIterator::create(
+            handle,
+            sstable_store,
+            Arc::new(SstableIteratorReadOptions::default()),
+        );
         let mut all_key_to_test = (0..TEST_KEYS_COUNT).collect_vec();
         let mut rng = thread_rng();
         all_key_to_test.shuffle(&mut rng);
@@ -263,5 +312,41 @@ mod tests {
             sstable_iter.next().await.unwrap();
         }
         assert!(!sstable_iter.is_valid());
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_table_read() {
+        let sstable_store = mock_sstable_store();
+        // when upload data is successful, but upload meta is fail and delete is fail
+        let kv_iter =
+            (0..TEST_KEYS_COUNT).map(|i| (test_key_of(i), HummockValue::put(test_value_of(i))));
+        let (data, meta, _) = gen_test_sstable_data(default_builder_opt_for_test(), kv_iter);
+        let sstable = Sstable {
+            id: 0,
+            meta,
+            blocks: vec![],
+        };
+        sstable_store
+            .put(sstable, data, CachePolicy::NotFill)
+            .await
+            .unwrap();
+
+        let mut stats = StoreLocalStatistic::default();
+        let mut sstable_iter = SstableIterator::create(
+            sstable_store.sstable(0, &mut stats).await.unwrap(),
+            sstable_store,
+            Arc::new(SstableIteratorReadOptions { prefetch: true }),
+        );
+        let mut cnt = 0;
+        sstable_iter.rewind().await.unwrap();
+        while sstable_iter.is_valid() {
+            let key = sstable_iter.key();
+            let value = sstable_iter.value();
+            assert_bytes_eq!(key, test_key_of(cnt));
+            assert_bytes_eq!(value.into_user_value().unwrap(), test_value_of(cnt));
+            cnt += 1;
+            sstable_iter.next().await.unwrap();
+        }
+        assert_eq!(cnt, TEST_KEYS_COUNT);
     }
 }

@@ -12,22 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::fmt::Debug;
-use std::ops::Deref;
 use std::sync::Arc;
 
 use enum_as_inner::EnumAsInner;
+use parking_lot::RwLock;
 use risingwave_common::config::StorageConfig;
+use risingwave_hummock_sdk::slice_transform::SliceTransformImpl;
+use risingwave_object_store::object::{
+    parse_local_object_store, parse_remote_object_store, ObjectStoreImpl,
+};
 use risingwave_rpc_client::HummockMetaClient;
 
 use crate::error::StorageResult;
-use crate::hummock::compactor::Compactor;
+use crate::hummock::compaction_group_client::CompactionGroupClientImpl;
 use crate::hummock::{HummockStorage, SstableStore};
 use crate::memory::MemoryStateStore;
-use crate::monitor::{MonitoredStateStore as Monitored, StateStoreMetrics};
-use crate::object::{parse_object_store, ObjectStoreImpl};
-use crate::rocksdb_local::RocksDBStateStore;
-use crate::tikv::TikvStateStore;
+use crate::monitor::{MonitoredStateStore as Monitored, ObjectStoreMetrics, StateStoreMetrics};
 use crate::StateStore;
 
 /// The type erased [`StateStore`].
@@ -47,12 +49,6 @@ pub enum StateStoreImpl {
     /// store misses some critical implementation to ensure the correctness of persisting streaming
     /// state. (e.g., no read_epoch support, no async checkpoint)
     MemoryStateStore(Monitored<MemoryStateStore>),
-    /// Should enable `rocksdb-local` feature to use this state store. Not feature-complete, and
-    /// should never be used in tests and production.
-    RocksDBStateStore(Monitored<RocksDBStateStore>),
-    /// Should enable `tikv` feature to use this state store. Not feature-complete, and
-    /// should never be used in tests and production.
-    TikvStateStore(Monitored<TikvStateStore>),
 }
 
 impl StateStoreImpl {
@@ -66,8 +62,6 @@ impl Debug for StateStoreImpl {
         match self {
             StateStoreImpl::HummockStateStore(_) => write!(f, "HummockStateStore"),
             StateStoreImpl::MemoryStateStore(_) => write!(f, "MemoryStateStore"),
-            StateStoreImpl::RocksDBStateStore(_) => write!(f, "RocksDBStateStore"),
-            StateStoreImpl::TikvStateStore(_) => write!(f, "TikvStateStore"),
         }
     }
 }
@@ -76,10 +70,20 @@ impl Debug for StateStoreImpl {
 macro_rules! dispatch_state_store {
     ($impl:expr, $store:ident, $body:tt) => {
         match $impl {
-            StateStoreImpl::MemoryStateStore($store) => $body,
+            StateStoreImpl::MemoryStateStore($store) => {
+                // WARNING: don't change this. Enabling memory backend will cause monomorphization
+                // explosion and thus slow compile time in release mode.
+                #[cfg(debug_assertions)]
+                {
+                    $body
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    let _store = $store;
+                    unimplemented!("memory state store should never be used in release mode");
+                }
+            }
             StateStoreImpl::HummockStateStore($store) => $body,
-            StateStoreImpl::TikvStateStore($store) => $body,
-            StateStoreImpl::RocksDBStateStore($store) => $body,
         }
     };
 }
@@ -90,52 +94,49 @@ impl StateStoreImpl {
         config: Arc<StorageConfig>,
         hummock_meta_client: Arc<dyn HummockMetaClient>,
         state_store_stats: Arc<StateStoreMetrics>,
+        object_store_metrics: Arc<ObjectStoreMetrics>,
+        table_id_to_slice_transform: Arc<RwLock<HashMap<u32, SliceTransformImpl>>>,
     ) -> StorageResult<Self> {
         let store = match s {
-            hummock if hummock.starts_with("hummock") => {
-                let object_store = Arc::new(parse_object_store(hummock).await);
+            hummock if hummock.starts_with("hummock+") => {
+                let remote_object_store = parse_remote_object_store(
+                    hummock.strip_prefix("hummock+").unwrap(),
+                    object_store_metrics.clone(),
+                )
+                .await;
+                let object_store = if config.enable_local_spill {
+                    let local_object_store = parse_local_object_store(
+                        config.local_object_store.as_str(),
+                        object_store_metrics.clone(),
+                    )
+                    .await;
+                    ObjectStoreImpl::hybrid(local_object_store, remote_object_store)
+                } else {
+                    remote_object_store
+                };
+
                 let sstable_store = Arc::new(SstableStore::new(
-                    object_store.clone(),
+                    Arc::new(object_store),
                     config.data_directory.to_string(),
-                    state_store_stats.clone(),
-                    config.block_cache_capacity,
-                    config.meta_cache_capacity,
+                    config.block_cache_capacity_mb * (1 << 20),
+                    config.meta_cache_capacity_mb * (1 << 20),
                 ));
+                let compaction_group_client =
+                    Arc::new(CompactionGroupClientImpl::new(hummock_meta_client.clone()));
                 let inner = HummockStorage::new(
                     config.clone(),
                     sstable_store.clone(),
                     hummock_meta_client.clone(),
                     state_store_stats.clone(),
+                    compaction_group_client,
+                    table_id_to_slice_transform,
                 )
                 .await?;
-                if let ObjectStoreImpl::Mem(ref in_mem_object_store) = object_store.deref() {
-                    tracing::info!("start a compactor for in-memory object store");
-                    let (_, shutdown_sender) = Compactor::start_compactor(
-                        config.clone(),
-                        hummock_meta_client,
-                        sstable_store,
-                        state_store_stats.clone(),
-                    );
-                    in_mem_object_store.set_compactor_shutdown_sender(shutdown_sender);
-                }
                 StateStoreImpl::HummockStateStore(inner.monitored(state_store_stats))
             }
 
             "in_memory" | "in-memory" => {
-                tracing::warn!("in-memory state backend should never be used in benchmarks and production environment.");
-                StateStoreImpl::shared_in_memory_store(state_store_stats.clone())
-            }
-
-            tikv if tikv.starts_with("tikv") => {
-                let inner =
-                    TikvStateStore::new(vec![tikv.strip_prefix("tikv://").unwrap().to_string()]);
-                StateStoreImpl::TikvStateStore(inner.monitored(state_store_stats))
-            }
-
-            rocksdb if rocksdb.starts_with("rocksdb_local://") => {
-                let inner =
-                    RocksDBStateStore::new(rocksdb.strip_prefix("rocksdb_local://").unwrap());
-                StateStoreImpl::RocksDBStateStore(inner.monitored(state_store_stats))
+                panic!("in-memory state backend should never be used in end-to-end environment, use `hummock+memory` instead.")
             }
 
             other => unimplemented!("{} state store is not supported", other),

@@ -15,25 +15,17 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use risingwave_common::error::{ErrorCode, Result};
+use risingwave_hummock_sdk::LocalSstableInfo;
 use risingwave_pb::hummock::{
-    CompactTask, HummockVersion, SstableInfo, SubscribeCompactTasksResponse, VacuumTask,
+    CompactTask, CompactionGroup, HummockVersion, HummockVersionDelta,
+    SubscribeCompactTasksResponse, VacuumTask,
 };
+use risingwave_rpc_client::error::Result;
 use risingwave_rpc_client::{HummockMetaClient, MetaClient};
 use tonic::Streaming;
 
-use crate::hummock::{HummockEpoch, HummockError, HummockSSTableId, HummockVersionId};
+use crate::hummock::{HummockEpoch, HummockSstableId, HummockVersionId};
 use crate::monitor::HummockMetrics;
-
-#[derive(Default)]
-pub struct RetryableError {}
-
-impl tokio_retry::Condition<HummockError> for RetryableError {
-    fn should_retry(&mut self, _error: &HummockError) -> bool {
-        // TODO #2745 define retryable error here
-        false
-    }
-}
 
 pub struct MonitoredHummockMetaClient {
     meta_client: MetaClient,
@@ -49,7 +41,10 @@ impl MonitoredHummockMetaClient {
 
 #[async_trait]
 impl HummockMetaClient for MonitoredHummockMetaClient {
-    async fn pin_version(&self, last_pinned: HummockVersionId) -> Result<HummockVersion> {
+    async fn pin_version(
+        &self,
+        last_pinned: HummockVersionId,
+    ) -> Result<(bool, Vec<HummockVersionDelta>, Option<HummockVersion>)> {
         self.stats.pin_version_counts.inc();
         let timer = self.stats.pin_version_latency.start_timer();
         let res = self.meta_client.pin_version(last_pinned).await;
@@ -57,46 +52,57 @@ impl HummockMetaClient for MonitoredHummockMetaClient {
         res
     }
 
-    async fn unpin_version(&self, pinned_version_ids: &[HummockVersionId]) -> Result<()> {
+    async fn unpin_version(&self) -> Result<()> {
         self.stats.unpin_version_counts.inc();
         let timer = self.stats.unpin_version_latency.start_timer();
-        let res = self.meta_client.unpin_version(pinned_version_ids).await;
+        let res = self.meta_client.unpin_version().await;
         timer.observe_duration();
         res
     }
 
-    async fn pin_snapshot(&self, last_pinned: HummockEpoch) -> Result<HummockEpoch> {
+    async fn unpin_version_before(&self, unpin_version_before: HummockVersionId) -> Result<()> {
+        self.stats.unpin_version_before_counts.inc();
+        let timer = self.stats.unpin_version_before_latency.start_timer();
+        let res = self
+            .meta_client
+            .unpin_version_before(unpin_version_before)
+            .await;
+        timer.observe_duration();
+        res
+    }
+
+    async fn pin_snapshot(&self) -> Result<HummockEpoch> {
         self.stats.pin_snapshot_counts.inc();
         let timer = self.stats.pin_snapshot_latency.start_timer();
-        let res = self.meta_client.pin_snapshot(last_pinned).await;
+        let res = self.meta_client.pin_snapshot().await;
         timer.observe_duration();
         res
     }
 
-    async fn unpin_snapshot(&self, pinned_epochs: &[HummockEpoch]) -> Result<()> {
+    async fn get_epoch(&self) -> Result<HummockEpoch> {
+        self.stats.pin_snapshot_counts.inc();
+        let timer = self.stats.pin_snapshot_latency.start_timer();
+        let res = self.meta_client.get_epoch().await;
+        timer.observe_duration();
+        res
+    }
+
+    async fn unpin_snapshot(&self) -> Result<()> {
         self.stats.unpin_snapshot_counts.inc();
         let timer = self.stats.unpin_snapshot_latency.start_timer();
-        let res = self.meta_client.unpin_snapshot(pinned_epochs).await;
+        let res = self.meta_client.unpin_snapshot().await;
         timer.observe_duration();
         res
     }
 
-    async fn get_new_table_id(&self) -> Result<HummockSSTableId> {
+    async fn unpin_snapshot_before(&self, _min_epoch: HummockEpoch) -> Result<()> {
+        unreachable!("Currently CNs should not call this function")
+    }
+
+    async fn get_new_table_id(&self) -> Result<HummockSstableId> {
         self.stats.get_new_table_id_counts.inc();
         let timer = self.stats.get_new_table_id_latency.start_timer();
         let res = self.meta_client.get_new_table_id().await;
-        timer.observe_duration();
-        res
-    }
-
-    async fn add_tables(
-        &self,
-        epoch: HummockEpoch,
-        sstables: Vec<SstableInfo>,
-    ) -> Result<HummockVersion> {
-        self.stats.add_tables_counts.inc();
-        let timer = self.stats.add_tables_latency.start_timer();
-        let res = self.meta_client.add_tables(epoch, sstables).await;
         timer.observe_duration();
         res
     }
@@ -109,12 +115,12 @@ impl HummockMetaClient for MonitoredHummockMetaClient {
         res
     }
 
-    async fn commit_epoch(&self, _epoch: HummockEpoch) -> Result<()> {
-        Err(ErrorCode::NotImplemented("commit_epoch unsupported".to_string(), None.into()).into())
-    }
-
-    async fn abort_epoch(&self, _epoch: HummockEpoch) -> Result<()> {
-        Err(ErrorCode::NotImplemented("abort_epoch unsupported".to_string(), None.into()).into())
+    async fn commit_epoch(
+        &self,
+        _epoch: HummockEpoch,
+        _sstables: Vec<LocalSstableInfo>,
+    ) -> Result<()> {
+        panic!("Only meta service can commit_epoch in production.")
     }
 
     async fn subscribe_compact_tasks(&self) -> Result<Streaming<SubscribeCompactTasksResponse>> {
@@ -123,5 +129,20 @@ impl HummockMetaClient for MonitoredHummockMetaClient {
 
     async fn report_vacuum_task(&self, vacuum_task: VacuumTask) -> Result<()> {
         self.meta_client.report_vacuum_task(vacuum_task).await
+    }
+
+    async fn get_compaction_groups(&self) -> Result<Vec<CompactionGroup>> {
+        self.meta_client.get_compaction_groups().await
+    }
+
+    async fn trigger_manual_compaction(
+        &self,
+        compaction_group_id: u64,
+        table_id: u32,
+        level: u32,
+    ) -> Result<()> {
+        self.meta_client
+            .trigger_manual_compaction(compaction_group_id, table_id, level)
+            .await
     }
 }

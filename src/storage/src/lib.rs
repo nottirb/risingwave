@@ -18,6 +18,7 @@
 #![warn(clippy::explicit_into_iter_loop)]
 #![warn(clippy::explicit_iter_loop)]
 #![warn(clippy::inconsistent_struct_constructor)]
+#![warn(clippy::unused_async)]
 #![warn(clippy::map_flatten)]
 #![warn(clippy::no_effect_underscore_binding)]
 #![warn(clippy::await_holding_lock)]
@@ -31,20 +32,25 @@
 #![feature(backtrace)]
 #![feature(map_first_last)]
 #![feature(type_alias_impl_trait)]
-#![feature(let_chains)]
 #![feature(test)]
 #![feature(custom_test_frameworks)]
 #![feature(result_option_inspect)]
-#![test_runner(hummock::test_runner::run_failpont_tests)]
-
-pub mod cell_based_row_deserializer;
-pub mod cell_based_row_serializer;
+#![feature(generators)]
+#![feature(lint_reasons)]
+#![feature(allocator_api)]
+#![feature(strict_provenance)]
+#![feature(let_else)]
+#![feature(proc_macro_hygiene)]
+#![feature(stmt_expr_attributes)]
+#![feature(type_changing_struct_update)]
+#![feature(build_hasher_simple_hash_one)]
+#![test_runner(risingwave_test_runner::test_runner::run_failpont_tests)]
 pub mod hummock;
 pub mod keyspace;
 pub mod memory;
 pub mod monitor;
-pub mod object;
 pub mod panic_store;
+pub mod row_serde;
 pub mod storage_value;
 #[macro_use]
 pub mod store;
@@ -53,20 +59,9 @@ pub mod store_impl;
 pub mod table;
 pub mod write_batch;
 
-#[cfg(feature = "rocksdb-local")]
-pub mod rocksdb_local;
-#[cfg(not(feature = "rocksdb-local"))]
-#[path = "rocksdb_local_mock.rs"]
-pub mod rocksdb_local;
-
 #[cfg(test)]
 #[cfg(feature = "failpoints")]
 mod storage_failpoints;
-#[cfg(feature = "tikv")]
-pub mod tikv;
-#[cfg(not(feature = "tikv"))]
-#[path = "tikv_mock.rs"]
-pub mod tikv;
 
 pub use keyspace::Keyspace;
 extern crate test;

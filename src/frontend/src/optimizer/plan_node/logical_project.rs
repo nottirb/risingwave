@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::string::String;
 
@@ -21,14 +22,54 @@ use risingwave_common::catalog::{Field, Schema};
 use risingwave_common::error::Result;
 
 use super::{
-    BatchProject, ColPrunable, PlanBase, PlanRef, PlanTreeNodeUnary, StreamProject, ToBatch,
-    ToStream,
+    gen_filter_and_pushdown, BatchProject, ColPrunable, PlanBase, PlanRef, PlanTreeNodeUnary,
+    PredicatePushdown, StreamProject, ToBatch, ToStream,
 };
-use crate::expr::{assert_input_ref, Expr, ExprImpl, ExprRewriter, ExprVisitor, InputRef};
+use crate::expr::{
+    assert_input_ref, Expr, ExprImpl, ExprRewriter, ExprVerboseDisplay, ExprVisitor, InputRef,
+};
 use crate::optimizer::plan_node::CollectInputRef;
-use crate::optimizer::property::{Distribution, Order};
-use crate::utils::ColIndexMapping;
+use crate::optimizer::property::{Distribution, Order, RequiredDist};
+use crate::utils::{ColIndexMapping, Condition, Substitute};
 
+/// Construct a `LogicalProject` and dedup expressions.
+/// expressions
+#[derive(Default)]
+pub struct LogicalProjectBuilder {
+    exprs: Vec<ExprImpl>,
+    exprs_index: HashMap<ExprImpl, usize>,
+}
+
+impl LogicalProjectBuilder {
+    /// add an expression to the `LogicalProject` and return the column index of the project's
+    /// output
+    pub fn add_expr(&mut self, expr: &ExprImpl) -> usize {
+        if let Some(idx) = self.exprs_index.get(expr) {
+            *idx
+        } else {
+            let index = self.exprs.len();
+            self.exprs.push(expr.clone());
+            self.exprs_index.insert(expr.clone(), index);
+            index
+        }
+    }
+
+    pub fn expr_index(&self, expr: &ExprImpl) -> Option<usize> {
+        if expr.has_subquery() {
+            return None;
+        }
+        self.exprs_index.get(expr).copied()
+    }
+
+    pub fn exprs_num(&self) -> usize {
+        self.exprs.len()
+    }
+
+    /// build the `LogicalProject` from `LogicalProjectBuilder`
+    pub fn build(self, input: PlanRef) -> LogicalProject {
+        LogicalProject::new(input, self.exprs)
+    }
+}
 /// `LogicalProject` computes a set of expressions from its input relation.
 #[derive(Debug, Clone)]
 pub struct LogicalProject {
@@ -36,9 +77,13 @@ pub struct LogicalProject {
     exprs: Vec<ExprImpl>,
     input: PlanRef,
 }
-
 impl LogicalProject {
     pub fn new(input: PlanRef, exprs: Vec<ExprImpl>) -> Self {
+        assert!(
+            exprs.iter().all(|e| !e.has_table_function()),
+            "Project should not have table function."
+        );
+
         let ctx = input.ctx();
         let schema = Self::derive_schema(&exprs, input.schema());
         let pk_indices = Self::derive_pk(input.schema(), input.pk_indices(), &exprs);
@@ -87,11 +132,11 @@ impl LogicalProject {
     ///
     /// This is useful in column pruning when we want to add a project to ensure the output schema
     /// is correct.
-    pub fn with_mapping(input: PlanRef, mapping: ColIndexMapping) -> PlanRef {
+    pub fn with_mapping(input: PlanRef, mapping: ColIndexMapping) -> Self {
         if mapping.target_size() == 0 {
             // The mapping is empty, so the parent actually doesn't need the output of the input.
             // This can happen when the parent node only selects constant expressions.
-            return input;
+            return LogicalProject::new(input, vec![]);
         };
         let mut input_refs = vec![None; mapping.target_size()];
         for (src, tar) in mapping.mapping_pairs() {
@@ -105,7 +150,21 @@ impl LogicalProject {
             .map(|i| InputRef::new(i, input_schema.fields()[i].data_type()).into())
             .collect();
 
-        LogicalProject::new(input, exprs).into()
+        LogicalProject::new(input, exprs)
+    }
+
+    /// Creates a `LogicalProject` which select some columns from the input.
+    pub fn with_out_fields(input: PlanRef, out_fields: &FixedBitSet) -> Self {
+        LogicalProject::with_out_col_idx(input, out_fields.ones())
+    }
+
+    /// Creates a `LogicalProject` which select some columns from the input.
+    pub fn with_out_col_idx(input: PlanRef, out_fields: impl Iterator<Item = usize>) -> Self {
+        let input_schema = input.schema();
+        let exprs = out_fields
+            .map(|index| InputRef::new(index, input_schema[index].data_type()).into())
+            .collect();
+        LogicalProject::new(input, exprs)
     }
 
     fn derive_schema(exprs: &[ExprImpl], input_schema: &Schema) -> Schema {
@@ -120,7 +179,11 @@ impl LogicalProject {
                         let field = input_schema.fields()[input_idx].clone();
                         (field.name, field.sub_fields, field.type_name)
                     }
-                    None => (format!("expr#{}", id), vec![], String::new()),
+                    None => (
+                        format!("{:?}", ExprVerboseDisplay { expr, input_schema }),
+                        vec![],
+                        String::new(),
+                    ),
                 };
                 Field::with_struct(expr.return_type(), name, sub_fields, type_name)
             })
@@ -142,7 +205,24 @@ impl LogicalProject {
     }
 
     pub(super) fn fmt_with_name(&self, f: &mut fmt::Formatter, name: &str) -> fmt::Result {
-        f.debug_struct(name).field("exprs", self.exprs()).finish()
+        let verbose = self.base.ctx.is_explain_verbose();
+        let mut builder = f.debug_struct(name);
+        if verbose {
+            builder.field(
+                "exprs",
+                &self
+                    .exprs()
+                    .iter()
+                    .map(|expr| ExprVerboseDisplay {
+                        expr,
+                        input_schema: self.input.schema(),
+                    })
+                    .collect_vec(),
+            );
+        } else {
+            builder.field("exprs", self.exprs());
+        }
+        builder.finish()
     }
 
     pub fn is_identity(&self) -> bool {
@@ -155,6 +235,17 @@ impl LogicalProject {
                 .all(|(i, (expr, field))| {
                     matches!(expr, ExprImpl::InputRef(input_ref) if **input_ref == InputRef::new(i, field.data_type()))
                 })
+    }
+
+    pub fn try_as_projection(&self) -> Option<Vec<usize>> {
+        self.exprs
+            .iter()
+            .enumerate()
+            .map(|(_i, expr)| match expr {
+                ExprImpl::InputRef(input_ref) => Some(input_ref.index),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
     }
 
     pub fn decompose(self) -> (Vec<ExprImpl>, PlanRef) {
@@ -235,37 +326,87 @@ impl ColPrunable for LogicalProject {
     }
 }
 
+impl PredicatePushdown for LogicalProject {
+    fn predicate_pushdown(&self, predicate: Condition) -> PlanRef {
+        // convert the predicate to one that references the child of the project
+        let mut subst = Substitute {
+            mapping: self.exprs.clone(),
+        };
+        let predicate = predicate.rewrite_expr(&mut subst);
+
+        gen_filter_and_pushdown(self, Condition::true_cond(), predicate)
+    }
+}
+
 impl ToBatch for LogicalProject {
     fn to_batch(&self) -> Result<PlanRef> {
         let new_input = self.input().to_batch()?;
-        let new_logical = self.clone_with_input(new_input);
-        Ok(BatchProject::new(new_logical).into())
+        let new_logical = self.clone_with_input(new_input.clone());
+        if let Some(input_proj) = new_input.as_batch_project() {
+            let outer_project = new_logical;
+            let inner_project = input_proj.as_logical();
+            let mut subst = Substitute {
+                mapping: inner_project.exprs().clone(),
+            };
+            let exprs = outer_project
+                .exprs()
+                .iter()
+                .cloned()
+                .map(|expr| subst.rewrite_expr(expr))
+                .collect();
+            Ok(BatchProject::new(LogicalProject::new(inner_project.input(), exprs)).into())
+        } else {
+            Ok(BatchProject::new(new_logical).into())
+        }
     }
 }
 
 impl ToStream for LogicalProject {
-    fn to_stream_with_dist_required(&self, required_dist: &Distribution) -> Result<PlanRef> {
-        let input_required = match required_dist {
-            Distribution::HashShard(_) => self
+    fn to_stream_with_dist_required(&self, required_dist: &RequiredDist) -> Result<PlanRef> {
+        let input_required = if required_dist.satisfies(&RequiredDist::AnyShard) {
+            RequiredDist::Any
+        } else {
+            let input_required = self
                 .o2i_col_mapping()
-                .rewrite_required_distribution(required_dist)
-                .unwrap_or(Distribution::AnyShard),
-            Distribution::AnyShard => Distribution::AnyShard,
-            _ => Distribution::Any,
+                .rewrite_required_distribution(required_dist);
+            match input_required {
+                RequiredDist::PhysicalDist(dist) => match dist {
+                    Distribution::Single => RequiredDist::Any,
+                    _ => RequiredDist::PhysicalDist(dist),
+                },
+                _ => input_required,
+            }
         };
         let new_input = self.input().to_stream_with_dist_required(&input_required)?;
-        let new_logical = self.clone_with_input(new_input);
-        let stream_plan = StreamProject::new(new_logical);
-        required_dist.enforce_if_not_satisfies(stream_plan.into(), Order::any())
+        let new_logical = self.clone_with_input(new_input.clone());
+        let stream_plan = if let Some(input_proj) = new_input.as_stream_project() {
+            let outer_project = new_logical;
+            let inner_project = input_proj.as_logical();
+            let mut subst = Substitute {
+                mapping: inner_project.exprs().clone(),
+            };
+            let exprs = outer_project
+                .exprs()
+                .iter()
+                .cloned()
+                .map(|expr| subst.rewrite_expr(expr))
+                .collect();
+            StreamProject::new(LogicalProject::new(inner_project.input(), exprs))
+        } else {
+            StreamProject::new(new_logical)
+        };
+        required_dist.enforce_if_not_satisfies(stream_plan.into(), &Order::any())
     }
 
     fn to_stream(&self) -> Result<PlanRef> {
-        self.to_stream_with_dist_required(Distribution::any())
+        self.to_stream_with_dist_required(&RequiredDist::Any)
     }
 
     fn logical_rewrite_for_stream(&self) -> Result<(PlanRef, ColIndexMapping)> {
         let (input, input_col_change) = self.input.logical_rewrite_for_stream()?;
         let (proj, out_col_change) = self.rewrite_with_input(input.clone(), input_col_change);
+
+        // Add missing columns of input_pk into the select list.
         let input_pk = input.pk_indices();
         let i2o = Self::i2o_col_mapping_inner(input.schema().len(), proj.exprs());
         let col_need_to_add = input_pk.iter().cloned().filter(|i| i2o.try_map(*i) == None);
@@ -279,7 +420,11 @@ impl ToStream for LogicalProject {
                 }))
                 .collect();
         let proj = Self::new(input, exprs);
-        // the added columns is at the end, so it will not change the exists column index
+        // The added columns is at the end, so it will not change existing column indices.
+        // But the target size of `out_col_change` should be the same as the length of the new
+        // schema.
+        let (map, _) = out_col_change.into_parts();
+        let out_col_change = ColIndexMapping::with_target_size(map, proj.base.schema.len());
         Ok((proj.into(), out_col_change))
     }
 }
