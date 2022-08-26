@@ -15,7 +15,6 @@
 use std::fmt;
 
 use itertools::Itertools;
-use risingwave_common::catalog::FieldVerboseDisplay;
 use risingwave_common::error::Result;
 use risingwave_pb::batch_plan::expand_node::Subset;
 use risingwave_pb::batch_plan::plan_node::NodeBody;
@@ -36,21 +35,19 @@ pub struct BatchExpand {
 impl BatchExpand {
     pub fn new(logical: LogicalExpand) -> Self {
         let ctx = logical.base.ctx.clone();
-        let base = PlanBase::new_batch(
-            ctx,
-            logical.schema().clone(),
-            Distribution::SomeShard,
-            Order::any(),
-        );
+        let dist = match logical.input().distribution() {
+            Distribution::Single => Distribution::Single,
+            Distribution::SomeShard
+            | Distribution::HashShard(_)
+            | Distribution::UpstreamHashShard(_) => Distribution::SomeShard,
+            Distribution::Broadcast => unreachable!(),
+        };
+        let base = PlanBase::new_batch(ctx, logical.schema().clone(), dist, Order::any());
         BatchExpand { base, logical }
     }
 
     pub fn column_subsets(&self) -> &Vec<Vec<usize>> {
         self.logical.column_subsets()
-    }
-
-    pub fn column_subsets_verbose_display(&self) -> Vec<Vec<FieldVerboseDisplay>> {
-        self.logical.column_subsets_verbose_display()
     }
 }
 

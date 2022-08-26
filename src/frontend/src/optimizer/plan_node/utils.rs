@@ -13,8 +13,10 @@
 // limitations under the License.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
-use risingwave_common::catalog::{ColumnDesc, Field};
+use itertools::Itertools;
+use risingwave_common::catalog::{ColumnDesc, Field, Schema};
 use risingwave_common::util::sort_util::OrderType;
 
 use crate::catalog::column_catalog::ColumnCatalog;
@@ -26,7 +28,10 @@ pub struct TableCatalogBuilder {
     columns: Vec<ColumnCatalog>,
     column_names: HashMap<String, i32>,
     order_key: Vec<FieldOrder>,
-    pk_indices: Vec<usize>,
+    // FIXME(stonepage): stream_key should be meaningless in internal state table, check if we
+    // can remove it later
+    stream_key: Vec<usize>,
+    properties: HashMap<String, String>,
 }
 
 /// For DRY, mainly used for construct internal table catalog in stateful streaming executors.
@@ -58,7 +63,7 @@ impl TableCatalogBuilder {
     /// Check whether need to add a ordered column. Different from value, order desc equal pk in
     /// semantics and they are encoded as storage key.
     pub fn add_order_column(&mut self, index: usize, order_type: OrderType) {
-        self.pk_indices.push(index);
+        self.stream_key.push(index);
         self.order_key.push(FieldOrder {
             index,
             direct: match order_type {
@@ -66,6 +71,11 @@ impl TableCatalogBuilder {
                 OrderType::Descending => Direction::Desc,
             },
         });
+    }
+
+    /// Add `properties` for `TableCatalog`
+    pub fn add_properties(&mut self, properties: HashMap<String, String>) {
+        self.properties = properties;
     }
 
     /// Check the column name whether exist before. if true, record occurrence and change the name
@@ -88,14 +98,12 @@ impl TableCatalogBuilder {
             name: String::new(),
             columns: self.columns,
             order_key: self.order_key,
-            pk: self.pk_indices,
+            stream_key: self.stream_key,
             is_index_on: None,
             distribution_key,
             appendonly: append_only,
             owner: risingwave_common::catalog::DEFAULT_SUPER_USER_ID,
-            vnode_mapping: None,
-            properties: HashMap::default(),
-            read_pattern_prefix_column: 0,
+            properties: self.properties,
         }
     }
 
@@ -131,5 +139,39 @@ impl TableCatalogBuilder {
             .collect();
 
         self.build(dist_indices_on_table_columns, append_only)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct IndicesDisplay<'a> {
+    pub indices: &'a [usize],
+    pub input_schema: &'a Schema,
+}
+
+impl fmt::Display for IndicesDisplay<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "[{}]",
+            self.indices
+                .iter()
+                .map(|i| self.input_schema.fields.get(*i).unwrap().name.clone())
+                .collect_vec()
+                .join(", ")
+        )
+    }
+}
+
+impl fmt::Debug for IndicesDisplay<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "[{}]",
+            self.indices
+                .iter()
+                .map(|i| self.input_schema.fields.get(*i).unwrap().name.clone())
+                .collect_vec()
+                .join(", ")
+        )
     }
 }

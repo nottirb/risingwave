@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::fmt;
 
 use itertools::Itertools;
-use risingwave_common::catalog::{DatabaseId, Field, Schema, SchemaId};
+use risingwave_common::catalog::{Field, Schema};
+use risingwave_common::config::constant::hummock::PROPERTIES_RETAINTION_SECOND_KEY;
 use risingwave_common::types::DataType;
 use risingwave_common::util::sort_util::OrderType;
 use risingwave_pb::plan_common::JoinType;
@@ -26,7 +28,8 @@ use super::utils::TableCatalogBuilder;
 use super::{LogicalJoin, PlanBase, PlanRef, PlanTreeNodeBinary, StreamDeltaJoin, ToStreamProst};
 use crate::catalog::table_catalog::TableCatalog;
 use crate::expr::Expr;
-use crate::optimizer::plan_node::{EqJoinPredicate, EqJoinPredicateVerboseDisplay};
+use crate::optimizer::plan_node::utils::IndicesDisplay;
+use crate::optimizer::plan_node::{EqJoinPredicate, EqJoinPredicateDisplay};
 use crate::optimizer::property::Distribution;
 use crate::utils::ColIndexMapping;
 
@@ -41,11 +44,6 @@ pub struct StreamHashJoin {
     /// The join condition must be equivalent to `logical.on`, but separated into equal and
     /// non-equal parts to facilitate execution later
     eq_join_predicate: EqJoinPredicate,
-
-    /// Whether to force use delta join for this join node. If this is true, then indexes will
-    /// be create automatically when building the executors on meta service. For testing purpose
-    /// only. Will remove after we have fully support shared state and index.
-    is_delta: bool,
 
     /// Whether can optimize for append-only stream.
     /// It is true if input of both side is append-only
@@ -69,13 +67,12 @@ impl StreamHashJoin {
                 .composite(&logical.i2o_col_mapping()),
         );
 
-        let force_delta = ctx.inner().session_ctx.config().get_delta_join();
-
         // TODO: derive from input
         let base = PlanBase::new_stream(
             ctx,
             logical.schema().clone(),
-            logical.base.pk_indices.to_vec(),
+            logical.base.logical_pk.to_vec(),
+            logical.functional_dependency().clone(),
             dist,
             append_only,
         );
@@ -84,7 +81,6 @@ impl StreamHashJoin {
             base,
             logical,
             eq_join_predicate,
-            is_delta: force_delta,
             is_append_only: append_only,
         }
     }
@@ -102,14 +98,17 @@ impl StreamHashJoin {
     pub(super) fn derive_dist(
         left: &Distribution,
         right: &Distribution,
-        side2o_mapping: &ColIndexMapping,
+        l2o_mapping: &ColIndexMapping,
     ) -> Distribution {
         match (left, right) {
             (Distribution::Single, Distribution::Single) => Distribution::Single,
             (Distribution::HashShard(_), Distribution::HashShard(_)) => {
-                side2o_mapping.rewrite_provided_distribution(left)
+                l2o_mapping.rewrite_provided_distribution(left)
             }
-            (_, _) => panic!(),
+            (_, _) => unreachable!(
+                "suspicious distribution: left: {:?}, right: {:?}",
+                left, right
+            ),
         }
     }
 
@@ -121,9 +120,7 @@ impl StreamHashJoin {
 
 impl fmt::Display for StreamHashJoin {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut builder = if self.is_delta {
-            f.debug_struct("StreamDeltaHashJoin")
-        } else if self.is_append_only {
+        let mut builder = if self.is_append_only {
             f.debug_struct("StreamAppendOnlyHashJoin")
         } else {
             f.debug_struct("StreamHashJoin")
@@ -132,40 +129,44 @@ impl fmt::Display for StreamHashJoin {
         let verbose = self.base.ctx.is_explain_verbose();
         builder.field("type", &format_args!("{:?}", self.logical.join_type()));
 
-        if verbose {
-            let mut concat_schema = self.left().schema().fields.clone();
-            concat_schema.extend(self.right().schema().fields.clone());
-            let concat_schema = Schema::new(concat_schema);
-            builder.field(
-                "predicate",
-                &format_args!(
-                    "{}",
-                    EqJoinPredicateVerboseDisplay {
-                        eq_join_predicate: self.eq_join_predicate(),
-                        input_schema: &concat_schema
-                    }
-                ),
-            );
-        } else {
-            builder.field("predicate", &format_args!("{}", self.eq_join_predicate()));
-        }
+        let mut concat_schema = self.left().schema().fields.clone();
+        concat_schema.extend(self.right().schema().fields.clone());
+        let concat_schema = Schema::new(concat_schema);
+        builder.field(
+            "predicate",
+            &format_args!(
+                "{}",
+                EqJoinPredicateDisplay {
+                    eq_join_predicate: self.eq_join_predicate(),
+                    input_schema: &concat_schema
+                }
+            ),
+        );
 
         if self.append_only() {
             builder.field("append_only", &format_args!("{}", true));
         }
-        if self
-            .logical
-            .output_indices()
-            .iter()
-            .copied()
-            .eq(0..self.logical.internal_column_num())
-        {
-            builder.field("output_indices", &format_args!("all"));
-        } else {
-            builder.field(
-                "output_indices",
-                &format_args!("{:?}", self.logical.output_indices()),
-            );
+        if verbose {
+            if self
+                .logical
+                .output_indices()
+                .iter()
+                .copied()
+                .eq(0..self.logical.internal_column_num())
+            {
+                builder.field("output", &format_args!("all"));
+            } else {
+                builder.field(
+                    "output",
+                    &format_args!(
+                        "{:?}",
+                        &IndicesDisplay {
+                            indices: self.logical.output_indices(),
+                            input_schema: &concat_schema,
+                        }
+                    ),
+                );
+            }
         }
 
         builder.finish()
@@ -209,18 +210,12 @@ impl ToStreamProst for StreamHashJoin {
                 .other_cond()
                 .as_expr_unless_true()
                 .map(|x| x.to_expr_proto()),
-            is_delta_join: self.is_delta,
             left_table: Some(
-                infer_internal_table_catalog(self.left(), left_key_indices).to_prost(
-                    SchemaId::placeholder() as u32,
-                    DatabaseId::placeholder() as u32,
-                ),
+                infer_internal_table_catalog(self.left(), left_key_indices).to_state_table_prost(),
             ),
             right_table: Some(
-                infer_internal_table_catalog(self.right(), right_key_indices).to_prost(
-                    SchemaId::placeholder() as u32,
-                    DatabaseId::placeholder() as u32,
-                ),
+                infer_internal_table_catalog(self.right(), right_key_indices)
+                    .to_state_table_prost(),
             ),
             output_indices: self
                 .logical
@@ -243,7 +238,7 @@ fn infer_internal_table_catalog(input: PlanRef, join_key_indices: Vec<usize>) ->
     // The pk of hash join internal table should be join_key + input_pk.
     let mut pk_indices = join_key_indices;
     // TODO(yuhao): dedup the dist key and pk.
-    pk_indices.extend(&base.pk_indices);
+    pk_indices.extend(&base.logical_pk);
 
     let mut columns_fields = schema.fields().to_vec();
 
@@ -260,6 +255,21 @@ fn infer_internal_table_catalog(input: PlanRef, join_key_indices: Vec<usize>) ->
     pk_indices.iter().for_each(|idx| {
         internal_table_catalog_builder.add_order_column(*idx, OrderType::Ascending)
     });
+
+    if !base.ctx.inner().with_properties.is_empty() {
+        let properties: HashMap<_, _> = base
+            .ctx
+            .inner()
+            .with_properties
+            .iter()
+            .filter(|(key, _)| key.as_str() == PROPERTIES_RETAINTION_SECOND_KEY)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+
+        if !properties.is_empty() {
+            internal_table_catalog_builder.add_properties(properties);
+        }
+    }
 
     internal_table_catalog_builder.build(dist_keys, append_only)
 }

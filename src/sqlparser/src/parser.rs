@@ -22,7 +22,7 @@ use alloc::{
 };
 use core::fmt;
 
-use log::debug;
+use tracing::debug;
 
 use crate::ast::{ParseTo, *};
 use crate::keywords::{self, Keyword};
@@ -229,7 +229,7 @@ impl Parser {
 
         match self.next_token() {
             Token::Word(w) if self.peek_token() == Token::Period => {
-                // Since there's no parentesis, `w` must be a column or a table
+                // Since there's no parenthesis, `w` must be a column or a table
                 // So what follows must be dot-delimited identifiers, e.g. `a.b.c.*`
                 let wildcard_expr = self.parse_simple_wildcard_expr(index)?;
                 return self.word_concat_wildcard_expr(w.to_ident(), wildcard_expr);
@@ -242,7 +242,7 @@ impl Parser {
             Token::LParen => {
                 let mut expr = self.parse_expr()?;
                 if self.consume_token(&Token::RParen) {
-                    // Cast off nested expression to avoid interface by parentesis.
+                    // Cast off nested expression to avoid interface by parenthesis.
                     while let Expr::Nested(expr1) = expr {
                         expr = *expr1;
                     }
@@ -435,9 +435,16 @@ impl Parser {
                 } else {
                     UnaryOperator::Minus
                 };
+                let mut sub_expr = self.parse_subexpr(Self::PLUS_MINUS_PREC)?;
+                if let Expr::Value(Value::Number(ref mut s, _)) = sub_expr {
+                    if tok == Token::Minus {
+                        *s = format!("-{}", s);
+                    }
+                    return Ok(sub_expr);
+                }
                 Ok(Expr::UnaryOp {
                     op,
-                    expr: Box::new(self.parse_subexpr(Self::PLUS_MINUS_PREC)?),
+                    expr: Box::new(sub_expr),
                 })
             }
             tok @ Token::DoubleExclamationMark
@@ -486,14 +493,6 @@ impl Parser {
                     Ok(expr)
                 }
             }
-
-            Token::LBrace => {
-                self.prev_token();
-                Ok(Expr::Array(self.parse_token_wrapped_exprs(
-                    &Token::LBrace,
-                    &Token::RBrace,
-                )?))
-            }
             unexpected => self.expected("an expression:", unexpected),
         }?;
 
@@ -511,7 +510,7 @@ impl Parser {
     pub fn parse_struct_selection(&mut self, expr: Expr) -> Result<Expr, ParserError> {
         if let Expr::Nested(compound_expr) = expr.clone() {
             let mut nested_expr = *compound_expr;
-            // Cast off nested expression to avoid interface by parentesis.
+            // Cast off nested expression to avoid interface by parenthesis.
             while let Expr::Nested(expr1) = nested_expr {
                 nested_expr = *expr1;
             }
@@ -927,7 +926,7 @@ impl Parser {
         // of the duration specified in the string literal.
         //
         // Note that PostgreSQL allows omitting the qualifier, so we provide
-        // this more general implemenation.
+        // this more general implementation.
         let leading_field = match self.peek_token() {
             Token::Word(kw)
                 if [
@@ -1096,15 +1095,15 @@ impl Parser {
     pub fn parse_array_index(&mut self, expr: Expr) -> Result<Expr, ParserError> {
         let index = self.parse_expr()?;
         self.expect_token(&Token::RBracket)?;
-        let mut indexs: Vec<Expr> = vec![index];
+        let mut indices: Vec<Expr> = vec![index];
         while self.consume_token(&Token::LBracket) {
             let index = self.parse_expr()?;
             self.expect_token(&Token::RBracket)?;
-            indexs.push(index);
+            indices.push(index);
         }
         Ok(Expr::ArrayIndex {
             obj: Box::new(expr),
-            indexs,
+            indices,
         })
     }
 
@@ -1517,6 +1516,7 @@ impl Parser {
     // where option can be:
     //       SUPERUSER | NOSUPERUSER
     //     | CREATEDB | NOCREATEDB
+    //     | CREATEUSER | NOCREATEUSER
     //     | LOGIN | NOLOGIN
     //     | [ ENCRYPTED ] PASSWORD 'password' | PASSWORD NULL
     fn parse_create_user(&mut self) -> Result<Statement, ParserError> {
@@ -1539,10 +1539,17 @@ impl Parser {
         self.expect_token(&Token::LParen)?;
         let columns = self.parse_comma_separated(Parser::parse_order_by_expr)?;
         self.expect_token(&Token::RParen)?;
+        let mut include = vec![];
+        if self.parse_keyword(Keyword::INCLUDE) {
+            self.expect_token(&Token::LParen)?;
+            include = self.parse_comma_separated(Parser::parse_identifier)?;
+            self.expect_token(&Token::RParen)?;
+        }
         Ok(Statement::CreateIndex {
             name: index_name,
             table_name,
             columns,
+            include,
             unique,
             if_not_exists,
         })
@@ -1798,8 +1805,17 @@ impl Parser {
     }
 
     pub fn parse_alter(&mut self) -> Result<Statement, ParserError> {
-        self.expect_keyword(Keyword::TABLE)?;
-        self.parse_alter_table()
+        if self.parse_keyword(Keyword::TABLE) {
+            self.parse_alter_table()
+        } else if self.parse_keyword(Keyword::USER) {
+            self.parse_alter_user()
+        } else {
+            self.expected("TABLE or USER after ALTER", self.peek_token())
+        }
+    }
+
+    pub fn parse_alter_user(&mut self) -> Result<Statement, ParserError> {
+        Ok(Statement::AlterUser(AlterUserStatement::parse_to(self)?))
     }
 
     pub fn parse_alter_table(&mut self) -> Result<Statement, ParserError> {
@@ -2033,7 +2049,6 @@ impl Parser {
             } else {
                 return self.expected("struct field name", self.peek_token());
             }
-            let comma = self.consume_token(&Token::Comma);
             if self.angle_brackets_num == 0 {
                 break;
             } else if self.consume_token(&Token::Gt) {
@@ -2046,7 +2061,7 @@ impl Parser {
                 } else {
                     return parser_err!("too much '>'");
                 }
-            } else if !comma {
+            } else if !self.consume_token(&Token::Comma) {
                 return self.expected("',' or '>' after column definition", self.peek_token());
             }
         }
@@ -2334,23 +2349,71 @@ impl Parser {
         })
     }
 
+    pub fn parse_optional_boolean(&mut self, default: bool) -> bool {
+        if let Some(keyword) = self.parse_one_of_keywords(&[Keyword::TRUE, Keyword::FALSE]) {
+            match keyword {
+                Keyword::TRUE => true,
+                Keyword::FALSE => false,
+                _ => unreachable!(),
+            }
+        } else {
+            default
+        }
+    }
+
     pub fn parse_explain(&mut self, describe_alias: bool) -> Result<Statement, ParserError> {
+        let mut options = ExplainOptions::default();
+        let parse_explain_option = |parser: &mut Parser| -> Result<(), ParserError> {
+            while let Some(keyword) = parser.parse_one_of_keywords(&[
+                Keyword::VERBOSE,
+                Keyword::TRACE,
+                Keyword::TYPE,
+                Keyword::LOGICAL,
+                Keyword::PHYSICAL,
+                Keyword::DISTSQL,
+            ]) {
+                match keyword {
+                    Keyword::VERBOSE => options.verbose = parser.parse_optional_boolean(true),
+                    Keyword::TRACE => options.trace = parser.parse_optional_boolean(true),
+                    Keyword::TYPE => {
+                        let explain_type = parser.expect_one_of_keywords(&[
+                            Keyword::LOGICAL,
+                            Keyword::PHYSICAL,
+                            Keyword::DISTSQL,
+                        ])?;
+                        match explain_type {
+                            Keyword::LOGICAL => options.explain_type = ExplainType::Logical,
+                            Keyword::PHYSICAL => options.explain_type = ExplainType::Physical,
+                            Keyword::DISTSQL => options.explain_type = ExplainType::DistSQL,
+                            _ => unreachable!("{}", keyword),
+                        }
+                    }
+                    Keyword::LOGICAL => options.explain_type = ExplainType::Logical,
+                    Keyword::PHYSICAL => options.explain_type = ExplainType::Physical,
+                    Keyword::DISTSQL => options.explain_type = ExplainType::DistSQL,
+                    _ => unreachable!("{}", keyword),
+                }
+            }
+            Ok(())
+        };
+
         let analyze = self.parse_keyword(Keyword::ANALYZE);
-        let verbose = self.parse_keyword(Keyword::VERBOSE);
-        let trace = self.parse_keyword(Keyword::TRACE);
+        if self.consume_token(&Token::LParen) {
+            self.parse_comma_separated(parse_explain_option)?;
+            self.expect_token(&Token::RParen)?;
+        }
 
         let statement = self.parse_statement()?;
         Ok(Statement::Explain {
             describe_alias,
             analyze,
-            verbose,
-            trace,
             statement: Box::new(statement),
+            options,
         })
     }
 
     /// Parse a query expression, i.e. a `SELECT` statement optionally
-    /// preceeded with some `WITH` CTE declarations and optionally followed
+    /// preceded with some `WITH` CTE declarations and optionally followed
     /// by `ORDER BY`. Unlike some other parse_... methods, this one doesn't
     /// expect the initial keyword to be already consumed
     pub fn parse_query(&mut self) -> Result<Query, ParserError> {
@@ -2651,6 +2714,11 @@ impl Parser {
                     return Ok(Statement::ShowObjects(ShowObject::Source {
                         schema: self.parse_from_and_identifier()?,
                     }));
+                }
+                Keyword::SINKS => {
+                    return Ok(Statement::ShowObjects(ShowObject::Sink {
+                        schema: self.parse_from_and_identifier()?,
+                    }))
                 }
                 Keyword::DATABASES => {
                     return Ok(Statement::ShowObjects(ShowObject::Database));
@@ -3389,6 +3457,17 @@ mod tests {
             assert_eq!(parser.next_token(), Token::EOF);
             assert_eq!(parser.next_token(), Token::EOF);
             parser.prev_token();
+        });
+    }
+
+    #[test]
+    fn test_parse_integer_min() {
+        let min_bigint = "-9223372036854775808";
+        run_parser_method(min_bigint, |parser| {
+            assert_eq!(
+                parser.parse_expr().unwrap(),
+                Expr::Value(Value::Number("-9223372036854775808".to_string(), false))
+            )
         });
     }
 }

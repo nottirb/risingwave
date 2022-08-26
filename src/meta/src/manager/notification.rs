@@ -22,7 +22,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::sync::{oneshot, Mutex};
 use tonic::Status;
 
-use crate::cluster::WorkerKey;
+use crate::manager::cluster::WorkerKey;
 
 pub type Notification = std::result::Result<SubscribeResponse, Status>;
 
@@ -162,7 +162,7 @@ impl NotificationManager {
         let mut core_guard = self.core.lock().await;
         let senders = match worker_type {
             WorkerType::Frontend => &mut core_guard.frontend_senders,
-            WorkerType::ComputeNode => &mut core_guard.compactor_senders,
+            WorkerType::ComputeNode => &mut core_guard.compute_senders,
             WorkerType::Compactor => &mut core_guard.compactor_senders,
 
             _ => unreachable!(),
@@ -223,14 +223,15 @@ impl NotificationManagerCore {
         self.current_version += 1;
 
         let senders = match worker_type {
-            WorkerType::Frontend => &self.frontend_senders,
-            WorkerType::ComputeNode => &self.compactor_senders,
-            WorkerType::Compactor => &self.compactor_senders,
+            WorkerType::Frontend => &mut self.frontend_senders,
+            WorkerType::ComputeNode => &mut self.compute_senders,
+            WorkerType::Compactor => &mut self.compactor_senders,
 
             _ => unreachable!(),
         };
 
-        for (worker_key, sender) in senders {
+        let mut bad_keys = vec![];
+        for (worker_key, sender) in senders.iter() {
             if let Err(err) = sender.send(Ok(SubscribeResponse {
                 status: None,
                 operation: operation as i32,
@@ -243,7 +244,11 @@ impl NotificationManagerCore {
                     worker_key,
                     err
                 );
+                bad_keys.push(worker_key.clone());
             }
+        }
+        for worker_key in bad_keys {
+            senders.remove(&worker_key);
         }
 
         self.current_version
@@ -252,11 +257,21 @@ impl NotificationManagerCore {
     fn notify_all(&mut self, operation: Operation, info: &Info) -> NotificationVersion {
         self.current_version += 1;
 
-        for (worker_key, sender) in self
+        let mut bad_keys = vec![];
+        for (worker_type, worker_key, sender) in self
             .frontend_senders
             .iter()
-            .chain(self.compute_senders.iter())
-            .chain(self.compactor_senders.iter())
+            .map(|(worker_key, sender)| (WorkerType::Frontend, worker_key, sender))
+            .chain(
+                self.compute_senders
+                    .iter()
+                    .map(|(worker_key, sender)| (WorkerType::ComputeNode, worker_key, sender)),
+            )
+            .chain(
+                self.compactor_senders
+                    .iter()
+                    .map(|(worker_key, sender)| (WorkerType::Compactor, worker_key, sender)),
+            )
         {
             if let Err(err) = sender.send(Ok(SubscribeResponse {
                 status: None,
@@ -265,7 +280,18 @@ impl NotificationManagerCore {
                 version: self.current_version,
             })) {
                 tracing::warn!("Failed to notify_all {:?}: {}", worker_key, err);
+                bad_keys.push((worker_type, worker_key.clone()));
             }
+        }
+        for (worker_type, worker_key) in bad_keys {
+            let senders = match worker_type {
+                WorkerType::Frontend => &mut self.frontend_senders,
+                WorkerType::ComputeNode => &mut self.compute_senders,
+                WorkerType::Compactor => &mut self.compactor_senders,
+
+                _ => unreachable!(),
+            };
+            senders.remove(&worker_key);
         }
 
         self.current_version

@@ -19,7 +19,7 @@ use risingwave_common::error::{ErrorCode, Result};
 use risingwave_common::types::DataType;
 
 use super::{align_types, cast_ok, infer_type, CastContext, Expr, ExprImpl, Literal};
-use crate::expr::{ExprType, ExprVerboseDisplay};
+use crate::expr::{ExprDisplay, ExprType};
 
 #[derive(Clone, Eq, PartialEq, Hash)]
 pub struct FunctionCall {
@@ -156,10 +156,34 @@ impl FunctionCall {
                     .try_collect()?;
                 Ok(DataType::Varchar)
             }
-            ExprType::RegexpMatch => Ok(DataType::List {
-                datatype: Box::new(DataType::Varchar),
-            }),
-
+            ExprType::RegexpMatch => {
+                if inputs.len() < 2 || inputs.len() > 3 {
+                    return Err(ErrorCode::BindError(format!(
+                        "Function `RegexpMatch` takes 2 or 3 arguments ({} given)",
+                        inputs.len()
+                    ))
+                    .into());
+                }
+                if inputs.len() == 3 {
+                    return Err(ErrorCode::NotImplemented(
+                        "flag in regexp_match".to_string(),
+                        4545.into(),
+                    )
+                    .into());
+                }
+                Ok(DataType::List {
+                    datatype: Box::new(DataType::Varchar),
+                })
+            }
+            ExprType::Vnode => {
+                if inputs.is_empty() {
+                    return Err(ErrorCode::BindError(
+                        "Function `Vnode` takes at least 1 arguments (0 given)".to_string(),
+                    )
+                    .into());
+                }
+                Ok(DataType::Int16)
+            }
             _ => {
                 // TODO(xiangjin): move variadic functions above as part of `infer_type`, as its
                 // interface has been enhanced to support mutating (casting) inputs as well.
@@ -177,6 +201,9 @@ impl FunctionCall {
 
     /// Create a cast expr over `child` to `target` type in `allows` context.
     pub fn new_cast(child: ExprImpl, target: DataType, allows: CastContext) -> Result<ExprImpl> {
+        if is_row_function(&child) {
+            return Self::cast_nested(child, target, allows);
+        }
         let source = child.return_type();
         if child.is_null() {
             Ok(Literal::new(None, target).into())
@@ -193,11 +220,45 @@ impl FunctionCall {
             .into())
         } else {
             Err(ErrorCode::BindError(format!(
-                "cannot cast type {:?} to {:?} in {:?} context",
+                "cannot cast type \"{}\" to \"{}\" in {:?} context",
                 source, target, allows
             ))
             .into())
         }
+    }
+
+    /// Cast a `ROW` expression to the target type. We intentionally disallow casting arbitrary
+    /// expressions, like `ROW(1)::STRUCT<i INTEGER>` to `STRUCT<VARCHAR>`, although an integer
+    /// is castible to VARCHAR. It's to simply the casting rules.
+    fn cast_nested(expr: ExprImpl, target_type: DataType, allows: CastContext) -> Result<ExprImpl> {
+        let func = *expr.into_function_call().unwrap();
+        let (fields, field_names) = if let DataType::Struct(t) = &target_type {
+            (t.fields.clone(), t.field_names.clone())
+        } else {
+            return Err(ErrorCode::BindError(format!(
+                "column is of type '{}' but expression is of type record",
+                target_type
+            ))
+            .into());
+        };
+        let (func_type, inputs, _) = func.decompose();
+        let msg = match fields.len().cmp(&inputs.len()) {
+            std::cmp::Ordering::Equal => {
+                let inputs = inputs
+                    .into_iter()
+                    .zip_eq(fields.to_vec())
+                    .map(|(e, t)| Self::new_cast(e, t, allows))
+                    .collect::<Result<Vec<_>>>()?;
+                let return_type = DataType::new_struct(
+                    inputs.iter().map(|i| i.return_type()).collect_vec(),
+                    field_names,
+                );
+                return Ok(FunctionCall::new_unchecked(func_type, inputs, return_type).into());
+            }
+            std::cmp::Ordering::Less => "Input has too few columns.",
+            std::cmp::Ordering::Greater => "Input has too many columns.",
+        };
+        Err(ErrorCode::BindError(format!("cannot cast record to {} ({})", target_type, msg)).into())
     }
 
     /// Construct a `FunctionCall` expr directly with the provided `return_type`, bypassing type
@@ -265,18 +326,18 @@ impl Expr for FunctionCall {
     }
 }
 
-pub struct FunctionCallVerboseDisplay<'a> {
+pub struct FunctionCallDisplay<'a> {
     pub function_call: &'a FunctionCall,
     pub input_schema: &'a Schema,
 }
 
-impl std::fmt::Debug for FunctionCallVerboseDisplay<'_> {
+impl std::fmt::Debug for FunctionCallDisplay<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let that = self.function_call;
         match &that.func_type {
             ExprType::Cast => {
                 assert_eq!(that.inputs.len(), 1);
-                ExprVerboseDisplay {
+                ExprDisplay {
                     expr: &that.inputs[0],
                     input_schema: self.input_schema,
                 }
@@ -329,7 +390,7 @@ impl std::fmt::Debug for FunctionCallVerboseDisplay<'_> {
                 let func_name = format!("{:?}", that.func_type);
                 let mut builder = f.debug_tuple(&func_name);
                 that.inputs.iter().for_each(|child| {
-                    builder.field(&ExprVerboseDisplay {
+                    builder.field(&ExprDisplay {
                         expr: child,
                         input_schema: self.input_schema,
                     });
@@ -351,13 +412,13 @@ fn explain_verbose_binary_op(
     assert_eq!(inputs.len(), 2);
 
     write!(f, "(")?;
-    ExprVerboseDisplay {
+    ExprDisplay {
         expr: &inputs[0],
         input_schema,
     }
     .fmt(f)?;
     write!(f, " {} ", op)?;
-    ExprVerboseDisplay {
+    ExprDisplay {
         expr: &inputs[1],
         input_schema,
     }
@@ -365,4 +426,13 @@ fn explain_verbose_binary_op(
     write!(f, ")")?;
 
     Ok(())
+}
+
+fn is_row_function(expr: &ExprImpl) -> bool {
+    if let ExprImpl::FunctionCall(func) = expr {
+        if func.get_expr_type() == ExprType::Row {
+            return true;
+        }
+    }
+    false
 }

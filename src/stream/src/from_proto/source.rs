@@ -32,7 +32,7 @@ impl ExecutorBuilder for SourceExecutorBuilder {
         stream
             .context
             .lock_barrier_manager()
-            .register_sender(params.actor_id, sender);
+            .register_sender(params.actor_context.id, sender);
 
         let source_id = TableId::new(node.table_id);
         let source_desc = params.env.source_manager().get_source(&source_id)?;
@@ -53,11 +53,15 @@ impl ExecutorBuilder for SourceExecutorBuilder {
         }));
         let schema = Schema::new(fields);
         let keyspace = Keyspace::table_root(store, &source_id);
+        let vnodes = params
+            .vnode_bitmap
+            .expect("vnodes not set for source executor");
 
         Ok(Box::new(SourceExecutor::new(
-            params.actor_id,
+            params.actor_context,
             source_id,
             source_desc,
+            vnodes,
             keyspace,
             column_ids,
             schema,

@@ -10,7 +10,7 @@ import "plan_common.proto";
 option optimize_for = SPEED;
 
 message RowSeqScanNode {
-  plan_common.CellBasedTableDesc table_desc = 1;
+  plan_common.StorageTableDesc table_desc = 1;
   repeated int32 column_ids = 2;
   // All the ranges need to be read. i.e., they are OR'ed.
   //
@@ -66,15 +66,21 @@ message FilterNode {
 message InsertNode {
   uint32 table_source_id = 1;
   repeated int32 column_ids = 2;
+  // Id of the materialized view which is used to determine which compute node to execute the dml fragment.
+  uint32 associated_mview_id = 3;
 }
 
 message DeleteNode {
   uint32 table_source_id = 1;
+  // Id of the materialized view which is used to determine which compute node to execute the dml fragment.
+  uint32 associated_mview_id = 2;
 }
 
 message UpdateNode {
   uint32 table_source_id = 1;
   repeated expr.ExprNode exprs = 2;
+  // Id of the materialized view which is used to determine which compute node to execute the dml fragment.
+  uint32 associated_mview_id = 3;
 }
 
 message ValuesNode {
@@ -91,13 +97,13 @@ message OrderByNode {
 
 message TopNNode {
   repeated plan_common.ColumnOrder column_orders = 1;
-  uint32 limit = 2;
-  uint32 offset = 3;
+  uint64 limit = 2;
+  uint64 offset = 3;
 }
 
 message LimitNode {
-  uint32 limit = 1;
-  uint32 offset = 2;
+  uint64 limit = 1;
+  uint64 offset = 2;
 }
 
 message NestedLoopJoinNode {
@@ -196,13 +202,15 @@ message MergeSortExchangeNode {
 message LookupJoinNode {
   plan_common.JoinType join_type = 1;
   expr.ExprNode condition = 2;
-  repeated int32 build_side_key = 3;
-  plan_common.CellBasedTableDesc probe_side_table_desc = 4;
+  repeated uint32 build_side_key = 3;
+  plan_common.StorageTableDesc probe_side_table_desc = 4;
   repeated uint32 probe_side_vnode_mapping = 5;
   repeated int32 probe_side_column_ids = 6;
   repeated uint32 output_indices = 7;
   repeated common.WorkerNode worker_nodes = 8;
 }
+
+message UnionNode {}
 
 message PlanNode {
   repeated PlanNode children = 1;
@@ -230,6 +238,7 @@ message PlanNode {
     ExpandNode expand = 28;
     LookupJoinNode lookup_join = 29;
     ProjectSetNode project_set = 30;
+    UnionNode union = 31;
   }
   string identity = 24;
 }
@@ -241,9 +250,10 @@ message PlanNode {
 message ExchangeInfo {
   enum DistributionMode {
     // No partitioning at all, used for root segment which aggregates query results
-    SINGLE = 0;
-    BROADCAST = 1;
-    HASH = 2;
+    UNSPECIFIED = 0;
+    SINGLE = 1;
+    BROADCAST = 2;
+    HASH = 3;
   }
   message BroadcastInfo {
     uint32 count = 1;

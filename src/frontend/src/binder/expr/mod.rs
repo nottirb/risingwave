@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use itertools::zip_eq;
+use itertools::{zip_eq, Itertools};
 use risingwave_common::catalog::{ColumnDesc, ColumnId};
 use risingwave_common::error::{ErrorCode, Result};
 use risingwave_common::types::DataType;
 use risingwave_sqlparser::ast::{
-    BinaryOperator, DataType as AstDataType, DateTimeField, Expr, Query, StructField,
-    TrimWhereField, UnaryOperator,
+    BinaryOperator, DataType as AstDataType, DateTimeField, Expr, Function, ObjectName, Query,
+    StructField, TrimWhereField, UnaryOperator,
 };
 
 use crate::binder::Binder;
@@ -41,7 +41,20 @@ impl Binder {
             }
             Expr::Row(exprs) => self.bind_row(exprs),
             // input ref
-            Expr::Identifier(ident) => self.bind_column(&[ident]),
+            Expr::Identifier(ident) => {
+                if ["session_user", "current_schema"]
+                    .iter()
+                    .any(|e| ident.real_value().as_str() == *e)
+                {
+                    // Rewrite a system variable to a function call, e.g. `SELECT current_schema;`
+                    // will be rewritten to `SELECT current_schema();`.
+                    // NOTE: Here we don't 100% follow the behavior of Postgres, as it doesn't
+                    // allow `session_user()` while we do.
+                    self.bind_function(Function::no_arg(ObjectName(vec![ident])))
+                } else {
+                    self.bind_column(&[ident])
+                }
+            }
             Expr::CompoundIdentifier(idents) => self.bind_column(&idents),
             Expr::FieldIdentifier(field_expr, idents) => {
                 self.bind_single_field_column(*field_expr, &idents)
@@ -51,7 +64,7 @@ impl Binder {
             Expr::BinaryOp { left, op, right } => self.bind_binary_op(*left, op, *right),
             Expr::Nested(expr) => self.bind_expr(*expr),
             Expr::Array(exprs) => self.bind_array(exprs),
-            Expr::ArrayIndex { obj, indexs } => self.bind_array_index(*obj, indexs),
+            Expr::ArrayIndex { obj, indices } => self.bind_array_index(*obj, indices),
             Expr::Function(f) => self.bind_function(f),
             // subquery
             Expr::Subquery(q) => self.bind_subquery_expr(*q, SubqueryKind::Scalar),
@@ -422,23 +435,23 @@ pub fn bind_data_type(data_type: &AstDataType) -> Result<DataType> {
             )
             .into())
         }
-        AstDataType::Struct(types) => DataType::Struct {
-            fields: types
+        AstDataType::Struct(types) => DataType::new_struct(
+            types
                 .iter()
                 .map(|f| bind_data_type(&f.data_type))
-                .collect::<Result<Vec<_>>>()?
-                .into(),
-        },
+                .collect::<Result<Vec<_>>>()?,
+            types.iter().map(|f| f.name.real_value()).collect_vec(),
+        ),
         AstDataType::Text => {
             return Err(ErrorCode::NotImplemented(
-                format!("unsupported data type: {:?}", data_type),
+                format!("unsupported data type: {:}", data_type),
                 2535.into(),
             )
             .into())
         }
         _ => {
             return Err(ErrorCode::NotImplemented(
-                format!("unsupported data type: {:?}", data_type),
+                format!("unsupported data type: {:}", data_type),
                 None.into(),
             )
             .into())

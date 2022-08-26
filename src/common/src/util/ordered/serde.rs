@@ -20,16 +20,12 @@ use itertools::Itertools;
 use super::OrderedDatum::{NormalOrder, ReversedOrder};
 use super::OrderedRow;
 use crate::array::{ArrayImpl, Row, RowRef};
-use crate::catalog::ColumnId;
 use crate::error::Result;
 use crate::types::{
     deserialize_datum_from, serialize_datum_into, serialize_datum_ref_into, DataType, Datum,
     DatumRef,
 };
 use crate::util::sort_util::{OrderPair, OrderType};
-
-/// The sentinel cell id is `-1_i32`, which is ensured to be the first kv pair in the row.
-pub const SENTINEL_CELL_ID: ColumnId = ColumnId::new(-1_i32);
 
 /// We can use memcomparable serialization to serialize data
 /// and flip the bits if the order of that datum is descending.
@@ -204,8 +200,8 @@ mod tests {
         array.sort();
         // option 1 byte || number 2 bytes
         assert_eq!(array[0][2], !6i16.to_be_bytes()[1]);
-        assert_eq!(&array[1][3..], [1, 1, b'a', b'b', b'c', 0, 0, 0, 0, 0, 3u8]);
-        assert_eq!(&array[2][3..], [1, 1, b'a', b'b', b'd', 0, 0, 0, 0, 0, 3u8]);
+        assert_eq!(&array[1][3..], [0, 1, b'a', b'b', b'c', 0, 0, 0, 0, 0, 3u8]);
+        assert_eq!(&array[2][3..], [0, 1, b'a', b'b', b'd', 0, 0, 0, 0, 0, 3u8]);
     }
 
     #[test]
@@ -249,7 +245,7 @@ mod tests {
         assert_eq!(
             array[0][..11],
             [
-                !(1u8),
+                !(0u8),
                 !(1u8),
                 !(b'a'),
                 !(b'b'),
@@ -262,8 +258,8 @@ mod tests {
                 !(3u8)
             ]
         );
-        assert_eq!(array[1][11..], [1, 1, b'j', b'm', b'z', 0, 0, 0, 0, 0, 3u8]);
-        assert_eq!(array[2][11..], [1, 1, b'm', b'j', b'z', 0, 0, 0, 0, 0, 3u8]);
+        assert_eq!(array[1][11..], [0, 1, b'j', b'm', b'z', 0, 0, 0, 0, 0, 3u8]);
+        assert_eq!(array[2][11..], [0, 1, b'm', b'j', b'z', 0, 0, 0, 0, 0, 3u8]);
     }
 
     #[test]

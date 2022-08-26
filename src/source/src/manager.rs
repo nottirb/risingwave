@@ -23,13 +23,11 @@ use risingwave_common::ensure;
 use risingwave_common::error::ErrorCode::{ConnectorError, InternalError, ProtocolError};
 use risingwave_common::error::{Result, RwError};
 use risingwave_common::types::DataType;
-use risingwave_common::util::epoch::UNIX_SINGULARITY_DATE_EPOCH;
 use risingwave_connector::source::ConnectorProperties;
 use risingwave_pb::catalog::StreamSourceInfo;
 use risingwave_pb::plan_common::RowFormatType;
 
 use crate::monitor::SourceMetrics;
-use crate::row_id::{RowId, RowIdGenerator};
 use crate::table_v2::TableSourceV2;
 use crate::{ConnectorSource, SourceFormat, SourceImpl, SourceParserImpl};
 
@@ -39,7 +37,13 @@ pub type SourceRef = Arc<SourceImpl>;
 #[async_trait]
 pub trait SourceManager: Debug + Sync + Send {
     async fn create_source(&self, table_id: &TableId, info: StreamSourceInfo) -> Result<()>;
-    fn create_table_source(&self, table_id: &TableId, columns: Vec<ColumnDesc>) -> Result<()>;
+    fn create_table_source(
+        &self,
+        table_id: &TableId,
+        columns: Vec<ColumnDesc>,
+        row_id_index: Option<usize>,
+        pk_column_ids: Vec<i32>,
+    ) -> Result<()>;
 
     fn get_source(&self, source_id: &TableId) -> Result<SourceDesc>;
     fn drop_source(&self, source_id: &TableId) -> Result<()>;
@@ -92,21 +96,9 @@ pub struct SourceDesc {
     pub columns: Vec<SourceColumnDesc>,
     pub metrics: Arc<SourceMetrics>,
 
-    // The column index of row ID. By default it's 0, which means the first column is row ID.
-    // TODO: change to Option<usize> when pk supported in the future.
-    pub row_id_index: usize,
-    pub row_id_generator: Arc<Mutex<RowIdGenerator>>,
-}
-
-impl SourceDesc {
-    pub fn next_row_id(&self) -> RowId {
-        self.row_id_generator.as_ref().lock().next()
-    }
-
-    pub fn next_row_id_batch(&self, length: usize) -> Vec<RowId> {
-        let mut guard = self.row_id_generator.as_ref().lock();
-        guard.next_batch(length)
-    }
+    // The column index of row ID. If the primary key is specified by users, this will be `None`.
+    pub row_id_index: Option<usize>,
+    pub pk_column_ids: Vec<i32>,
 }
 
 pub type SourceManagerRef = Arc<dyn SourceManager>;
@@ -114,8 +106,6 @@ pub type SourceManagerRef = Arc<dyn SourceManager>;
 #[derive(Debug, Default)]
 pub struct MemSourceManager {
     sources: Mutex<HashMap<TableId, SourceDesc>>,
-    /// Located worker id.
-    worker_id: u32,
     /// local source metrics
     metrics: Arc<SourceMetrics>,
 }
@@ -128,6 +118,7 @@ impl SourceManager for MemSourceManager {
             RowFormatType::Protobuf => SourceFormat::Protobuf,
             RowFormatType::DebeziumJson => SourceFormat::DebeziumJson,
             RowFormatType::Avro => SourceFormat::Avro,
+            RowFormatType::RowUnspecified => unreachable!(),
         };
 
         if format == SourceFormat::Protobuf && info.row_schema_location.is_empty() {
@@ -144,28 +135,23 @@ impl SourceManager for MemSourceManager {
             return Err(source_parser_rs.err().unwrap());
         };
 
-        let columns = info
+        let mut columns: Vec<_> = info
             .columns
-            .iter()
-            .enumerate()
-            .map(|(idx, c)| {
-                let mut col = SourceColumnDesc::from(&ColumnDesc::from(
-                    c.column_desc.as_ref().unwrap().clone(),
-                ));
-                col.skip_parse = idx as i32 == info.row_id_index;
-                col
-            })
-            .collect::<Vec<SourceColumnDesc>>();
-
+            .into_iter()
+            .map(|c| SourceColumnDesc::from(&ColumnDesc::from(c.column_desc.unwrap())))
+            .collect();
+        let row_id_index = info.row_id_index.map(|row_id_index| {
+            columns[row_id_index.index as usize].skip_parse = true;
+            row_id_index.index as usize
+        });
+        let pk_column_ids = info.pk_column_ids;
         assert!(
-            info.row_id_index >= 0,
-            "expected row_id_index >= 0, got {}",
-            info.row_id_index
+            !pk_column_ids.is_empty(),
+            "source should have at least one pk column"
         );
-        let row_id_index = info.row_id_index as usize;
 
         let config = ConnectorProperties::extract(info.properties)
-            .map_err(|e| RwError::from(ConnectorError(e.to_string())))?;
+            .map_err(|e| RwError::from(ConnectorError(e.into())))?;
 
         let source = SourceImpl::Connector(ConnectorSource {
             config,
@@ -178,10 +164,7 @@ impl SourceManager for MemSourceManager {
             format,
             columns,
             row_id_index,
-            row_id_generator: Arc::new(Mutex::new(RowIdGenerator::with_epoch(
-                self.worker_id,
-                *UNIX_SINGULARITY_DATE_EPOCH,
-            ))),
+            pk_column_ids,
             metrics: self.metrics.clone(),
         };
 
@@ -196,13 +179,24 @@ impl SourceManager for MemSourceManager {
         Ok(())
     }
 
-    fn create_table_source(&self, table_id: &TableId, columns: Vec<ColumnDesc>) -> Result<()> {
+    fn create_table_source(
+        &self,
+        table_id: &TableId,
+        columns: Vec<ColumnDesc>,
+        row_id_index: Option<usize>,
+        pk_column_ids: Vec<i32>,
+    ) -> Result<()> {
         let mut sources = self.get_sources()?;
 
         ensure!(
             !sources.contains_key(table_id),
             "Source id already exists: {:?}",
             table_id
+        );
+
+        assert!(
+            !pk_column_ids.is_empty(),
+            "source should have at least one pk column"
         );
 
         let source_columns = columns.iter().map(SourceColumnDesc::from).collect();
@@ -213,11 +207,8 @@ impl SourceManager for MemSourceManager {
             source: Arc::new(source),
             columns: source_columns,
             format: SourceFormat::Invalid,
-            row_id_index: 0, // always use the first column as row_id
-            row_id_generator: Arc::new(Mutex::new(RowIdGenerator::with_epoch(
-                self.worker_id,
-                *UNIX_SINGULARITY_DATE_EPOCH,
-            ))),
+            row_id_index,
+            pk_column_ids,
             metrics: self.metrics.clone(),
         };
 
@@ -251,10 +242,9 @@ impl SourceManager for MemSourceManager {
 }
 
 impl MemSourceManager {
-    pub fn new(worker_id: u32, metrics: Arc<SourceMetrics>) -> Self {
+    pub fn new(metrics: Arc<SourceMetrics>) -> Self {
         MemSourceManager {
             sources: Mutex::new(HashMap::new()),
-            worker_id,
             metrics,
         }
     }
@@ -270,7 +260,7 @@ mod tests {
     use risingwave_common::error::Result;
     use risingwave_common::types::DataType;
     use risingwave_connector::source::kinesis::config::kinesis_demo_properties;
-    use risingwave_pb::catalog::StreamSourceInfo;
+    use risingwave_pb::catalog::{ColumnIndex, StreamSourceInfo};
     use risingwave_pb::plan_common::ColumnCatalog;
     use risingwave_storage::memory::MemoryStateStore;
     use risingwave_storage::Keyspace;
@@ -295,7 +285,7 @@ mod tests {
             properties,
             row_format: 0,
             row_schema_location: "".to_string(),
-            row_id_index: 0,
+            row_id_index: Some(ColumnIndex { index: 0 }),
             pk_column_ids: vec![0],
             columns,
         };
@@ -332,11 +322,18 @@ mod tests {
                 type_name: "".to_string(),
             })
             .collect();
+        let row_id_index = None;
+        let pk_column_ids = vec![1];
 
         let _keyspace = Keyspace::table_root(MemoryStateStore::new(), &table_id);
 
         let mem_source_manager = MemSourceManager::default();
-        let res = mem_source_manager.create_table_source(&table_id, table_columns);
+        let res = mem_source_manager.create_table_source(
+            &table_id,
+            table_columns,
+            row_id_index,
+            pk_column_ids,
+        );
         assert!(res.is_ok());
 
         // get source

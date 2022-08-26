@@ -37,7 +37,6 @@ To report bugs, create a [GitHub issue](https://github.com/singularity-data/risi
   - [Update Grafana dashboard](#update-grafana-dashboard)
   - [Add new files](#add-new-files)
   - [Add new dependencies](#add-new-dependencies)
-  - [Check in PRs from forks](#check-in-prs-from-forks)
   - [Submit PRs](#submit-prs)
 
 
@@ -89,6 +88,8 @@ You can now build RiseDev and start a dev cluster. It is as simple as:
 psql -h localhost -p 4566 -d dev -U root
 ```
 
+If you detect memory bottlenecks while compiling, either allocate some disk space on your computer as swap memory, or lower the compilation parallelism with [`CARGO_BUILD_JOBS`](https://doc.rust-lang.org/cargo/reference/config.html#buildjobs), e.g. `CARGO_BUILD_JOBS=2`.
+
 The default dev cluster includes metadata-node, compute-node and frontend-node processes, and an embedded volatile in-memory state storage. No data will be persisted. This configuration is intended to make it easier to develop and debug RisingWave.
 
 To stop the cluster:
@@ -127,7 +128,9 @@ To manually add those components into the cluster, you will need to configure Ri
 ./risedev configure enable prometheus-and-grafana # enable Prometheus and Grafana
 ./risedev configure enable minio                  # enable MinIO
 ```
-**Note**: Enabling a component with the `./risedev configure enable` command will only download the component to your environment. To allow it to function, you must revise the corresponding configuration setting in `risedev.yml` and restart the dev cluster.
+> **Note**
+>
+> Enabling a component with the `./risedev configure enable` command will only download the component to your environment. To allow it to function, you must revise the corresponding configuration setting in `risedev.yml` and restart the dev cluster.
 
 For example, you can modify the default section to:
 
@@ -146,7 +149,9 @@ For example, you can modify the default section to:
       persist-data: true
 ```
 
-**Note**: The Kafka service depends on the ZooKeeper service. If you want to enable the Kafka component, enable the ZooKeeper component first.
+> **Note**
+>
+> The Kafka service depends on the ZooKeeper service. If you want to enable the Kafka component, enable the ZooKeeper component first.
 
 Now you can run `./risedev d` to start a new dev cluster. The new dev cluster will contain components as configured in the yaml file. RiseDev will automatically configure the components to use the available storage service and to monitor the target.
 
@@ -281,7 +286,7 @@ Use [sqllogictest-rs](https://github.com/risinglightdb/sqllogictest-rs) to run R
 sqllogictest installation is included when you install test tools with the `./risedev install-tools` command. You may also install it with:
 
 ```shell
-cargo install --git https://github.com/risinglightdb/sqllogictest-rs --features bin
+cargo install --git https://github.com/risinglightdb/sqllogictest-rs --bin sqllogictest
 ```
 
 Before running end-to-end tests, you will need to start a full cluster first:
@@ -290,10 +295,28 @@ Before running end-to-end tests, you will need to start a full cluster first:
 ./risedev d
 ```
 
-Then run the end-to-end tests (replace `**/*.slt` with the test case directories and files available):
+Then to run the end-to-end tests, you can use one of the following commands according to which component you are developing:
 
 ```shell
-./risedev slt -p 4566 -d dev  './e2e_test/streaming/**/*.slt'
+# run all streaming tests
+./risedev slt-streaming -p 4566 -d dev -j 1
+# run all batch tests
+./risedev slt-batch -p 4566 -d dev -j 1
+# run both
+./risedev slt-all -p 4566 -d dev -j 1
+```
+
+> **Note**
+>
+> Use `-j 1` to create a separate database for each test case, which can ensure that previous test case failure won’t affect other tests due to table cleanups.
+
+Alternatively, you can also run some specific tests:
+
+```shell
+# run a single test
+./risedev slt -p 4566 -d dev './e2e_test/path/to/file.slt'
+# run all tests under a directory (including subdirectories)
+./risedev slt -p 4566 -d dev './e2e_test/path/to/directory/**/*.slt'
 ```
 
 After running e2e tests, you may kill the cluster and clean data.

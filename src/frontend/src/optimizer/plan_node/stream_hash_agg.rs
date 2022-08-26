@@ -15,7 +15,6 @@
 use std::fmt;
 
 use itertools::Itertools;
-use risingwave_common::catalog::{DatabaseId, SchemaId};
 use risingwave_pb::stream_plan::stream_node::NodeBody as ProstStreamNode;
 
 use super::logical_agg::PlanAggCall;
@@ -31,7 +30,7 @@ pub struct StreamHashAgg {
 impl StreamHashAgg {
     pub fn new(logical: LogicalAgg) -> Self {
         let ctx = logical.base.ctx.clone();
-        let pk_indices = logical.base.pk_indices.to_vec();
+        let pk_indices = logical.base.logical_pk.to_vec();
         let input = logical.input();
         let input_dist = input.distribution();
         let dist = match input_dist {
@@ -41,7 +40,14 @@ impl StreamHashAgg {
             d => d.clone(),
         };
         // Hash agg executor might change the append-only behavior of the stream.
-        let base = PlanBase::new_stream(ctx, logical.schema().clone(), pk_indices, dist, false);
+        let base = PlanBase::new_stream(
+            ctx,
+            logical.schema().clone(),
+            pk_indices,
+            logical.functional_dependency().clone(),
+            dist,
+            false,
+        );
         StreamHashAgg { base, logical }
     }
 
@@ -88,12 +94,7 @@ impl ToStreamProst for StreamHashAgg {
                 .collect_vec(),
             internal_tables: internal_tables
                 .into_iter()
-                .map(|table_catalog| {
-                    table_catalog.to_prost(
-                        SchemaId::placeholder() as u32,
-                        DatabaseId::placeholder() as u32,
-                    )
-                })
+                .map(|table_catalog| table_catalog.to_state_table_prost())
                 .collect_vec(),
             column_mappings: column_mappings
                 .into_iter()

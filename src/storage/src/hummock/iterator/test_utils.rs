@@ -15,20 +15,19 @@
 use std::iter::Iterator;
 use std::sync::Arc;
 
-use risingwave_hummock_sdk::key::{key_with_epoch, Epoch};
-use risingwave_hummock_sdk::HummockSstableId;
+use risingwave_hummock_sdk::key::key_with_epoch;
+use risingwave_hummock_sdk::{HummockEpoch, HummockSstableId};
 use risingwave_object_store::object::{
     InMemObjectStore, ObjectStore, ObjectStoreImpl, ObjectStoreRef,
 };
 
-use crate::hummock::iterator::BoxedForwardHummockIterator;
 use crate::hummock::sstable::SstableIteratorReadOptions;
 use crate::hummock::sstable_store::SstableStore;
 pub use crate::hummock::test_utils::default_builder_opt_for_test;
 use crate::hummock::test_utils::{create_small_table_cache, gen_test_sstable};
 use crate::hummock::{
     HummockValue, Sstable, SstableBuilderOptions, SstableIterator, SstableIteratorType,
-    SstableStoreRef,
+    SstableStoreRef, TieredCache,
 };
 use crate::monitor::ObjectStoreMetrics;
 
@@ -59,7 +58,13 @@ pub fn mock_sstable_store() -> SstableStoreRef {
 
 pub fn mock_sstable_store_with_object_store(store: ObjectStoreRef) -> SstableStoreRef {
     let path = "test".to_string();
-    Arc::new(SstableStore::new(store, path, 64 << 20, 64 << 20))
+    Arc::new(SstableStore::new(
+        store,
+        path,
+        64 << 20,
+        64 << 20,
+        TieredCache::none(),
+    ))
 }
 
 /// Generates keys like `key_test_00002` with epoch 233.
@@ -68,7 +73,7 @@ pub fn iterator_test_key_of(idx: usize) -> Vec<u8> {
 }
 
 /// Generates keys like `key_test_00002` with epoch `epoch` .
-pub fn iterator_test_key_of_epoch(idx: usize, epoch: Epoch) -> Vec<u8> {
+pub fn iterator_test_key_of_epoch(idx: usize, epoch: HummockEpoch) -> Vec<u8> {
     key_with_epoch(format!("key_test_{:05}", idx).as_bytes().to_vec(), epoch)
 }
 
@@ -121,7 +126,7 @@ pub async fn gen_iterator_test_sstable_from_kv_pair(
 pub async fn gen_merge_iterator_interleave_test_sstable_iters(
     key_count: usize,
     count: usize,
-) -> Vec<BoxedForwardHummockIterator> {
+) -> Vec<SstableIterator> {
     let sstable_store = mock_sstable_store();
     let cache = create_small_table_cache();
     let mut result = vec![];
@@ -135,11 +140,11 @@ pub async fn gen_merge_iterator_interleave_test_sstable_iters(
         )
         .await;
         let handle = cache.insert(table.id, table.id, 1, Box::new(table));
-        result.push(Box::new(SstableIterator::create(
+        result.push(SstableIterator::create(
             handle,
             sstable_store.clone(),
             Arc::new(SstableIteratorReadOptions::default()),
-        )) as BoxedForwardHummockIterator);
+        ));
     }
     result
 }

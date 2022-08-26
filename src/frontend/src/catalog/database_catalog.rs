@@ -35,7 +35,6 @@ impl DatabaseCatalog {
     pub fn create_schema(&mut self, proto: ProstSchema) {
         let name = proto.name.clone();
         let id = proto.id;
-        #[expect(clippy::needless_borrow)]
         let schema = (&proto).into();
         self.schema_by_name
             .try_insert(name.clone(), schema)
@@ -65,8 +64,17 @@ impl DatabaseCatalog {
             .collect_vec()
     }
 
+    pub fn iter_schemas(&self) -> impl Iterator<Item = &SchemaCatalog> {
+        self.schema_by_name.values()
+    }
+
     pub fn get_schema_by_name(&self, name: &str) -> Option<&SchemaCatalog> {
         self.schema_by_name.get(name)
+    }
+
+    pub fn get_schema_by_id(&self, schema_id: &SchemaId) -> Option<&SchemaCatalog> {
+        self.schema_by_name
+            .get(self.schema_name_by_id.get(schema_id)?)
     }
 
     pub fn get_schema_mut(&mut self, schema_id: SchemaId) -> Option<&mut SchemaCatalog> {

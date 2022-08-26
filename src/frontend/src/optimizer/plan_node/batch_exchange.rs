@@ -20,9 +20,7 @@ use risingwave_pb::batch_plan::{ExchangeNode, MergeSortExchangeNode};
 
 use super::{PlanBase, PlanRef, PlanTreeNodeUnary, ToBatchProst, ToDistributedBatch};
 use crate::optimizer::plan_node::ToLocalBatch;
-use crate::optimizer::property::{
-    Distribution, DistributionVerboseDisplay, Order, OrderVerboseDisplay,
-};
+use crate::optimizer::property::{Distribution, DistributionDisplay, Order, OrderDisplay};
 
 /// `BatchExchange` imposes a particular distribution on its input
 /// without changing its content.
@@ -36,7 +34,6 @@ impl BatchExchange {
     pub fn new(input: PlanRef, order: Order, dist: Distribution) -> Self {
         let ctx = input.ctx();
         let schema = input.schema().clone();
-        let _pk_indices = input.pk_indices().to_vec();
         let base = PlanBase::new_batch(ctx, schema, dist, order);
         BatchExchange { base, input }
     }
@@ -44,27 +41,18 @@ impl BatchExchange {
 
 impl fmt::Display for BatchExchange {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let verbose = self.base.ctx.is_explain_verbose();
-        if verbose {
-            write!(
-                f,
-                "BatchExchange {{ order: {}, dist: {} }}",
-                OrderVerboseDisplay {
-                    order: &self.base.order,
-                    input_schema: self.input.schema()
-                },
-                DistributionVerboseDisplay {
-                    distribution: &self.base.dist,
-                    input_schema: self.input.schema()
-                }
-            )
-        } else {
-            write!(
-                f,
-                "BatchExchange {{ order: {}, dist: {:?} }}",
-                self.base.order, self.base.dist
-            )
-        }
+        write!(
+            f,
+            "BatchExchange {{ order: {}, dist: {} }}",
+            OrderDisplay {
+                order: &self.base.order,
+                input_schema: self.input.schema()
+            },
+            DistributionDisplay {
+                distribution: &self.base.dist,
+                input_schema: self.input.schema()
+            }
+        )
     }
 }
 

@@ -16,8 +16,8 @@ use std::fmt;
 
 use risingwave_common::catalog::Schema;
 
-use crate::expr::{ExprType, FunctionCall, InputRef, InputRefVerboseDisplay};
-use crate::utils::{ColIndexMapping, Condition, ConditionVerboseDisplay};
+use crate::expr::{ExprType, FunctionCall, InputRef, InputRefDisplay};
+use crate::utils::{ColIndexMapping, Condition, ConditionDisplay};
 
 /// The join predicate used in optimizer
 #[derive(Debug, Clone)]
@@ -76,8 +76,8 @@ impl EqJoinPredicate {
     /// ```
     /// And the `create functions` should return `JoinPredicate`
     /// ```sql
-    ///   other_conds = Vec[input_ref(1) = input_ref(1), input_ref(1) > input_ref(3)],
-    ///   keys= Vec[(1,1)]
+    ///   other_conds = Vec[input_ref(0) = input_ref(1), input_ref(1) > input_ref(3)],
+    ///   keys= Vec[(0,2)]
     /// ```
     pub fn create(left_cols_num: usize, right_cols_num: usize, on_clause: Condition) -> Self {
         let (eq_keys, other_cond) = on_clause.split_eq_keys(left_cols_num, right_cols_num);
@@ -122,6 +122,11 @@ impl EqJoinPredicate {
         &self.other_cond
     }
 
+    /// Get a mutable reference to the join predicate's other cond.
+    pub fn other_cond_mut(&mut self) -> &mut Condition {
+        &mut self.other_cond
+    }
+
     /// Get a reference to the join predicate's eq keys.
     pub fn eq_keys(&self) -> &[(InputRef, InputRef)] {
         self.eq_keys.as_ref()
@@ -160,12 +165,12 @@ impl EqJoinPredicate {
     }
 }
 
-pub struct EqJoinPredicateVerboseDisplay<'a> {
+pub struct EqJoinPredicateDisplay<'a> {
     pub eq_join_predicate: &'a EqJoinPredicate,
     pub input_schema: &'a Schema,
 }
 
-impl EqJoinPredicateVerboseDisplay<'_> {
+impl EqJoinPredicateDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
         let that = self.eq_join_predicate;
         let mut eq_keys = that.eq_keys().iter();
@@ -173,11 +178,11 @@ impl EqJoinPredicateVerboseDisplay<'_> {
             write!(
                 f,
                 "{} = {}",
-                InputRefVerboseDisplay {
+                InputRefDisplay {
                     input_ref: k1,
                     input_schema: self.input_schema
                 },
-                InputRefVerboseDisplay {
+                InputRefDisplay {
                     input_ref: k2,
                     input_schema: self.input_schema
                 }
@@ -187,11 +192,11 @@ impl EqJoinPredicateVerboseDisplay<'_> {
             write!(
                 f,
                 " AND {} = {}",
-                InputRefVerboseDisplay {
+                InputRefDisplay {
                     input_ref: k1,
                     input_schema: self.input_schema
                 },
-                InputRefVerboseDisplay {
+                InputRefDisplay {
                     input_ref: k2,
                     input_schema: self.input_schema
                 }
@@ -201,7 +206,7 @@ impl EqJoinPredicateVerboseDisplay<'_> {
             write!(
                 f,
                 " AND {}",
-                ConditionVerboseDisplay {
+                ConditionDisplay {
                     condition: &that.other_cond,
                     input_schema: self.input_schema
                 }
@@ -212,13 +217,13 @@ impl EqJoinPredicateVerboseDisplay<'_> {
     }
 }
 
-impl fmt::Display for EqJoinPredicateVerboseDisplay<'_> {
+impl fmt::Display for EqJoinPredicateDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
         self.fmt(f)
     }
 }
 
-impl fmt::Debug for EqJoinPredicateVerboseDisplay<'_> {
+impl fmt::Debug for EqJoinPredicateDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
         self.fmt(f)
     }

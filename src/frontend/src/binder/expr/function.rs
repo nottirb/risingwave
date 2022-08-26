@@ -16,6 +16,7 @@ use std::iter::once;
 use std::str::FromStr;
 
 use itertools::Itertools;
+use risingwave_common::catalog::DEFAULT_SCHEMA_NAME;
 use risingwave_common::error::{ErrorCode, Result};
 use risingwave_common::types::DataType;
 use risingwave_expr::expr::AggKind;
@@ -60,6 +61,7 @@ impl Binder {
             "string_agg" => Some(AggKind::StringAgg),
             "single_value" => Some(AggKind::SingleValue),
             "approx_count_distinct" => Some(AggKind::ApproxCountDistinct),
+            "array_agg" => Some(AggKind::ArrayAgg),
             _ => None,
         };
         if let Some(kind) = agg_kind {
@@ -142,7 +144,7 @@ impl Binder {
             "octet_length" => ExprType::OctetLength,
             "bit_length" => ExprType::BitLength,
             "regexp_match" => ExprType::RegexpMatch,
-            // special
+            // System information operations.
             "pg_typeof" if inputs.len() == 1 => {
                 let input = &inputs[0];
                 let v = match input.is_unknown() {
@@ -154,6 +156,16 @@ impl Binder {
             "current_database" if inputs.is_empty() => {
                 return Ok(ExprImpl::literal_varchar(self.db_name.clone()));
             }
+            "current_schema" if inputs.is_empty() => {
+                return Ok(ExprImpl::literal_varchar(DEFAULT_SCHEMA_NAME.to_string()));
+            }
+            "session_user" if inputs.is_empty() => {
+                return Ok(ExprImpl::literal_varchar(
+                    self.auth_context.user_name.clone(),
+                ));
+            }
+            // internal
+            "rw_vnode" => ExprType::Vnode,
             _ => {
                 return Err(ErrorCode::NotImplemented(
                     format!("unsupported function: {:?}", function_name),

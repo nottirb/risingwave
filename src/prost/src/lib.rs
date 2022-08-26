@@ -43,6 +43,9 @@ pub mod user;
 #[rustfmt::skip]
 #[cfg_attr(madsim, path = "sim/source.rs")]
 pub mod source;
+#[rustfmt::skip]
+#[cfg_attr(madsim, path = "sim/monitor_service.rs")]
+pub mod monitor_service;
 
 
 #[rustfmt::skip]
@@ -87,6 +90,9 @@ pub mod user_serde;
 #[rustfmt::skip]
 #[path = "source.serde.rs"]
 pub mod source_serde;
+#[rustfmt::skip]
+#[path = "monitor_service.serde.rs"]
+pub mod monitor_service_serde;
 
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -116,6 +122,13 @@ mod tests {
             data_type::TypeName::Double,
             data_type.get_type_name().unwrap()
         );
+    }
+
+    #[test]
+    fn test_enum_unspecified() {
+        let mut data_type: DataType = DataType::default();
+        data_type.type_name = data_type::TypeName::TypeUnspecified as i32;
+        assert!(data_type.get_type_name().is_err());
     }
 
     #[test]

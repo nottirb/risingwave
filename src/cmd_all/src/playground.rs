@@ -14,13 +14,14 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{anyhow, Result};
 use clap::StructOpt;
 use risedev::{
-    CompactorService, ComputeNodeService, ConfigExpander, FrontendService, MetaNodeService,
-    ServiceConfig,
+    CompactorService, ComputeNodeService, ConfigExpander, FrontendService, HummockInMemoryStrategy,
+    MetaNodeService, ServiceConfig,
 };
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
@@ -58,6 +59,15 @@ pub async fn playground() -> Result<()> {
     } else {
         "playground".to_string()
     };
+    let force_shared_hummock_in_mem = std::env::var("FORCE_SHARED_HUMMOCK_IN_MEM").is_ok();
+
+    // TODO: may allow specifying the config file for the playground.
+    let apply_config_file = |cmd: &mut Command| {
+        let path = Path::new("src/config/risingwave.toml");
+        if path.exists() {
+            cmd.arg("--config-path").arg(path);
+        }
+    };
 
     let services = match load_risedev_config(&profile).await {
         Ok((steps, services)) => {
@@ -66,12 +76,32 @@ pub async fn playground() -> Result<()> {
                 profile
             );
             tracing::info!("steps: {:?}", steps);
+
+            let steps: Vec<_> = steps
+                .into_iter()
+                .map(|step| services.get(&step).expect("service not found"))
+                .collect();
+
+            let compute_node_count = steps
+                .iter()
+                .filter(|s| matches!(s, ServiceConfig::ComputeNode(_)))
+                .count();
+
             let mut rw_services = vec![];
             for step in steps {
-                match services.get(&step).expect("service not found") {
+                match step {
                     ServiceConfig::ComputeNode(c) => {
                         let mut command = Command::new("compute-node");
-                        ComputeNodeService::apply_command_args(&mut command, c)?;
+                        ComputeNodeService::apply_command_args(
+                            &mut command,
+                            c,
+                            if force_shared_hummock_in_mem || compute_node_count > 1 {
+                                HummockInMemoryStrategy::Shared
+                            } else {
+                                HummockInMemoryStrategy::Isolated
+                            },
+                        )?;
+                        apply_config_file(&mut command);
                         rw_services.push(RisingWaveService::Compute(
                             command.get_args().map(ToOwned::to_owned).collect(),
                         ));
@@ -79,11 +109,12 @@ pub async fn playground() -> Result<()> {
                     ServiceConfig::MetaNode(c) => {
                         let mut command = Command::new("meta-node");
                         MetaNodeService::apply_command_args(&mut command, c)?;
+                        apply_config_file(&mut command);
                         rw_services.push(RisingWaveService::Meta(
                             command.get_args().map(ToOwned::to_owned).collect(),
                         ));
                     }
-                    ServiceConfig::FrontendV2(c) => {
+                    ServiceConfig::Frontend(c) => {
                         let mut command = Command::new("frontend-node");
                         FrontendService::apply_command_args(&mut command, c)?;
                         rw_services.push(RisingWaveService::Frontend(
@@ -93,12 +124,13 @@ pub async fn playground() -> Result<()> {
                     ServiceConfig::Compactor(c) => {
                         let mut command = Command::new("compactor");
                         CompactorService::apply_command_args(&mut command, c)?;
+                        apply_config_file(&mut command);
                         rw_services.push(RisingWaveService::Compactor(
                             command.get_args().map(ToOwned::to_owned).collect(),
                         ));
                     }
                     _ => {
-                        return Err(anyhow!("unsupported service: {}", step));
+                        return Err(anyhow!("unsupported service: {:?}", step));
                     }
                 }
             }
@@ -156,6 +188,10 @@ pub async fn playground() -> Result<()> {
             }
         }
     }
+
+    risingwave_common::util::sync_point::on_sync_point("CLUSTER_READY")
+        .await
+        .unwrap();
 
     // TODO: should we join all handles?
     // Currently, not all services can be shutdown gracefully, just quit on Ctrl-C now.

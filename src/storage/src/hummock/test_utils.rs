@@ -27,7 +27,7 @@ use crate::hummock::shared_buffer::shared_buffer_batch::SharedBufferBatch;
 use crate::hummock::value::HummockValue;
 use crate::hummock::{
     CachePolicy, HummockStateStoreIter, LruCache, Sstable, SstableBuilder, SstableBuilderOptions,
-    SstableStoreRef,
+    SstableStoreRef, SstableStoreWrite,
 };
 use crate::storage_value::StorageValue;
 use crate::store::StateStoreIter;
@@ -48,6 +48,9 @@ pub fn default_config_for_test() -> StorageConfig {
         enable_local_spill: false,
         local_object_store: "memory".to_string(),
         share_buffer_upload_concurrency: 1,
+        compactor_memory_limit_mb: 64,
+        sstable_id_remote_fetch_number: 1,
+        ..Default::default()
     }
 }
 
@@ -91,6 +94,7 @@ pub fn default_builder_opt_for_test() -> SstableBuilderOptions {
         restart_interval: DEFAULT_RESTART_INTERVAL,
         bloom_false_positive: 0.1,
         compression_algorithm: CompressionAlgorithm::None,
+        ..Default::default()
     }
 }
 
@@ -99,7 +103,7 @@ pub fn gen_test_sstable_data(
     opts: SstableBuilderOptions,
     kv_iter: impl Iterator<Item = (Vec<u8>, HummockValue<Vec<u8>>)>,
 ) -> (Bytes, SstableMeta, Vec<u32>) {
-    let mut b = SstableBuilder::new(0, opts);
+    let mut b = SstableBuilder::new_for_test(0, opts);
     for (key, value) in kv_iter {
         b.add(&key, value.as_slice())
     }
@@ -118,7 +122,7 @@ pub async fn gen_test_sstable_inner(
     let (data, meta, _) = gen_test_sstable_data(opts, kv_iter);
     let sst = Sstable::new(sst_id, meta.clone());
     sstable_store
-        .put(Sstable::new(sst_id, meta.clone()), data, policy)
+        .put_sst(sst_id, meta, data, policy)
         .await
         .unwrap();
     sst
@@ -131,7 +135,7 @@ pub async fn gen_test_sstable(
     kv_iter: impl Iterator<Item = (Vec<u8>, HummockValue<Vec<u8>>)>,
     sstable_store: SstableStoreRef,
 ) -> Sstable {
-    gen_test_sstable_inner(opts, sst_id, kv_iter, sstable_store, CachePolicy::Fill).await
+    gen_test_sstable_inner(opts, sst_id, kv_iter, sstable_store, CachePolicy::NotFill).await
 }
 
 /// The key (with epoch 0) of an index in the test table

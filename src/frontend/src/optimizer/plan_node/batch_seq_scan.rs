@@ -26,7 +26,7 @@ use risingwave_pb::plan_common::ColumnDesc as ProstColumnDesc;
 use super::{PlanBase, PlanRef, ToBatchProst, ToDistributedBatch};
 use crate::catalog::ColumnId;
 use crate::optimizer::plan_node::{LogicalScan, ToLocalBatch};
-use crate::optimizer::property::{Distribution, Order};
+use crate::optimizer::property::{Distribution, DistributionDisplay, Order};
 
 /// `BatchSeqScan` implements [`super::LogicalScan`] to scan from a row-oriented table
 #[derive(Debug, Clone)]
@@ -37,11 +37,7 @@ pub struct BatchSeqScan {
 }
 
 impl BatchSeqScan {
-    pub fn new_inner(
-        logical: LogicalScan,
-        dist: Distribution,
-        scan_ranges: Vec<ScanRange>,
-    ) -> Self {
+    fn new_inner(logical: LogicalScan, dist: Distribution, scan_ranges: Vec<ScanRange>) -> Self {
         let ctx = logical.base.ctx.clone();
         // TODO: derive from input
         let base = PlanBase::new_batch(ctx, logical.schema().clone(), dist, Order::any());
@@ -72,20 +68,29 @@ impl BatchSeqScan {
         Self::new_inner(logical, Distribution::Single, scan_ranges)
     }
 
-    pub fn clone_with_dist(&self) -> Self {
+    fn clone_with_dist(&self) -> Self {
         Self::new_inner(
             self.logical.clone(),
             if self.logical.is_sys_table() {
                 Distribution::Single
             } else {
                 match self.logical.distribution_key() {
-                    // FIXME: Should be `Single` if no distribution key.
-                    // Currently the task will be scheduled to frontend under local mode, which is
-                    // unimplemented yet. Enable this when it's done.
-                    //
-                    // Some(dist_key) if dist_key.is_empty() => Distribution::Single,
-                    Some(dist_key) => Distribution::HashShard(dist_key),
                     None => Distribution::SomeShard,
+                    Some(distribution_key) => {
+                        // FIXME: Should be `Single` if distribution_key.is_empty().
+                        // Currently the task will be scheduled to frontend under local mode, which
+                        // is unimplemented yet. Enable this when it's done.
+
+                        // For other batch operators, `HashShard` is a simple hashing, i.e.,
+                        // `target_shard = hash(dist_key) % shard_num`
+                        //
+                        // But MV is actually sharded by consistent hashing, i.e.,
+                        // `target_shard = vnode_mapping.map(hash(dist_key) % vnode_num)`
+                        //
+                        // They are incompatible, so we just specify its distribution as `SomeShard`
+                        // to force an exchange is inserted.
+                        Distribution::UpstreamHashShard(distribution_key)
+                    }
                 }
             },
             self.scan_ranges.clone(),
@@ -171,7 +176,14 @@ impl fmt::Display for BatchSeqScan {
         }
 
         if verbose {
-            write!(f, ", distribution: {}", self.distribution())?;
+            write!(
+                f,
+                ", distribution: {}",
+                &DistributionDisplay {
+                    distribution: self.distribution(),
+                    input_schema: &self.base.schema,
+                }
+            )?;
         }
 
         write!(f, " }}")

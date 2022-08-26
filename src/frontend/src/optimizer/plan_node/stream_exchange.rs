@@ -18,7 +18,7 @@ use risingwave_pb::stream_plan::stream_node::NodeBody;
 use risingwave_pb::stream_plan::{DispatchStrategy, DispatcherType, ExchangeNode};
 
 use super::{PlanBase, PlanRef, PlanTreeNodeUnary, ToStreamProst};
-use crate::optimizer::property::{Distribution, DistributionVerboseDisplay};
+use crate::optimizer::property::{Distribution, DistributionDisplay};
 
 /// `StreamExchange` imposes a particular distribution on its input
 /// without changing its content.
@@ -31,12 +31,13 @@ pub struct StreamExchange {
 impl StreamExchange {
     pub fn new(input: PlanRef, dist: Distribution) -> Self {
         let ctx = input.ctx();
-        let pk_indices = input.pk_indices().to_vec();
+        let pk_indices = input.logical_pk().to_vec();
         // Dispatch executor won't change the append-only behavior of the stream.
         let base = PlanBase::new_stream(
             ctx,
             input.schema().clone(),
             pk_indices,
+            input.functional_dependency().clone(),
             dist,
             input.append_only(),
         );
@@ -46,26 +47,19 @@ impl StreamExchange {
 
 impl fmt::Display for StreamExchange {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let verbose = self.base.ctx.is_explain_verbose();
         let mut builder = f.debug_struct("StreamExchange");
-        if verbose {
-            builder
-                .field(
-                    "dist",
-                    &format_args!(
-                        "{:?}",
-                        DistributionVerboseDisplay {
-                            distribution: &self.base.dist,
-                            input_schema: self.input.schema()
-                        }
-                    ),
-                )
-                .finish()
-        } else {
-            builder
-                .field("dist", &format_args!("{:?}", self.base.dist))
-                .finish()
-        }
+        builder
+            .field(
+                "dist",
+                &format_args!(
+                    "{:?}",
+                    DistributionDisplay {
+                        distribution: &self.base.dist,
+                        input_schema: self.input.schema()
+                    }
+                ),
+            )
+            .finish()
     }
 }
 

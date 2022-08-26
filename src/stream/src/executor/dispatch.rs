@@ -18,6 +18,7 @@ use std::future::Future;
 use std::iter::repeat_with;
 use std::sync::Arc;
 
+use async_stack_trace::StackTrace;
 use futures::Stream;
 use futures_async_stream::try_stream;
 use itertools::Itertools;
@@ -261,7 +262,14 @@ impl StreamConsumer for DispatchExecutor {
             for msg in input {
                 let msg: Message = msg?;
                 let barrier = msg.as_barrier().cloned();
-                self.inner.dispatch(msg).await?;
+                self.inner
+                    .dispatch(msg)
+                    .stack_trace(if barrier.is_some() {
+                        "dispatch_barrier"
+                    } else {
+                        "dispatch_chunk"
+                    })
+                    .await?;
                 if let Some(barrier) = barrier {
                     yield barrier;
                 }
@@ -323,7 +331,7 @@ impl DispatcherImpl {
                 let [output]: [_; 1] = outputs.try_into().unwrap();
                 DispatcherImpl::Simple(SimpleDispatcher::new(output, dispatcher.dispatcher_id))
             }
-            Invalid => unreachable!(),
+            Unspecified => unreachable!(),
         };
 
         Ok(dispatcher_impl)
@@ -898,16 +906,16 @@ mod tests {
     async fn test_configuration_change() {
         let schema = Schema { fields: vec![] };
         let (tx, rx) = channel(16);
+        let actor_id = 233;
         let input = Box::new(ReceiverExecutor::new(
             schema.clone(),
             vec![],
             LocalInput::for_test(rx),
-            ActorContext::create(),
+            ActorContext::create(actor_id),
             0,
             0,
             Arc::new(StreamingMetrics::unused()),
         ));
-        let actor_id = 233;
         let ctx = Arc::new(SharedContext::for_test());
         let dispatcher_id = 666;
         let metrics = Arc::new(StreamingMetrics::unused());
@@ -975,6 +983,7 @@ mod tests {
         let b1 = Barrier::new_test_barrier(1).with_mutation(Mutation::Update {
             dispatchers: dispatcher_updates,
             merges: Default::default(),
+            vnode_bitmaps: Default::default(),
             dropped_actors: Default::default(),
         });
         tx.send(Message::Barrier(b1)).await.unwrap();

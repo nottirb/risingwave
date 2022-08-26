@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use futures::stream::StreamExt;
 use futures_async_stream::try_stream;
 use itertools::Itertools;
@@ -26,7 +27,8 @@ use risingwave_batch::executor::{
     RowSeqScanExecutor, ScanType,
 };
 use risingwave_common::array::{Array, DataChunk, F64Array, I64Array, Row};
-use risingwave_common::catalog::{ColumnDesc, ColumnId, Field, OrderedColumnDesc, Schema, TableId};
+use risingwave_common::buffer::Bitmap;
+use risingwave_common::catalog::{ColumnDesc, ColumnId, Field, Schema, TableId};
 use risingwave_common::column_nonnull;
 use risingwave_common::error::{Result, RwError};
 use risingwave_common::test_prelude::DataChunkTestExt;
@@ -36,12 +38,12 @@ use risingwave_pb::data::data_type::TypeName;
 use risingwave_pb::plan_common::ColumnDesc as ProstColumnDesc;
 use risingwave_source::{MemSourceManager, SourceManager};
 use risingwave_storage::memory::MemoryStateStore;
-use risingwave_storage::table::state_table::StateTable;
-use risingwave_storage::table::storage_table::StorageTable;
+use risingwave_storage::table::storage_table::RowBasedStorageTable;
+use risingwave_storage::table::streaming_table::state_table::StateTable;
 use risingwave_storage::Keyspace;
 use risingwave_stream::executor::monitor::StreamingMetrics;
 use risingwave_stream::executor::{
-    Barrier, Executor, MaterializeExecutor, Message, PkIndices, SourceExecutor,
+    ActorContext, Barrier, Executor, MaterializeExecutor, Message, PkIndices, SourceExecutor,
 };
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -113,7 +115,14 @@ async fn test_table_v2_materialize() -> Result<()> {
         }
         .into(),
     ];
-    source_manager.create_table_source(&source_table_id, table_columns)?;
+    let row_id_index = Some(0);
+    let pk_column_ids = vec![0];
+    source_manager.create_table_source(
+        &source_table_id,
+        table_columns,
+        row_id_index,
+        pk_column_ids,
+    )?;
 
     // Ensure the source exists
     let source_desc = source_manager.get_source(&source_table_id)?;
@@ -135,10 +144,12 @@ async fn test_table_v2_materialize() -> Result<()> {
     let all_schema = get_schema(&all_column_ids);
     let (barrier_tx, barrier_rx) = unbounded_channel();
     let keyspace = Keyspace::table_root(MemoryStateStore::new(), &TableId::from(0x2333));
+    let vnodes = Bitmap::from_bytes(Bytes::from_static(&[0b11111111]));
     let stream_source = SourceExecutor::new(
-        0x3f3f3f,
+        ActorContext::create(0x3f3f3f),
         source_table_id,
-        source_desc.clone(),
+        source_desc,
+        vnodes,
         keyspace,
         all_column_ids.clone(),
         all_schema.clone(),
@@ -200,7 +211,7 @@ async fn test_table_v2_materialize() -> Result<()> {
         .collect_vec();
 
     // Since we have not polled `Materialize`, we cannot scan anything from this table
-    let table = StorageTable::new_for_test(
+    let table = RowBasedStorageTable::new_for_test(
         memory_state_store.clone(),
         source_table_id,
         column_descs.clone(),
@@ -208,25 +219,12 @@ async fn test_table_v2_materialize() -> Result<()> {
         vec![0],
     );
 
-    let ordered_column_descs: Vec<OrderedColumnDesc> = column_descs
-        .iter()
-        .take(1)
-        .map(|d| OrderedColumnDesc {
-            column_desc: d.clone(),
-            order: OrderType::Ascending,
-        })
-        .collect();
-
     let scan = Box::new(RowSeqScanExecutor::new(
         table.schema().clone(),
-        vec![ScanType::TableScan(
-            table
-                .batch_dedup_pk_iter(u64::MAX, &ordered_column_descs)
-                .await?,
-        )],
+        vec![ScanType::BatchScan(table.batch_iter(u64::MAX).await?)],
         1024,
         "RowSeqExecutor2".to_string(),
-        Arc::new(BatchMetrics::unused()),
+        Arc::new(BatchMetrics::for_test()),
     ));
     let mut stream = scan.execute();
     let result = stream.next().await;
@@ -281,14 +279,10 @@ async fn test_table_v2_materialize() -> Result<()> {
     // Scan the table again, we are able to get the data now!
     let scan = Box::new(RowSeqScanExecutor::new(
         table.schema().clone(),
-        vec![ScanType::TableScan(
-            table
-                .batch_dedup_pk_iter(u64::MAX, &ordered_column_descs)
-                .await?,
-        )],
+        vec![ScanType::BatchScan(table.batch_iter(u64::MAX).await?)],
         1024,
         "RowSeqScanExecutor2".to_string(),
-        Arc::new(BatchMetrics::unused()),
+        Arc::new(BatchMetrics::for_test()),
     ));
 
     let mut stream = scan.execute();
@@ -352,14 +346,10 @@ async fn test_table_v2_materialize() -> Result<()> {
     // Scan the table again, we are able to see the deletion now!
     let scan = Box::new(RowSeqScanExecutor::new(
         table.schema().clone(),
-        vec![ScanType::TableScan(
-            table
-                .batch_dedup_pk_iter(u64::MAX, &ordered_column_descs)
-                .await?,
-        )],
+        vec![ScanType::BatchScan(table.batch_iter(u64::MAX).await?)],
         1024,
         "RowSeqScanExecutor2".to_string(),
-        Arc::new(BatchMetrics::unused()),
+        Arc::new(BatchMetrics::for_test()),
     ));
 
     let mut stream = scan.execute();
@@ -396,7 +386,13 @@ async fn test_row_seq_scan() -> Result<()> {
         vec![OrderType::Ascending],
         vec![0_usize],
     );
-    let table = state.storage_table().clone();
+    let table = RowBasedStorageTable::new_for_test(
+        memory_state_store.clone(),
+        TableId::from(0x42),
+        column_descs.clone(),
+        vec![OrderType::Ascending],
+        vec![0],
+    );
 
     let epoch: u64 = 0;
 
@@ -416,26 +412,14 @@ async fn test_row_seq_scan() -> Result<()> {
         .unwrap();
     state.commit(epoch).await.unwrap();
 
-    let pk_descs: Vec<OrderedColumnDesc> = column_descs
-        .iter()
-        .take(1)
-        .map(|d| OrderedColumnDesc {
-            column_desc: d.clone(),
-            order: OrderType::Ascending,
-        })
-        .collect();
-
     let executor = Box::new(RowSeqScanExecutor::new(
         table.schema().clone(),
-        vec![ScanType::TableScan(
-            table
-                .batch_dedup_pk_iter(u64::MAX, &pk_descs)
-                .await
-                .unwrap(),
+        vec![ScanType::BatchScan(
+            table.batch_iter(u64::MAX).await.unwrap(),
         )],
         1,
         "RowSeqScanExecutor2".to_string(),
-        Arc::new(BatchMetrics::unused()),
+        Arc::new(BatchMetrics::for_test()),
     ));
 
     assert_eq!(executor.schema().fields().len(), 3);

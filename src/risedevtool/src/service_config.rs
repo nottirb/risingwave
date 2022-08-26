@@ -27,6 +27,8 @@ pub struct ComputeNodeConfig {
     pub port: u16,
     pub listen_address: String,
     pub exporter_port: u16,
+    pub enable_async_stack_trace: bool,
+    pub enable_tiered_cache: bool,
 
     pub provide_minio: Option<Vec<MinioConfig>>,
     pub provide_meta_node: Option<Vec<MetaNodeConfig>>,
@@ -59,6 +61,9 @@ pub struct MetaNodeConfig {
     pub enable_dashboard_v2: bool,
     pub unsafe_disable_recovery: bool,
     pub max_idle_secs_to_exit: Option<u64>,
+    pub vacuum_interval_sec: u64,
+    pub collect_gc_watermark_spin_interval_sec: u64,
+    pub min_sst_retention_time_sec: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -96,6 +101,8 @@ pub struct CompactorConfig {
     pub provide_aws_s3: Option<Vec<AwsS3Config>>,
     pub provide_meta_node: Option<Vec<MetaNodeConfig>>,
     pub user_managed: bool,
+    pub max_concurrent_task_number: u64,
+    pub compaction_worker_threads_number: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -249,12 +256,24 @@ pub struct RedPandaConfig {
     pub memory: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[serde(deny_unknown_fields)]
+pub struct RedisConfig {
+    #[serde(rename = "use")]
+    phantom_use: Option<String>,
+    pub id: String,
+
+    pub port: u16,
+    pub address: String,
+}
+
 /// All service configuration
 #[derive(Clone, Debug, PartialEq)]
 pub enum ServiceConfig {
     ComputeNode(ComputeNodeConfig),
     MetaNode(MetaNodeConfig),
-    FrontendV2(FrontendConfig),
+    Frontend(FrontendConfig),
     Compactor(CompactorConfig),
     Minio(MinioConfig),
     Etcd(EtcdConfig),
@@ -263,6 +282,7 @@ pub enum ServiceConfig {
     Jaeger(JaegerConfig),
     AwsS3(AwsS3Config),
     Kafka(KafkaConfig),
+    Redis(RedisConfig),
     ZooKeeper(ZooKeeperConfig),
     RedPanda(RedPandaConfig),
 }
@@ -272,7 +292,7 @@ impl ServiceConfig {
         match self {
             Self::ComputeNode(c) => &c.id,
             Self::MetaNode(c) => &c.id,
-            Self::FrontendV2(c) => &c.id,
+            Self::Frontend(c) => &c.id,
             Self::Compactor(c) => &c.id,
             Self::Minio(c) => &c.id,
             Self::Etcd(c) => &c.id,
@@ -282,6 +302,7 @@ impl ServiceConfig {
             Self::AwsS3(c) => &c.id,
             Self::ZooKeeper(c) => &c.id,
             Self::Kafka(c) => &c.id,
+            Self::Redis(c) => &c.id,
             Self::RedPanda(c) => &c.id,
         }
     }

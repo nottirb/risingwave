@@ -1736,23 +1736,16 @@ fn parse_bad_constraint() {
     );
 }
 
-fn run_explain_analyze(
-    query: &str,
-    expected_verbose: bool,
-    expected_analyze: bool,
-    expected_trace: bool,
-) {
-    match verified_stmt(query) {
+fn run_explain_analyze(query: &str, expected_analyze: bool, expected_options: ExplainOptions) {
+    match one_statement_parses_to(query, "") {
         Statement::Explain {
             describe_alias: _,
             analyze,
-            verbose,
-            trace,
             statement,
+            options,
         } => {
-            assert_eq!(verbose, expected_verbose);
             assert_eq!(analyze, expected_analyze);
-            assert_eq!(trace, expected_trace);
+            assert_eq!(options, expected_options);
             assert_eq!("SELECT sqrt(id) FROM foo", statement.to_string());
         }
         _ => panic!("Unexpected Statement, must be Explain"),
@@ -1761,32 +1754,80 @@ fn run_explain_analyze(
 
 #[test]
 fn parse_explain_analyze_with_simple_select() {
-    run_explain_analyze("EXPLAIN SELECT sqrt(id) FROM foo", false, false, false);
     run_explain_analyze(
-        "EXPLAIN VERBOSE SELECT sqrt(id) FROM foo",
-        true,
+        "EXPLAIN SELECT sqrt(id) FROM foo",
         false,
+        ExplainOptions {
+            ..Default::default()
+        },
+    );
+    run_explain_analyze(
+        "EXPLAIN (VERBOSE) SELECT sqrt(id) FROM foo",
         false,
+        ExplainOptions {
+            verbose: true,
+            ..Default::default()
+        },
     );
     run_explain_analyze(
         "EXPLAIN ANALYZE SELECT sqrt(id) FROM foo",
-        false,
         true,
-        false,
+        ExplainOptions {
+            ..Default::default()
+        },
     );
-    run_explain_analyze("EXPLAIN TRACE SELECT sqrt(id) FROM foo", false, false, true);
     run_explain_analyze(
-        "EXPLAIN ANALYZE VERBOSE SELECT sqrt(id) FROM foo",
-        true,
-        true,
+        "EXPLAIN (TRACE) SELECT sqrt(id) FROM foo",
         false,
+        ExplainOptions {
+            trace: true,
+            ..Default::default()
+        },
+    );
+    run_explain_analyze(
+        "EXPLAIN ANALYZE (VERBOSE) SELECT sqrt(id) FROM foo",
+        true,
+        ExplainOptions {
+            verbose: true,
+            ..Default::default()
+        },
     );
 
     run_explain_analyze(
-        "EXPLAIN VERBOSE TRACE SELECT sqrt(id) FROM foo",
-        true,
+        "EXPLAIN (VERBOSE  , TRACE) SELECT sqrt(id) FROM foo",
         false,
-        true,
+        ExplainOptions {
+            verbose: true,
+            trace: true,
+            ..Default::default()
+        },
+    );
+    run_explain_analyze(
+        "EXPLAIN (DISTSQL, TRACE ,VERBOSE) SELECT sqrt(id) FROM foo",
+        false,
+        ExplainOptions {
+            trace: true,
+            verbose: true,
+            explain_type: ExplainType::DistSQL,
+        },
+    );
+    run_explain_analyze(
+        "EXPLAIN (DISTSQL, TRACE false ,VERBOSE true) SELECT sqrt(id) FROM foo",
+        false,
+        ExplainOptions {
+            trace: false,
+            verbose: true,
+            explain_type: ExplainType::DistSQL,
+        },
+    );
+    run_explain_analyze(
+        "EXPLAIN (TYPE DISTSQL, TRACE false ,VERBOSE true) SELECT sqrt(id) FROM foo",
+        false,
+        ExplainOptions {
+            trace: false,
+            verbose: true,
+            explain_type: ExplainType::DistSQL,
+        },
     );
 }
 
@@ -3090,10 +3131,10 @@ fn parse_create_user() {
             assert_eq!(
                 stmt.with_options.0,
                 vec![
-                    CreateUserOption::NoSuperUser,
-                    CreateUserOption::CreateDB,
-                    CreateUserOption::Login,
-                    CreateUserOption::Password(Some(AstString(
+                    UserOption::NoSuperUser,
+                    UserOption::CreateDB,
+                    UserOption::Login,
+                    UserOption::Password(Some(AstString(
                         "md5827ccb0eea8a706c4c34a16891f84e7b".into()
                     ))),
                 ]
@@ -3478,7 +3519,7 @@ fn parse_rollback() {
 
 #[test]
 fn parse_create_index() {
-    let sql = "CREATE UNIQUE INDEX IF NOT EXISTS idx_name ON test(name,age DESC)";
+    let sql = "CREATE UNIQUE INDEX IF NOT EXISTS idx_name ON test(name,age DESC) INCLUDE(other)";
     let indexed_columns = vec![
         OrderByExpr {
             expr: Expr::Identifier(Ident::new("name")),
@@ -3491,17 +3532,21 @@ fn parse_create_index() {
             nulls_first: None,
         },
     ];
+
+    let include_columns = vec![Ident::new("other")];
     match verified_stmt(sql) {
         Statement::CreateIndex {
             name,
             table_name,
             columns,
+            include,
             unique,
             if_not_exists,
         } => {
             assert_eq!("idx_name", name.to_string());
             assert_eq!("test", table_name.to_string());
             assert_eq!(indexed_columns, columns);
+            assert_eq!(include_columns, include);
             assert!(unique);
             assert!(if_not_exists)
         }

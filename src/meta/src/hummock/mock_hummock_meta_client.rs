@@ -19,9 +19,10 @@ use async_trait::async_trait;
 use risingwave_hummock_sdk::compaction_group::StaticCompactionGroupId;
 use risingwave_hummock_sdk::{
     HummockContextId, HummockEpoch, HummockSstableId, HummockVersionId, LocalSstableInfo,
+    SstIdRange,
 };
 use risingwave_pb::hummock::{
-    CompactTask, CompactionGroup, HummockSnapshot, HummockVersion, HummockVersionDelta,
+    pin_version_response, CompactTask, CompactionGroup, HummockSnapshot,
     SubscribeCompactTasksResponse, VacuumTask,
 };
 use risingwave_rpc_client::error::{Result, RpcError};
@@ -64,7 +65,7 @@ impl HummockMetaClient for MockHummockMetaClient {
     async fn pin_version(
         &self,
         last_pinned: HummockVersionId,
-    ) -> Result<(bool, Vec<HummockVersionDelta>, Option<HummockVersion>)> {
+    ) -> Result<pin_version_response::Payload> {
         self.hummock_manager
             .pin_version(self.context_id, last_pinned)
             .await
@@ -119,16 +120,16 @@ impl HummockMetaClient for MockHummockMetaClient {
             .map_err(mock_err)
     }
 
-    async fn get_new_table_id(&self) -> Result<HummockSstableId> {
+    async fn get_new_sst_ids(&self, number: u32) -> Result<SstIdRange> {
         self.hummock_manager
-            .get_new_table_id()
+            .get_new_sst_ids(number)
             .await
             .map_err(mock_err)
     }
 
     async fn report_compaction_task(&self, compact_task: CompactTask) -> Result<()> {
         self.hummock_manager
-            .report_compact_task(&compact_task)
+            .report_compact_task(self.context_id, &compact_task)
             .await
             .map(|_| ())
             .map_err(mock_err)
@@ -139,13 +140,20 @@ impl HummockMetaClient for MockHummockMetaClient {
         epoch: HummockEpoch,
         sstables: Vec<LocalSstableInfo>,
     ) -> Result<()> {
+        let sst_to_worker = sstables
+            .iter()
+            .map(|(_, sst)| (sst.id, self.context_id))
+            .collect();
         self.hummock_manager
-            .commit_epoch(epoch, sstables)
+            .commit_epoch(epoch, sstables, sst_to_worker)
             .await
             .map_err(mock_err)
     }
 
-    async fn subscribe_compact_tasks(&self) -> Result<Streaming<SubscribeCompactTasksResponse>> {
+    async fn subscribe_compact_tasks(
+        &self,
+        _max_concurrent_task_number: u64,
+    ) -> Result<Streaming<SubscribeCompactTasksResponse>> {
         unimplemented!()
     }
 
@@ -164,6 +172,14 @@ impl HummockMetaClient for MockHummockMetaClient {
         _level: u32,
     ) -> Result<()> {
         todo!()
+    }
+
+    async fn report_full_scan_task(&self, _sst_ids: Vec<HummockSstableId>) -> Result<()> {
+        unimplemented!()
+    }
+
+    async fn trigger_full_gc(&self, _sst_retention_time_sec: u64) -> Result<()> {
+        unimplemented!()
     }
 }
 

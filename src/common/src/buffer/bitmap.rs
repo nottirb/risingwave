@@ -40,7 +40,6 @@ use itertools::Itertools;
 use risingwave_pb::common::buffer::CompressionType;
 use risingwave_pb::common::Buffer as ProstBuffer;
 
-use crate::array::error::ArrayError;
 use crate::array::ArrayResult;
 use crate::util::bit_util;
 
@@ -185,7 +184,6 @@ impl Bitmap {
         }
     }
 
-    #[cfg(test)]
     pub fn from_bytes(buf: Bytes) -> Self {
         let num_bits = buf.len() << 3;
         Self::from_bytes_with_num_bits(buf, num_bits)
@@ -201,13 +199,7 @@ impl Bitmap {
     }
 
     fn num_bytes(num_bits: usize) -> usize {
-        let num_bytes = num_bits / 8 + if num_bits % 8 > 0 { 1 } else { 0 };
-        let r = num_bytes % 64;
-        if r == 0 {
-            num_bytes
-        } else {
-            num_bytes + 64 - r
-        }
+        num_bits / 8 + if num_bits % 8 > 0 { 1 } else { 0 }
     }
 
     /// Returns the number of valid bits in the bitmap,
@@ -330,15 +322,13 @@ impl Bitmap {
     }
 }
 
-impl TryFrom<&ProstBuffer> for Bitmap {
-    type Error = ArrayError;
-
-    fn try_from(buf: &ProstBuffer) -> ArrayResult<Bitmap> {
+impl From<&ProstBuffer> for Bitmap {
+    fn from(buf: &ProstBuffer) -> Self {
         let last_byte_num_bits = u8::from_be_bytes(buf.body[..1].try_into().unwrap());
         let bits = Bytes::copy_from_slice(&buf.body[1..]); // TODO: avoid this allocation
         let num_bits = (bits.len() << 3) - ((8 - last_byte_num_bits) % 8) as usize;
 
-        Ok(Self::from_bytes_with_num_bits(bits, num_bits))
+        Self::from_bytes_with_num_bits(bits, num_bits)
     }
 }
 
@@ -424,6 +414,18 @@ mod tests {
     }
 
     #[test]
+    fn test_bitmap_all_high() {
+        let num_bits = 3;
+        let bitmap = Bitmap::all_high_bits(num_bits);
+        assert_eq!(bitmap.len(), num_bits);
+        for i in 0..num_bits {
+            assert!(bitmap.is_set(i).unwrap());
+        }
+        // Test to and from protobuf is OK.
+        assert_eq!(bitmap, Bitmap::from(&bitmap.to_protobuf()));
+    }
+
+    #[test]
     fn test_bitwise_and() {
         let bitmap1 = Bitmap::from_bytes(Bytes::from_static(&[0b01101010]));
         let bitmap2 = Bitmap::from_bytes(Bytes::from_static(&[0b01001110]));
@@ -476,7 +478,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::needless_borrow)]
     fn test_bitmap_from_protobuf() {
         let bitmap_bytes = vec![3u8 /* len % 8 */, 0b0101_0010, 0b110];
         let buf = ProstBuffer {

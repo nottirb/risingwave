@@ -82,7 +82,7 @@ impl<S: StateStore> Keyspace<S> {
     /// Treats the keyspace as a single key, and gets its value.
     /// The returned value is based on a snapshot corresponding to the given `epoch`
     pub async fn value(&self, read_options: ReadOptions) -> StorageResult<Option<Bytes>> {
-        self.store.get(&self.prefix, read_options).await
+        self.store.get(&self.prefix, true, read_options).await
     }
 
     /// Concatenates this keyspace and the given key to produce a prefixed key.
@@ -95,9 +95,12 @@ impl<S: StateStore> Keyspace<S> {
     pub async fn get(
         &self,
         key: impl AsRef<[u8]>,
+        check_bloom_filter: bool,
         read_options: ReadOptions,
     ) -> StorageResult<Option<Bytes>> {
-        self.store.get(&self.prefixed_key(key), read_options).await
+        self.store
+            .get(&self.prefixed_key(key), check_bloom_filter, read_options)
+            .await
     }
 
     /// Scans `limit` keys from the keyspace and get their values.
@@ -128,7 +131,7 @@ impl<S: StateStore> Keyspace<S> {
         B: AsRef<[u8]> + Send,
     {
         let range = prefixed_range(range, &self.prefix);
-        let mut pairs = self.store.scan(range, limit, read_options).await?;
+        let mut pairs = self.store.scan(None, range, limit, read_options).await?;
         pairs
             .iter_mut()
             .for_each(|(k, _v)| *k = k.slice(self.prefix.len()..));
@@ -141,7 +144,8 @@ impl<S: StateStore> Keyspace<S> {
         &self,
         read_options: ReadOptions,
     ) -> StorageResult<StripPrefixIterator<S::Iter>> {
-        self.iter_with_range::<_, &[u8]>(.., read_options).await
+        self.iter_with_range::<_, &[u8]>(None, .., read_options)
+            .await
     }
 
     /// Gets an iterator of the given `range` in this keyspace.
@@ -150,6 +154,7 @@ impl<S: StateStore> Keyspace<S> {
     /// **Note**: the `range` should not be prepended with the prefix of this keyspace.
     pub async fn iter_with_range<R, B>(
         &self,
+        prefix_hint: Option<Vec<u8>>,
         range: R,
         read_options: ReadOptions,
     ) -> StorageResult<StripPrefixIterator<S::Iter>>
@@ -158,11 +163,15 @@ impl<S: StateStore> Keyspace<S> {
         B: AsRef<[u8]> + Send,
     {
         let range = prefixed_range(range, &self.prefix);
-        let iter = self.store.iter(range, read_options).await?;
+        let prefix_hint =
+            prefix_hint.map(|prefix_hint| [self.prefix.to_vec(), prefix_hint].concat());
+
+        let iter = self.store.iter(prefix_hint, range, read_options).await?;
         let strip_prefix_iterator = StripPrefixIterator {
             iter,
             prefix_len: self.prefix.len(),
         };
+
         Ok(strip_prefix_iterator)
     }
 

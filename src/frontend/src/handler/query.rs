@@ -38,10 +38,7 @@ pub async fn handle_query(
     let session = context.session_ctx.clone();
 
     let bound = {
-        let mut binder = Binder::new(
-            session.env().catalog_reader().read_guard(),
-            session.database().to_string(),
-        );
+        let mut binder = Binder::new(&session);
         binder.bind(stmt)?
     };
 
@@ -81,7 +78,7 @@ fn to_statement_type(stmt: &Statement) -> StatementType {
     }
 }
 
-async fn distribute_execute(
+pub async fn distribute_execute(
     context: OptimizerContext,
     stmt: BoundStatement,
 ) -> Result<(BoxedDataChunkStream, Vec<PgFieldDescriptor>)> {
@@ -97,7 +94,7 @@ async fn distribute_execute(
             .map(to_pg_field)
             .collect::<Vec<PgFieldDescriptor>>();
 
-        let plan = root.gen_batch_query_plan()?;
+        let plan = root.gen_batch_distributed_plan()?;
 
         tracing::trace!(
             "Generated distributed plan: {:?}",

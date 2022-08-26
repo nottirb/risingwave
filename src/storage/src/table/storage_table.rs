@@ -12,18 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeMap;
 use std::ops::Bound::{self, Excluded, Included, Unbounded};
 use std::ops::RangeBounds;
 use std::sync::Arc;
 
+use async_stack_trace::StackTrace;
 use auto_enums::auto_enum;
 use bytes::BufMut;
 use futures::future::try_join_all;
 use futures::{Stream, StreamExt};
 use futures_async_stream::try_stream;
 use itertools::Itertools;
-use log::trace;
 use risingwave_common::array::Row;
 use risingwave_common::buffer::Bitmap;
 use risingwave_common::catalog::{
@@ -34,19 +33,15 @@ use risingwave_common::types::{Datum, VirtualNode};
 use risingwave_common::util::hash_util::CRC32FastBuilder;
 use risingwave_common::util::ordered::*;
 use risingwave_common::util::sort_util::OrderType;
-use risingwave_hummock_sdk::key::{end_bound_of_prefix, next_key, prefixed_range, range_of_prefix};
+use risingwave_hummock_sdk::key::{end_bound_of_prefix, next_key, prefixed_range};
 use risingwave_pb::catalog::Table;
+use tracing::trace;
 
-use super::mem_table::RowOp;
 use super::{Distribution, TableIter};
 use crate::error::{StorageError, StorageResult};
 use crate::keyspace::StripPrefixIterator;
-use crate::row_serde::cell_based_encoding_util::serialize_pk_and_column_id;
-use crate::row_serde::{
-    serialize_pk, CellBasedRowSerde, ColumnDescMapping, RowDeserialize, RowSerde, RowSerialize,
-};
-use crate::storage_value::StorageValue;
-use crate::store::{ReadOptions, WriteOptions};
+use crate::row_serde::{serialize_pk, ColumnDescMapping, RowBasedSerde, RowDeserialize, RowSerde};
+use crate::store::ReadOptions;
 use crate::{Keyspace, StateStore, StateStoreIter};
 
 mod iter_utils;
@@ -60,10 +55,9 @@ pub const READ_WRITE: AccessType = true;
 /// For tables without distribution (singleton), the `DEFAULT_VNODE` is encoded.
 pub const DEFAULT_VNODE: VirtualNode = 0;
 
-/// [`StorageTable`] is the interface accessing relational data in KV(`StateStore`) with cell-based
-/// encoding format: [keyspace | pk | `column_id` (4B)] -> value.
-/// if the key of the column id does not exist, it will be Null in the relation
-pub type StorageTable<S, const T: AccessType> = StorageTableBase<S, CellBasedRowSerde, T>;
+/// [`RowBasedStorageTable`] is the interface accessing relational data in KV(`StateStore`) with
+/// row-based encoding format.
+pub type RowBasedStorageTable<S, const T: AccessType> = StorageTableBase<S, RowBasedSerde, T>;
 /// [`StorageTableBase`] is the interface accessing relational data in KV(`StateStore`) with
 /// encoding format: [keyspace | pk | `column_id` (4B)] -> value.
 /// if the key of the column id does not exist, it will be Null in the relation.
@@ -86,7 +80,7 @@ pub struct StorageTableBase<S: StateStore, RS: RowSerde, const T: AccessType> {
     pk_serializer: OrderedRowSerializer,
 
     /// Used for serializing the row.
-    row_serializer: RS::Serializer,
+    _row_serializer: RS::Serializer,
 
     /// Mapping from column id to column index. Used for deserializing the row.
     mapping: Arc<ColumnDescMapping>,
@@ -108,7 +102,7 @@ pub struct StorageTableBase<S: StateStore, RS: RowSerde, const T: AccessType> {
     /// Virtual nodes that the table is partitioned into.
     ///
     /// Only the rows whose vnode of the primary key is in this set will be visible to the
-    /// executor. For READ_WRITE instances, the table will also check whether the writed rows
+    /// executor. For READ_WRITE instances, the table will also check whether the written rows
     /// confirm to this partition.
     vnodes: Arc<Bitmap>,
 
@@ -117,9 +111,6 @@ pub struct StorageTableBase<S: StateStore, RS: RowSerde, const T: AccessType> {
 
     /// Used for catalog table_properties
     table_option: TableOption,
-
-    // TODO: check and build bloom_filter_key by read_pattern_prefix_column
-    _read_pattern_prefix_column: u32,
 }
 
 impl<S: StateStore, RS: RowSerde, const T: AccessType> std::fmt::Debug
@@ -139,6 +130,7 @@ impl<S: StateStore, RS: RowSerde> StorageTableBase<S, RS, READ_ONLY> {
     /// set of `column_ids`. The output will only contains columns with the given ids in the same
     /// order.
     /// This is parameterized on cell based row serializer.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_partial(
         store: S,
         table_id: TableId,
@@ -147,6 +139,7 @@ impl<S: StateStore, RS: RowSerde> StorageTableBase<S, RS, READ_ONLY> {
         order_types: Vec<OrderType>,
         pk_indices: Vec<usize>,
         distribution: Distribution,
+        table_options: TableOption,
     ) -> Self {
         Self::new_inner(
             store,
@@ -156,8 +149,7 @@ impl<S: StateStore, RS: RowSerde> StorageTableBase<S, RS, READ_ONLY> {
             order_types,
             pk_indices,
             distribution,
-            Default::default(),
-            0,
+            table_options,
         )
     }
 }
@@ -184,7 +176,6 @@ impl<S: StateStore, RS: RowSerde> StorageTableBase<S, RS, READ_WRITE> {
             pk_indices,
             distribution,
             Default::default(),
-            0,
         )
     }
 
@@ -246,6 +237,7 @@ impl<S: StateStore, RS: RowSerde, const T: AccessType> StorageTableBase<S, RS, T
             .iter()
             .map(|col_order| col_order.index as usize)
             .collect();
+
         let distribution = match vnodes {
             Some(vnodes) => Distribution {
                 dist_key_indices,
@@ -253,6 +245,7 @@ impl<S: StateStore, RS: RowSerde, const T: AccessType> StorageTableBase<S, RS, T
             },
             None => Distribution::fallback(),
         };
+
         Self::new_inner(
             store,
             TableId::new(table_catalog.id),
@@ -265,7 +258,6 @@ impl<S: StateStore, RS: RowSerde, const T: AccessType> StorageTableBase<S, RS, T
             pk_indices,
             distribution,
             TableOption::build_table_option(table_catalog.get_properties()),
-            table_catalog.read_pattern_prefix_column,
         )
     }
 
@@ -282,9 +274,8 @@ impl<S: StateStore, RS: RowSerde, const T: AccessType> StorageTableBase<S, RS, T
             vnodes,
         }: Distribution,
         table_option: TableOption,
-        read_pattern_prefix_column: u32,
     ) -> Self {
-        let row_serializer = RS::create_serializer(&pk_indices, &table_columns, &column_ids);
+        let _row_serializer = RS::create_serializer(&pk_indices, &table_columns, &column_ids);
 
         assert_eq!(order_types.len(), pk_indices.len());
         let mapping = ColumnDescMapping::new_partial(&table_columns, &column_ids);
@@ -311,7 +302,7 @@ impl<S: StateStore, RS: RowSerde, const T: AccessType> StorageTableBase<S, RS, T
             table_columns,
             schema,
             pk_serializer,
-            row_serializer,
+            _row_serializer,
             mapping,
             pk_indices,
             dist_key_indices,
@@ -319,7 +310,6 @@ impl<S: StateStore, RS: RowSerde, const T: AccessType> StorageTableBase<S, RS, T
             vnodes,
             disable_sanity_check: false,
             table_option,
-            _read_pattern_prefix_column: read_pattern_prefix_column,
         }
     }
 
@@ -330,18 +320,6 @@ impl<S: StateStore, RS: RowSerde, const T: AccessType> StorageTableBase<S, RS, T
 
     pub fn schema(&self) -> &Schema {
         &self.schema
-    }
-
-    pub(super) fn pk_serializer(&self) -> &OrderedRowSerializer {
-        &self.pk_serializer
-    }
-
-    pub(super) fn pk_indices(&self) -> &[usize] {
-        &self.pk_indices
-    }
-
-    pub(super) fn column_ids(&self) -> impl Iterator<Item = ColumnId> + '_ {
-        self.table_columns.iter().map(|t| t.column_id)
     }
 }
 
@@ -368,7 +346,10 @@ impl<S: StateStore, RS: RowSerde, const T: AccessType> StorageTableBase<S, RS, T
 
         tracing::trace!(target: "events::storage::storage_table", "compute vnode: {:?} key {:?} => {}", row, indices, vnode);
 
-        self.check_vnode_is_set(vnode);
+        // FIXME: temporary workaround for local agg, may not needed after we have a vnode builder
+        if !indices.is_empty() {
+            self.check_vnode_is_set(vnode);
+        }
         vnode
     }
 
@@ -396,233 +377,39 @@ impl<S: StateStore, RS: RowSerde, const T: AccessType> StorageTableBase<S, RS, T
 
     /// Get a single row by point get
     pub async fn get_row(&self, pk: &Row, epoch: u64) -> StorageResult<Option<Row>> {
-        // TODO: use multi-get for storage get_row
         let serialized_pk = self.serialize_pk_with_vnode(pk);
         let mut deserializer = RS::create_deserializer(self.mapping.clone());
-        let sentinel_key = <RS as RowSerde>::Serializer::serialize_sentinel_cell(
-            &serialized_pk,
-            &SENTINEL_CELL_ID,
-        )
-        .map_err(err)?;
-
         let read_options = self.get_read_option(epoch);
-        match sentinel_key {
-            Some(sentinel_key) => {
-                if self
-                    .keyspace
-                    .get(&sentinel_key, read_options.clone())
-                    .await?
-                    .is_none()
-                {
-                    // if sentinel cell is none, this row doesn't exist
-                    return Ok(None);
-                };
-            }
-            // if sentinel cell does not exist, the encoding format is row-based.
-            None => {
-                if let Some(value) = self
-                    .keyspace
-                    .get(&serialized_pk, read_options.clone())
-                    .await?
-                {
-                    let deserialize_res = deserializer
-                        .deserialize(&serialized_pk, &value)
-                        .map_err(err)?;
-                    match deserialize_res {
-                        Some(deserialize_res) => return Ok(Some(deserialize_res.2)),
-                        None => return Ok(None),
-                    }
-                }
-            }
-        }
+        assert!(pk.size() <= self.pk_indices.len());
+        let key_indices = (0..pk.size())
+            .into_iter()
+            .map(|index| self.pk_indices[index])
+            .collect_vec();
 
-        for column_id in self.column_ids() {
-            let key = serialize_pk_and_column_id(&serialized_pk, &column_id).map_err(err)?;
-            if let Some(value) = self.keyspace.get(&key, read_options.clone()).await? {
-                let deserialize_res = deserializer.deserialize(&key, &value).map_err(err)?;
-                assert!(deserialize_res.is_none());
-            }
-        }
-
-        let result = deserializer.take();
-        Ok(result.map(|(vnode, _pk, row)| {
-            self.check_vnode_is_set(vnode);
-            row
-        }))
-    }
-
-    /// Get a single row by range scan
-    pub async fn get_row_by_scan(&self, pk: &Row, epoch: u64) -> StorageResult<Option<Row>> {
-        let serialized_pk = self.serialize_pk_with_vnode(pk);
-        let key_range = range_of_prefix(&serialized_pk);
-
-        let read_options = self.get_read_option(epoch);
-        let kv_pairs = self
+        if let Some(value) = self
             .keyspace
-            .scan_with_range(key_range, None, read_options)
-            .await?;
-
-        let mut deserializer = RS::create_deserializer(self.mapping.clone());
-        for (key, value) in kv_pairs {
-            deserializer.deserialize(&key, &value).map_err(err)?;
+            .get(
+                &serialized_pk,
+                self.dist_key_indices == key_indices,
+                read_options.clone(),
+            )
+            .await?
+        {
+            let deserialize_res = deserializer
+                .deserialize(&serialized_pk, &value)
+                .map_err(err)?;
+            Ok(Some(deserialize_res.2))
+        } else {
+            Ok(None)
         }
-
-        let result = deserializer.take();
-        Ok(result.map(|(vnode, _pk, row)| {
-            self.check_vnode_is_set(vnode);
-            row
-        }))
     }
 
     fn get_read_option(&self, epoch: u64) -> ReadOptions {
         ReadOptions {
             epoch,
             table_id: Some(self.keyspace.table_id()),
-            ttl: self.table_option.ttl,
+            retention_seconds: self.table_option.retention_seconds,
         }
-    }
-}
-
-const ENABLE_STATE_TABLE_SANITY_CHECK: bool = cfg!(debug_assertions);
-
-/// Write with different encoding format, depending on the specific implementation of RS.
-impl<S: StateStore, RS: RowSerde> StorageTableBase<S, RS, READ_WRITE> {
-    /// Get vnode value with full row.
-    fn compute_vnode_by_row(&self, row: &Row) -> VirtualNode {
-        // With `READ_WRITE`, the output columns should be exactly same with the table columns, so
-        // we can directly index into the row with indices to the table columns.
-        self.compute_vnode(row, &self.dist_key_indices)
-    }
-
-    /// Write to state store.
-    pub async fn batch_write_rows(
-        &mut self,
-        buffer: BTreeMap<Vec<u8>, RowOp>,
-        epoch: u64,
-    ) -> StorageResult<()> {
-        let mut batch = self.keyspace.state_store().start_write_batch(WriteOptions {
-            epoch,
-            table_id: self.keyspace.table_id(),
-        });
-        let mut local = batch.prefixify(&self.keyspace);
-
-        for (pk, row_op) in buffer {
-            match row_op {
-                RowOp::Insert(row) => {
-                    if ENABLE_STATE_TABLE_SANITY_CHECK && !self.disable_sanity_check {
-                        // If we want to insert a row, it should not exist in storage.
-                        let storage_row = self
-                            .get_row(&row.by_indices(&self.pk_indices), epoch)
-                            .await?;
-
-                        // It's normal for some executors to fail this assert, you can use
-                        // `.disable_sanity_check()` on state table to disable this check.
-                        assert!(
-                            storage_row.is_none(),
-                            "overwriting an existing row:\nin-storage: {:?}\nto-be-written: {:?}",
-                            storage_row.unwrap(),
-                            row
-                        );
-                    }
-
-                    let vnode = self.compute_vnode_by_row(&row);
-                    let bytes = self
-                        .row_serializer
-                        .serialize(vnode, &pk, row)
-                        .map_err(err)?;
-                    for (key, value) in bytes {
-                        local.put(key, StorageValue::new_default_put(value));
-                    }
-                }
-                RowOp::Delete(old_row) => {
-                    if ENABLE_STATE_TABLE_SANITY_CHECK && !self.disable_sanity_check {
-                        // If we want to delete a row, it should exist in storage, and should
-                        // have the same old_value as recorded.
-                        let storage_row = self
-                            .get_row(&old_row.by_indices(&self.pk_indices), epoch)
-                            .await?;
-
-                        // It's normal for some executors to fail this assert, you can use
-                        // `.disable_sanity_check()` on state table to disable this check.
-                        assert!(storage_row.is_some(), "deleting an non-existing row");
-                        assert!(
-                            storage_row.as_ref().unwrap() == &old_row,
-                            "inconsistent deletion:\nin-storage: {:?}\nold-value: {:?}",
-                            storage_row.as_ref().unwrap(),
-                            old_row
-                        );
-                    }
-
-                    let vnode = self.compute_vnode_by_row(&old_row);
-                    let bytes = self
-                        .row_serializer
-                        .serialize(vnode, &pk, old_row)
-                        .map_err(err)?;
-                    for (key, _) in bytes {
-                        local.delete(key);
-                    }
-                }
-                RowOp::Update((old_row, new_row)) => {
-                    if ENABLE_STATE_TABLE_SANITY_CHECK && !self.disable_sanity_check {
-                        // If we want to update a row, it should exist in storage, and should
-                        // have the same old_value as recorded.
-                        let storage_row = self
-                            .get_row(&old_row.by_indices(&self.pk_indices), epoch)
-                            .await?;
-
-                        // It's normal for some executors to fail this assert, you can use
-                        // `.disable_sanity_check()` on state table to disable this check.
-                        assert!(
-                            storage_row.is_some(),
-                            "update a non-existing row: {:?}",
-                            old_row
-                        );
-                        assert!(
-                            storage_row.as_ref().unwrap() == &old_row,
-                            "value mismatch when updating row: {:?} != {:?}",
-                            storage_row,
-                            old_row
-                        );
-                    }
-
-                    // The row to update should keep the same primary key, so distribution key as
-                    // well.
-                    let vnode = self.compute_vnode_by_row(&new_row);
-                    debug_assert_eq!(self.compute_vnode_by_row(&old_row), vnode);
-
-                    // TODO: Row-based encoding does not need to serializer old_row, while a little
-                    // overhead can be allowed here. Refactor this part after cell-based encoding is
-                    // removed.
-                    let delete_bytes = self
-                        .row_serializer
-                        .serialize_for_update(vnode, &pk, old_row)
-                        .map_err(err)?;
-                    let insert_bytes = self
-                        .row_serializer
-                        .serialize_for_update(vnode, &pk, new_row)
-                        .map_err(err)?;
-                    for (delete, insert) in
-                        delete_bytes.into_iter().zip_eq(insert_bytes.into_iter())
-                    {
-                        match (delete, insert) {
-                            (Some((delete_pk, _)), None) => {
-                                local.delete(delete_pk);
-                            }
-                            (None, Some((insert_pk, insert_row))) => {
-                                local.put(insert_pk, StorageValue::new_default_put(insert_row));
-                            }
-                            (None, None) => {}
-                            (Some((delete_pk, _)), Some((insert_pk, insert_row))) => {
-                                debug_assert_eq!(delete_pk, insert_pk);
-                                local.put(insert_pk, StorageValue::new_default_put(insert_row));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        batch.ingest().await?;
-        Ok(())
     }
 }
 
@@ -650,6 +437,7 @@ impl<S: StateStore, RS: RowSerde, const T: AccessType> StorageTableBase<S, RS, T
     /// `vnode_hint`, and merge or concat them by given `ordered`.
     async fn iter_with_encoded_key_range<R, B>(
         &self,
+        prefix_hint: Option<Vec<u8>>,
         encoded_key_range: R,
         epoch: u64,
         vnode_hint: Option<VirtualNode>,
@@ -679,17 +467,23 @@ impl<S: StateStore, RS: RowSerde, const T: AccessType> StorageTableBase<S, RS, T
         // can use a single iterator.
         let iterators: Vec<_> = try_join_all(vnodes.map(|vnode| {
             let raw_key_range = prefixed_range(encoded_key_range.clone(), &vnode.to_be_bytes());
+            let prefix_hint = prefix_hint
+                .clone()
+                .map(|prefix_hint| [&vnode.to_be_bytes(), prefix_hint.as_slice()].concat());
 
             async move {
+                let read_options = self.get_read_option(epoch);
                 let iter = StorageTableIterInner::<S, RS>::new(
                     &self.keyspace,
                     self.mapping.clone(),
+                    prefix_hint,
                     raw_key_range,
                     wait_epoch,
-                    self.get_read_option(epoch),
+                    read_options,
                 )
                 .await?
                 .into_stream();
+
                 Ok::<_, StorageError>(iter)
             }
         }))
@@ -781,13 +575,41 @@ impl<S: StateStore, RS: RowSerde, const T: AccessType> StorageTableBase<S, RS, T
             false,
         );
 
+        assert!(pk_prefix.size() <= self.pk_indices.len());
+        let pk_prefix_indices = (0..pk_prefix.size())
+            .into_iter()
+            .map(|index| self.pk_indices[index])
+            .collect_vec();
+        let prefix_hint = if self.dist_key_indices.is_empty()
+            || self.dist_key_indices != pk_prefix_indices
+        {
+            trace!(
+                "iter_with_pk_bounds dist_key_indices table_id {} not match prefix pk_prefix {:?} dist_key_indices {:?} pk_prefix_indices {:?}",
+                self.keyspace.table_id(),
+                pk_prefix,
+                self.dist_key_indices,
+                pk_prefix_indices
+            );
+            None
+        } else {
+            let pk_prefix_serializer = self.pk_serializer.prefix(pk_prefix.size());
+            let serialized_pk_prefix = serialize_pk(pk_prefix, &pk_prefix_serializer);
+            Some(serialized_pk_prefix)
+        };
+
         trace!(
-            "iter_with_pk_bounds: start_key: {:?}, end_key: {:?}",
+            "iter_with_pk_bounds table_id {} prefix_hint {:?} start_key: {:?}, end_key: {:?} pk_prefix {:?} dist_key_indices {:?} pk_prefix_indices {:?}" ,
+            self.keyspace.table_id(),
+            prefix_hint,
             start_key,
-            end_key
+            end_key,
+            pk_prefix,
+            self.dist_key_indices,
+            pk_prefix_indices
         );
 
         self.iter_with_encoded_key_range(
+            prefix_hint,
             (start_key, end_key),
             epoch,
             self.try_compute_vnode_by_pk_prefix(pk_prefix),
@@ -860,6 +682,7 @@ impl<S: StateStore, RS: RowSerde> StorageTableIterInner<S, RS> {
     async fn new<R, B>(
         keyspace: &Keyspace<S>,
         table_descs: Arc<ColumnDescMapping>,
+        prefix_hint: Option<Vec<u8>>,
         raw_key_range: R,
         wait_epoch: bool,
         read_options: ReadOptions,
@@ -876,9 +699,8 @@ impl<S: StateStore, RS: RowSerde> StorageTableIterInner<S, RS> {
         }
 
         let row_deserializer = RS::create_deserializer(table_descs);
-
         let iter = keyspace
-            .iter_with_range(raw_key_range, read_options)
+            .iter_with_range(prefix_hint, raw_key_range, read_options)
             .await?;
         let iter = Self {
             iter,
@@ -890,18 +712,18 @@ impl<S: StateStore, RS: RowSerde> StorageTableIterInner<S, RS> {
     /// Yield a row with its primary key.
     #[try_stream(ok = (Vec<u8>, Row), error = StorageError)]
     async fn into_stream(mut self) {
-        while let Some((key, value)) = self.iter.next().await? {
-            if let Some((_vnode, pk, row)) = self
+        while let Some((key, value)) = self
+            .iter
+            .next()
+            .stack_trace("storage_table_iter_next")
+            .await?
+        {
+            let (_vnode, pk, row) = self
                 .row_deserializer
                 .deserialize(&key, &value)
-                .map_err(err)?
-            {
-                yield (pk, row)
-            }
-        }
+                .map_err(err)?;
 
-        if let Some((_vnode, pk, row)) = self.row_deserializer.take() {
-            yield (pk, row);
+            yield (pk, row)
         }
     }
 }

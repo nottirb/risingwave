@@ -39,7 +39,7 @@ use risingwave_common::error::{ErrorCode, Result};
 use risingwave_pb::batch_plan::PlanNode as BatchPlanProst;
 use risingwave_pb::stream_plan::StreamNode as StreamPlanProst;
 
-use super::property::{Distribution, Order};
+use super::property::{Distribution, FunctionalDependencySet, Order};
 
 /// The common trait over all plan nodes. Used by optimizer framework which will treat all node as
 /// `dyn PlanNode`
@@ -107,8 +107,8 @@ impl dyn PlanNode {
         &self.plan_base().schema
     }
 
-    pub fn pk_indices(&self) -> &[usize] {
-        &self.plan_base().pk_indices
+    pub fn logical_pk(&self) -> &[usize] {
+        &self.plan_base().logical_pk
     }
 
     pub fn order(&self) -> &Order {
@@ -121,6 +121,10 @@ impl dyn PlanNode {
 
     pub fn append_only(&self) -> bool {
         self.plan_base().append_only
+    }
+
+    pub fn functional_dependency(&self) -> &FunctionalDependencySet {
+        &self.plan_base().functional_dependency
     }
 
     /// Serialize the plan node and its children to a batch plan proto.
@@ -153,36 +157,26 @@ impl dyn PlanNode {
     /// Note that [`StreamTableScan`] has its own implementation of `to_stream_prost`. We have a
     /// hook inside to do some ad-hoc thing for [`StreamTableScan`].
     pub fn to_stream_prost(&self) -> StreamPlanProst {
-        self.to_stream_prost_auto_fields(true)
-    }
-
-    /// Serialize the plan node and its children to a stream plan proto without identity and without
-    /// operator id (for testing).
-    pub fn to_stream_prost_auto_fields(&self, auto_fields: bool) -> StreamPlanProst {
         if let Some(stream_table_scan) = self.as_stream_table_scan() {
-            return stream_table_scan.adhoc_to_stream_prost(auto_fields);
+            return stream_table_scan.adhoc_to_stream_prost();
         }
         if let Some(stream_index_scan) = self.as_stream_index_scan() {
-            return stream_index_scan.adhoc_to_stream_prost(auto_fields);
+            return stream_index_scan.adhoc_to_stream_prost();
         }
 
         let node = Some(self.to_stream_prost_body());
         let input = self
             .inputs()
             .into_iter()
-            .map(|plan| plan.to_stream_prost_auto_fields(auto_fields))
+            .map(|plan| plan.to_stream_prost())
             .collect();
         // TODO: support pk_indices and operator_id
         StreamPlanProst {
             input,
-            identity: if auto_fields {
-                format!("{}", self)
-            } else {
-                "".into()
-            },
+            identity: format!("{}", self),
             node_body: node,
-            operator_id: if auto_fields { self.id().0 as u64 } else { 0 },
-            pk_indices: self.pk_indices().iter().map(|x| *x as u32).collect(),
+            operator_id: self.id().0 as u64,
+            stream_key: self.logical_pk().iter().map(|x| *x as u32).collect(),
             fields: self.schema().to_prost(),
             append_only: self.append_only(),
         }
@@ -223,6 +217,7 @@ mod batch_simple_agg;
 mod batch_sort;
 mod batch_table_function;
 mod batch_topn;
+mod batch_union;
 mod batch_update;
 mod batch_values;
 mod logical_agg;
@@ -241,6 +236,7 @@ mod logical_scan;
 mod logical_source;
 mod logical_table_function;
 mod logical_topn;
+mod logical_union;
 mod logical_update;
 mod logical_values;
 mod stream_delta_join;
@@ -249,6 +245,7 @@ mod stream_exchange;
 mod stream_expand;
 mod stream_filter;
 mod stream_global_simple_agg;
+mod stream_group_topn;
 mod stream_hash_agg;
 mod stream_hash_join;
 mod stream_hop_window;
@@ -257,6 +254,7 @@ mod stream_local_simple_agg;
 mod stream_materialize;
 mod stream_project;
 mod stream_project_set;
+mod stream_sink;
 mod stream_source;
 mod stream_table_scan;
 mod stream_topn;
@@ -281,9 +279,10 @@ pub use batch_simple_agg::BatchSimpleAgg;
 pub use batch_sort::BatchSort;
 pub use batch_table_function::BatchTableFunction;
 pub use batch_topn::BatchTopN;
+pub use batch_union::BatchUnion;
 pub use batch_update::BatchUpdate;
 pub use batch_values::BatchValues;
-pub use logical_agg::{LogicalAgg, PlanAggCall, PlanAggCallVerboseDisplay};
+pub use logical_agg::{LogicalAgg, PlanAggCall, PlanAggCallDisplay};
 pub use logical_apply::LogicalApply;
 pub use logical_delete::LogicalDelete;
 pub use logical_expand::LogicalExpand;
@@ -299,6 +298,7 @@ pub use logical_scan::LogicalScan;
 pub use logical_source::LogicalSource;
 pub use logical_table_function::LogicalTableFunction;
 pub use logical_topn::LogicalTopN;
+pub use logical_union::LogicalUnion;
 pub use logical_update::LogicalUpdate;
 pub use logical_values::LogicalValues;
 pub use stream_delta_join::StreamDeltaJoin;
@@ -307,6 +307,7 @@ pub use stream_exchange::StreamExchange;
 pub use stream_expand::StreamExpand;
 pub use stream_filter::StreamFilter;
 pub use stream_global_simple_agg::StreamGlobalSimpleAgg;
+pub use stream_group_topn::StreamGroupTopN;
 pub use stream_hash_agg::StreamHashAgg;
 pub use stream_hash_join::StreamHashJoin;
 pub use stream_hop_window::StreamHopWindow;
@@ -315,6 +316,7 @@ pub use stream_local_simple_agg::StreamLocalSimpleAgg;
 pub use stream_materialize::StreamMaterialize;
 pub use stream_project::StreamProject;
 pub use stream_project_set::StreamProjectSet;
+pub use stream_sink::StreamSink;
 pub use stream_source::StreamSource;
 pub use stream_table_scan::StreamTableScan;
 pub use stream_topn::StreamTopN;
@@ -356,6 +358,7 @@ macro_rules! for_all_plan_nodes {
             , { Logical, MultiJoin }
             , { Logical, Expand }
             , { Logical, ProjectSet }
+            , { Logical, Union }
             // , { Logical, Sort } we don't need a LogicalSort, just require the Order
             , { Batch, SimpleAgg }
             , { Batch, HashAgg }
@@ -377,9 +380,11 @@ macro_rules! for_all_plan_nodes {
             , { Batch, Expand }
             , { Batch, LookupJoin }
             , { Batch, ProjectSet }
+            , { Batch, Union }
             , { Stream, Project }
             , { Stream, Filter }
             , { Stream, TableScan }
+            , { Stream, Sink }
             , { Stream, Source }
             , { Stream, HashJoin }
             , { Stream, Exchange }
@@ -394,6 +399,7 @@ macro_rules! for_all_plan_nodes {
             , { Stream, Expand }
             , { Stream, DynamicFilter }
             , { Stream, ProjectSet }
+            , { Stream, GroupTopN }
         }
     };
 }
@@ -422,6 +428,7 @@ macro_rules! for_logical_plan_nodes {
             , { Logical, MultiJoin }
             , { Logical, Expand }
             , { Logical, ProjectSet }
+            , { Logical, Union }
             // , { Logical, Sort} not sure if we will support Order by clause in subquery/view/MV
             // if we dont support that, we don't need LogicalSort, just require the Order at the top of query
         }
@@ -454,6 +461,7 @@ macro_rules! for_batch_plan_nodes {
             , { Batch, Expand }
             , { Batch, LookupJoin }
             , { Batch, ProjectSet }
+            , { Batch, Union }
         }
     };
 }
@@ -469,6 +477,7 @@ macro_rules! for_stream_plan_nodes {
             , { Stream, HashJoin }
             , { Stream, Exchange }
             , { Stream, TableScan }
+            , { Stream, Sink }
             , { Stream, Source }
             , { Stream, HashAgg }
             , { Stream, LocalSimpleAgg }
@@ -481,6 +490,7 @@ macro_rules! for_stream_plan_nodes {
             , { Stream, Expand }
             , { Stream, DynamicFilter }
             , { Stream, ProjectSet }
+            , { Stream, GroupTopN }
         }
     };
 }

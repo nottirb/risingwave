@@ -14,6 +14,7 @@
 
 use proc_macro2::{Ident, Span, TokenStream as TokenStream2};
 use proc_macro_error::abort;
+use quote::quote;
 use syn::ext::IdentExt;
 use syn::spanned::Spanned;
 use syn::{self, Field, GenericArgument, Lit, Meta, PathArguments, PathSegment, Type};
@@ -93,6 +94,9 @@ pub fn implement(field: &Field) -> TokenStream2 {
             return quote! {
                 #[inline(always)]
                 pub fn #getter_fn_name(&self) -> std::result::Result<#enum_type, crate::ProstFieldNotFound> {
+                    if self.#field_name.eq(&0) {
+                        return Err(crate::ProstFieldNotFound(stringify!(#field_name)));
+                    }
                     #enum_type::from_i32(self.#field_name).ok_or_else(|| crate::ProstFieldNotFound(stringify!(#field_name)))
                 }
             };

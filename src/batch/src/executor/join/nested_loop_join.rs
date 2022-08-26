@@ -21,7 +21,7 @@ use risingwave_common::buffer::BitmapBuilder;
 use risingwave_common::catalog::Schema;
 use risingwave_common::error::{Result, RwError};
 use risingwave_common::types::DataType;
-use risingwave_common::util::chunk_coalesce::{DataChunkBuilder, SlicedDataChunk};
+use risingwave_common::util::chunk_coalesce::DataChunkBuilder;
 use risingwave_expr::expr::{
     build_from_prost as expr_build_from_prost, BoxedExpression, Expression,
 };
@@ -129,34 +129,15 @@ impl NestedLoopJoinExecutor {
         chunk.set_visibility(expr.eval(&chunk)?.as_bool().iter().collect());
         Ok(chunk)
     }
-
-    /// Append a chunk to the chunk builder and get a stream of the spilled chunks.
-    #[try_stream(boxed, ok = DataChunk, error = RwError)]
-    async fn append_chunk(chunk_builder: &mut DataChunkBuilder, chunk: DataChunk) {
-        let (mut remain, mut output) =
-            chunk_builder.append_chunk(SlicedDataChunk::new_checked(chunk)?)?;
-        if let Some(output_chunk) = output {
-            yield output_chunk
-        }
-        while let Some(remain_chunk) = remain {
-            (remain, output) = chunk_builder.append_chunk(remain_chunk)?;
-            if let Some(output_chunk) = output {
-                yield output_chunk
-            }
-        }
-    }
 }
 
 #[async_trait::async_trait]
 impl BoxedExecutorBuilder for NestedLoopJoinExecutor {
     async fn new_boxed_executor<C: BatchTaskContext>(
         source: &ExecutorBuilder<C>,
-        mut inputs: Vec<BoxedExecutor>,
+        inputs: Vec<BoxedExecutor>,
     ) -> Result<BoxedExecutor> {
-        ensure!(
-            inputs.len() == 2,
-            "NestedLoopJoinExecutor should have 2 children!"
-        );
+        let [left_child, right_child]: [_; 2] = inputs.try_into().unwrap();
 
         let nested_loop_join_node = try_match_expand!(
             source.plan_node().get_node_body().unwrap(),
@@ -165,9 +146,6 @@ impl BoxedExecutorBuilder for NestedLoopJoinExecutor {
 
         let join_type = JoinType::from_prost(nested_loop_join_node.get_join_type()?);
         let join_expr = expr_build_from_prost(nested_loop_join_node.get_join_cond()?)?;
-
-        let left_child = inputs.remove(0);
-        let right_child = inputs.remove(0);
 
         let output_indices = nested_loop_join_node
             .output_indices
@@ -252,7 +230,7 @@ impl NestedLoopJoinExecutor {
                 // 4. Yield the concatenated chunk.
                 if chunk.cardinality() > 0 {
                     #[for_await]
-                    for spilled in Self::append_chunk(chunk_builder, chunk) {
+                    for spilled in chunk_builder.trunc_data_chunk(chunk) {
                         yield spilled?
                     }
                 }
@@ -285,7 +263,7 @@ impl NestedLoopJoinExecutor {
                 if chunk.cardinality() > 0 {
                     matched.set(left_row_idx, true);
                     #[for_await]
-                    for spilled in Self::append_chunk(chunk_builder, chunk) {
+                    for spilled in chunk_builder.trunc_data_chunk(chunk) {
                         yield spilled?
                     }
                 }
@@ -370,7 +348,7 @@ impl NestedLoopJoinExecutor {
                     // chunk.visibility() must be Some(_)
                     matched = &matched | chunk.visibility().unwrap();
                     #[for_await]
-                    for spilled in Self::append_chunk(chunk_builder, chunk) {
+                    for spilled in chunk_builder.trunc_data_chunk(chunk) {
                         yield spilled?
                     }
                 }
@@ -418,7 +396,7 @@ impl NestedLoopJoinExecutor {
             right_chunk.set_visibility(matched);
             if right_chunk.cardinality() > 0 {
                 #[for_await]
-                for spilled in Self::append_chunk(chunk_builder, right_chunk) {
+                for spilled in chunk_builder.trunc_data_chunk(right_chunk) {
                     yield spilled?
                 }
             }
@@ -451,7 +429,7 @@ impl NestedLoopJoinExecutor {
                     left_matched.set(left_row_idx, true);
                     right_matched = &right_matched | chunk.visibility().unwrap();
                     #[for_await]
-                    for spilled in Self::append_chunk(chunk_builder, chunk) {
+                    for spilled in chunk_builder.trunc_data_chunk(chunk) {
                         yield spilled?
                     }
                 }

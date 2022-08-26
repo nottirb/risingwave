@@ -47,7 +47,7 @@ use std::fmt::Debug;
 
 use fixedbitset::FixedBitSet;
 use itertools::Itertools;
-use risingwave_common::catalog::{FieldVerboseDisplay, Schema};
+use risingwave_common::catalog::{FieldDisplay, Schema};
 use risingwave_common::error::Result;
 use risingwave_pb::batch_plan::exchange_info::{
     Distribution as DistributionProst, DistributionMode, HashInfo,
@@ -70,7 +70,17 @@ pub enum Distribution {
     /// the records with the same hash values must be on the same partition.
     /// `usize` is the index of column used as the distribution key.
     HashShard(Vec<usize>),
-    /// Records are available on all downstream shards
+    /// A special kind of provided distribution which is almost the same as
+    /// [`Distribution::HashShard`], but may have different vnode mapping.
+    ///
+    /// It exists because the upstream MV can be scaled independently. So we use
+    /// `UpstreamHashShard` to force an exchange is inserted.
+    ///
+    /// Alternatively, [`Distribution::SomeShard`] can also be used to insert an exchange, but
+    /// `UpstreamHashShard` contains distribution keys, which might be useful in some cases, e.g.,
+    /// two-phase Agg. It also satisfies [`RequiredDist::ShardByKey`].
+    UpstreamHashShard(Vec<usize>),
+    /// Records are available on all downstream shards.
     Broadcast,
 }
 
@@ -98,6 +108,7 @@ impl Distribution {
                 // TODO: add round robin DistributionMode
                 Distribution::SomeShard => DistributionMode::Single,
                 Distribution::Broadcast => DistributionMode::Broadcast,
+                Distribution::UpstreamHashShard(_) => unreachable!(),
             } as i32,
             distribution: match self {
                 Distribution::Single => None,
@@ -114,6 +125,7 @@ impl Distribution {
                 // TODO: add round robin distribution
                 Distribution::SomeShard => None,
                 Distribution::Broadcast => None,
+                Distribution::UpstreamHashShard(_) => unreachable!(),
             },
         }
     }
@@ -125,11 +137,14 @@ impl Distribution {
             RequiredDist::AnyShard => {
                 matches!(
                     self,
-                    Distribution::SomeShard | Distribution::HashShard(_) | Distribution::Broadcast
+                    Distribution::SomeShard
+                        | Distribution::HashShard(_)
+                        | Distribution::UpstreamHashShard(_)
+                        | Distribution::Broadcast
                 )
             }
             RequiredDist::ShardByKey(required_key) => match self {
-                Distribution::HashShard(hash_key) => {
+                Distribution::HashShard(hash_key) | Distribution::UpstreamHashShard(hash_key) => {
                     hash_key.iter().all(|idx| required_key.contains(*idx))
                 }
                 _ => false,
@@ -145,7 +160,7 @@ impl Distribution {
             Distribution::Single | Distribution::SomeShard | Distribution::Broadcast => {
                 Default::default()
             }
-            Distribution::HashShard(dists) => dists,
+            Distribution::HashShard(dists) | Distribution::UpstreamHashShard(dists) => dists,
         }
     }
 }
@@ -157,7 +172,7 @@ impl fmt::Display for Distribution {
             Self::Single => f.write_str("Single")?,
             Self::SomeShard => f.write_str("SomeShard")?,
             Self::Broadcast => f.write_str("Broadcast")?,
-            Self::HashShard(vec) => {
+            Self::HashShard(vec) | Self::UpstreamHashShard(vec) => {
                 for key in vec {
                     std::fmt::Debug::fmt(&key, f)?;
                 }
@@ -167,25 +182,27 @@ impl fmt::Display for Distribution {
     }
 }
 
-pub struct DistributionVerboseDisplay<'a> {
+pub struct DistributionDisplay<'a> {
     pub distribution: &'a Distribution,
     pub input_schema: &'a Schema,
 }
 
-impl DistributionVerboseDisplay<'_> {
+impl DistributionDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let that = self.distribution;
-        f.write_str("[")?;
         match that {
-            Distribution::Single => f.write_str("Single")?,
-            Distribution::SomeShard => f.write_str("SomeShard")?,
-            Distribution::Broadcast => f.write_str("Broadcast")?,
-            Distribution::HashShard(vec) => {
+            Distribution::Single => f.write_str("Single"),
+            Distribution::SomeShard => f.write_str("SomeShard"),
+            Distribution::Broadcast => f.write_str("Broadcast"),
+            Distribution::HashShard(vec) | Distribution::UpstreamHashShard(vec) => {
+                if let Distribution::HashShard(_) = that {
+                    f.write_str("HashShard(")?;
+                } else {
+                    f.write_str("UpstreamHashShard(")?;
+                }
                 for key in vec.iter().copied().with_position() {
                     std::fmt::Debug::fmt(
-                        &FieldVerboseDisplay(
-                            self.input_schema.fields.get(key.into_inner()).unwrap(),
-                        ),
+                        &FieldDisplay(self.input_schema.fields.get(key.into_inner()).unwrap()),
                         f,
                     )?;
                     match key {
@@ -195,19 +212,19 @@ impl DistributionVerboseDisplay<'_> {
                         _ => {}
                     }
                 }
+                f.write_str(")")
             }
         }
-        f.write_str("]")
     }
 }
 
-impl fmt::Debug for DistributionVerboseDisplay<'_> {
+impl fmt::Debug for DistributionDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.fmt(f)
     }
 }
 
-impl fmt::Display for DistributionVerboseDisplay<'_> {
+impl fmt::Display for DistributionDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.fmt(f)
     }
@@ -228,6 +245,11 @@ impl RequiredDist {
         } else {
             Self::ShardByKey(cols)
         }
+    }
+
+    pub fn hash_shard(key: &[usize]) -> Self {
+        assert!(!key.is_empty());
+        Self::PhysicalDist(Distribution::HashShard(key.to_vec()))
     }
 
     pub fn enforce_if_not_satisfies(

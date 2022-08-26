@@ -12,41 +12,45 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use rand::Rng;
-use risingwave_common::error::{ErrorCode, Result, ToErrorStr};
 use risingwave_hummock_sdk::HummockContextId;
-use risingwave_pb::hummock::{CompactTask, SubscribeCompactTasksResponse, VacuumTask};
+use risingwave_pb::hummock::subscribe_compact_tasks_response::Task;
+use risingwave_pb::hummock::SubscribeCompactTasksResponse;
 use tokio::sync::mpsc::{Receiver, Sender};
+
+use crate::hummock::HummockManager;
+use crate::storage::MetaStore;
+use crate::MetaResult;
 
 const STREAM_BUFFER_SIZE: usize = 4;
 
 pub type CompactorManagerRef = Arc<CompactorManager>;
 
+/// Wraps the stream between meta node and compactor node.
+/// Compactor node will re-establish the stream when the previous one fails.
 pub struct Compactor {
     context_id: HummockContextId,
-    sender: Sender<Result<SubscribeCompactTasksResponse>>,
+    sender: Sender<MetaResult<SubscribeCompactTasksResponse>>,
+    max_concurrent_task_number: u64,
 }
 
 impl Compactor {
-    pub async fn send_task(
-        &self,
-        compact_task: Option<CompactTask>,
-        vacuum_task: Option<VacuumTask>,
-    ) -> Result<()> {
-        // TODO: compactor node backpressure
+    pub async fn send_task(&self, task: Task) -> MetaResult<()> {
         self.sender
-            .send(Ok(SubscribeCompactTasksResponse {
-                compact_task,
-                vacuum_task,
-            }))
+            .send(Ok(SubscribeCompactTasksResponse { task: Some(task) }))
             .await
-            .map_err(|e| ErrorCode::InternalError(e.to_error_str()).into())
+            .map_err(|e| anyhow::anyhow!(e).into())
     }
 
     pub fn context_id(&self) -> HummockContextId {
         self.context_id
+    }
+
+    pub fn max_concurrent_task_number(&self) -> u64 {
+        self.max_concurrent_task_number
     }
 }
 
@@ -94,6 +98,36 @@ impl CompactorManager {
         }
     }
 
+    pub async fn next_idle_compactor<S>(
+        &self,
+        hummock_manager: &HummockManager<S>,
+    ) -> Option<Arc<Compactor>>
+    where
+        S: MetaStore,
+    {
+        let mut visited = HashSet::new();
+        loop {
+            match self.next_compactor() {
+                None => {
+                    return None;
+                }
+                Some(compactor) => {
+                    if visited.contains(&compactor.context_id()) {
+                        return None;
+                    }
+                    if hummock_manager
+                        .get_assigned_tasks_number(compactor.context_id())
+                        .await
+                        <= compactor.max_concurrent_task_number()
+                    {
+                        return Some(compactor);
+                    }
+                    visited.insert(compactor.context_id());
+                }
+            }
+        }
+    }
+
     /// Gets next compactor to assign task.
     pub fn next_compactor(&self) -> Option<Arc<Compactor>> {
         let mut guard = self.inner.write();
@@ -120,20 +154,22 @@ impl CompactorManager {
     pub fn add_compactor(
         &self,
         context_id: HummockContextId,
-    ) -> Receiver<Result<SubscribeCompactTasksResponse>> {
+        max_concurrent_task_number: u64,
+    ) -> Receiver<MetaResult<SubscribeCompactTasksResponse>> {
         let (tx, rx) = tokio::sync::mpsc::channel(STREAM_BUFFER_SIZE);
         let mut guard = self.inner.write();
         guard.compactors.retain(|c| c.context_id != context_id);
         guard.compactors.push(Arc::new(Compactor {
             context_id,
             sender: tx,
+            max_concurrent_task_number,
         }));
-        tracing::info!("Added compactor {}", context_id);
+        tracing::info!("Added compactor session {}", context_id);
         rx
     }
 
     pub fn remove_compactor(&self, context_id: HummockContextId) {
-        tracing::info!("Removed compactor {}", context_id);
+        tracing::info!("Removed compactor session {}", context_id);
         self.inner
             .write()
             .compactors
@@ -145,38 +181,39 @@ impl CompactorManager {
 mod tests {
     use std::collections::HashMap;
 
+    use risingwave_common::try_match_expand;
     use risingwave_hummock_sdk::compaction_group::StaticCompactionGroupId;
+    use risingwave_pb::hummock::subscribe_compact_tasks_response::Task;
     use risingwave_pb::hummock::CompactTask;
     use tokio::sync::mpsc::error::TryRecvError;
 
+    use crate::hummock::compaction::compaction_config::CompactionConfigBuilder;
     use crate::hummock::test_utils::{
-        generate_test_tables, register_sstable_infos_to_compaction_group, setup_compute_env,
+        commit_from_meta_node, generate_test_tables, get_sst_ids,
+        register_sstable_infos_to_compaction_group, setup_compute_env_with_config,
         to_local_sstable_info,
     };
     use crate::hummock::{CompactorManager, HummockManager};
     use crate::storage::MetaStore;
 
-    async fn add_compact_task<S>(
-        hummock_manager_ref: &HummockManager<S>,
-        _context_id: u32,
-        epoch: u64,
-    ) where
+    async fn add_compact_task<S>(hummock_manager: &HummockManager<S>, _context_id: u32, epoch: u64)
+    where
         S: MetaStore,
     {
-        let original_tables = generate_test_tables(
-            epoch,
-            vec![hummock_manager_ref.get_new_table_id().await.unwrap()],
-        );
+        let original_tables = generate_test_tables(epoch, get_sst_ids(hummock_manager, 2).await);
         register_sstable_infos_to_compaction_group(
-            hummock_manager_ref.compaction_group_manager_ref_for_test(),
+            hummock_manager.compaction_group_manager_ref_for_test(),
             &original_tables,
             StaticCompactionGroupId::StateDefault.into(),
         )
         .await;
-        hummock_manager_ref
-            .commit_epoch(epoch, to_local_sstable_info(&original_tables))
-            .await
-            .unwrap();
+        commit_from_meta_node(
+            hummock_manager,
+            epoch,
+            to_local_sstable_info(&original_tables),
+        )
+        .await
+        .unwrap();
     }
 
     fn dummy_compact_task(task_id: u64) -> CompactTask {
@@ -196,6 +233,7 @@ mod tests {
             compaction_filter_mask: 0,
             table_options: HashMap::default(),
             current_epoch_time: 0,
+            target_sub_level_id: 0,
         }
     }
 
@@ -205,9 +243,9 @@ mod tests {
         // No compactors by default.
         assert_eq!(compactor_manager.inner.read().compactors.len(), 0);
 
-        let mut receiver = compactor_manager.add_compactor(1);
+        let mut receiver = compactor_manager.add_compactor(1, u64::MAX);
         assert_eq!(compactor_manager.inner.read().compactors.len(), 1);
-        let _receiver_2 = compactor_manager.add_compactor(2);
+        let _receiver_2 = compactor_manager.add_compactor(2, u64::MAX);
         assert_eq!(compactor_manager.inner.read().compactors.len(), 2);
         compactor_manager.remove_compactor(2);
         assert_eq!(compactor_manager.inner.read().compactors.len(), 1);
@@ -226,12 +264,14 @@ mod tests {
             .first()
             .unwrap()
             .clone();
-        compactor.send_task(Some(task.clone()), None).await.unwrap();
+        compactor
+            .send_task(Task::CompactTask(task.clone()))
+            .await
+            .unwrap();
         // Receive a compact task.
-        assert_eq!(
-            receiver.try_recv().unwrap().unwrap().compact_task.unwrap(),
-            task
-        );
+        let received_task = receiver.try_recv().unwrap().unwrap().task.unwrap();
+        let received_compact_task = try_match_expand!(received_task, Task::CompactTask).unwrap();
+        assert_eq!(received_compact_task, task);
 
         compactor_manager.remove_compactor(compactor.context_id);
         assert_eq!(compactor_manager.inner.read().compactors.len(), 0);
@@ -244,7 +284,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_next_compactor() {
-        let (_, hummock_manager, _, worker_node) = setup_compute_env(80).await;
+        let config = CompactionConfigBuilder::new()
+            .level0_tier_compact_file_number(1)
+            .max_bytes_for_level_base(1)
+            .build();
+        let (_, hummock_manager, _, worker_node) = setup_compute_env_with_config(80, config).await;
         let context_id = worker_node.id;
         let compactor_manager = CompactorManager::new();
         add_compact_task(hummock_manager.as_ref(), context_id, 1).await;
@@ -253,7 +297,7 @@ mod tests {
         assert!(compactor_manager.next_compactor().is_none());
 
         // Add a compactor.
-        let mut receiver = compactor_manager.add_compactor(context_id);
+        let mut receiver = compactor_manager.add_compactor(context_id, u64::MAX);
         assert_eq!(compactor_manager.inner.read().compactors.len(), 1);
         let compactor = compactor_manager.next_compactor().unwrap();
         // No compact task.
@@ -267,12 +311,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        compactor.send_task(Some(task.clone()), None).await.unwrap();
+        compactor
+            .send_task(Task::CompactTask(task.clone()))
+            .await
+            .unwrap();
+
         // Get a compact task.
-        assert_eq!(
-            receiver.try_recv().unwrap().unwrap().compact_task.unwrap(),
-            task
-        );
+        let received_task = receiver.try_recv().unwrap().unwrap().task.unwrap();
+        let received_compact_task = try_match_expand!(received_task, Task::CompactTask).unwrap();
+        assert_eq!(received_compact_task, task);
 
         compactor_manager.remove_compactor(compactor.context_id());
         assert_eq!(compactor_manager.inner.read().compactors.len(), 0);
@@ -284,7 +331,7 @@ mod tests {
         let compactor_manager = CompactorManager::new();
         let mut receivers = vec![];
         for context_id in 0..5 {
-            receivers.push(compactor_manager.add_compactor(context_id));
+            receivers.push(compactor_manager.add_compactor(context_id, u64::MAX));
         }
         assert_eq!(compactor_manager.inner.read().compactors.len(), 5);
         for i in 0..receivers.len() * 3 {

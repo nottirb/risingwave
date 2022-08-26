@@ -11,9 +11,11 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+use std::collections::HashMap;
 use std::fmt;
 
-use risingwave_common::catalog::{DatabaseId, Schema, SchemaId};
+use risingwave_common::catalog::Schema;
+use risingwave_common::config::constant::hummock::PROPERTIES_RETAINTION_SECOND_KEY;
 use risingwave_common::util::sort_util::OrderType;
 use risingwave_pb::stream_plan::stream_node::NodeBody;
 use risingwave_pb::stream_plan::DynamicFilterNode;
@@ -23,7 +25,7 @@ use crate::catalog::TableCatalog;
 use crate::expr::Expr;
 use crate::optimizer::plan_node::{PlanBase, PlanTreeNodeBinary, ToStreamProst};
 use crate::optimizer::PlanRef;
-use crate::utils::{Condition, ConditionVerboseDisplay};
+use crate::utils::{Condition, ConditionDisplay};
 
 #[derive(Clone, Debug)]
 pub struct StreamDynamicFilter {
@@ -42,7 +44,8 @@ impl StreamDynamicFilter {
         let base = PlanBase::new_stream(
             left.ctx(),
             left.schema().clone(),
-            left.pk_indices().to_vec(),
+            left.logical_pk().to_vec(),
+            left.functional_dependency().clone(),
             left.distribution().clone(),
             false, /* we can have a new abstraction for append only and monotonically increasing
                     * in the future */
@@ -59,22 +62,17 @@ impl StreamDynamicFilter {
 
 impl fmt::Display for StreamDynamicFilter {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let verbose = self.base.ctx.is_explain_verbose();
-        if verbose {
-            let mut concat_schema = self.left().schema().fields.clone();
-            concat_schema.extend(self.right().schema().fields.clone());
-            let concat_schema = Schema::new(concat_schema);
-            write!(
-                f,
-                "StreamDynamicFilter {{ predicate: {} }}",
-                ConditionVerboseDisplay {
-                    condition: &self.predicate,
-                    input_schema: &concat_schema
-                }
-            )
-        } else {
-            write!(f, "StreamDynamicFilter {{ predicate: {} }}", self.predicate)
-        }
+        let mut concat_schema = self.left().schema().fields.clone();
+        concat_schema.extend(self.right().schema().fields.clone());
+        let concat_schema = Schema::new(concat_schema);
+        write!(
+            f,
+            "StreamDynamicFilter {{ predicate: {} }}",
+            ConditionDisplay {
+                condition: &self.predicate,
+                input_schema: &concat_schema
+            }
+        )
     }
 }
 
@@ -103,16 +101,11 @@ impl ToStreamProst for StreamDynamicFilter {
                 .as_expr_unless_true()
                 .map(|x| x.to_expr_proto()),
             left_table: Some(
-                infer_left_internal_table_catalog(self.clone().into(), self.left_index).to_prost(
-                    SchemaId::placeholder() as u32,
-                    DatabaseId::placeholder() as u32,
-                ),
+                infer_left_internal_table_catalog(self.clone().into(), self.left_index)
+                    .to_state_table_prost(),
             ),
             right_table: Some(
-                infer_right_internal_table_catalog(self.right.clone()).to_prost(
-                    SchemaId::placeholder() as u32,
-                    DatabaseId::placeholder() as u32,
-                ),
+                infer_right_internal_table_catalog(self.right.clone()).to_state_table_prost(),
             ),
         })
     }
@@ -128,9 +121,23 @@ fn infer_left_internal_table_catalog(input: PlanRef, left_key_index: usize) -> T
     // The pk of dynamic filter internal table should be left_key + input_pk.
     let mut pk_indices = vec![left_key_index];
     // TODO(yuhao): dedup the dist key and pk.
-    pk_indices.extend(&base.pk_indices);
+    pk_indices.extend(&base.logical_pk);
 
     let mut internal_table_catalog_builder = TableCatalogBuilder::new();
+    if !base.ctx.inner().with_properties.is_empty() {
+        let properties: HashMap<_, _> = base
+            .ctx
+            .inner()
+            .with_properties
+            .iter()
+            .filter(|(key, _)| key.as_str() == PROPERTIES_RETAINTION_SECOND_KEY)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+
+        if !properties.is_empty() {
+            internal_table_catalog_builder.add_properties(properties);
+        }
+    }
 
     schema.fields().iter().for_each(|field| {
         internal_table_catalog_builder.add_column(field);
@@ -139,6 +146,21 @@ fn infer_left_internal_table_catalog(input: PlanRef, left_key_index: usize) -> T
     pk_indices.iter().for_each(|idx| {
         internal_table_catalog_builder.add_order_column(*idx, OrderType::Ascending)
     });
+
+    if !base.ctx.inner().with_properties.is_empty() {
+        let properties: HashMap<_, _> = base
+            .ctx
+            .inner()
+            .with_properties
+            .iter()
+            .filter(|(key, _)| key.as_str() == PROPERTIES_RETAINTION_SECOND_KEY)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+
+        if !properties.is_empty() {
+            internal_table_catalog_builder.add_properties(properties);
+        }
+    }
 
     internal_table_catalog_builder.build(dist_keys, append_only)
 }

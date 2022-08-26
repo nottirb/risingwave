@@ -21,7 +21,9 @@ use risingwave_common::array::{Array, DataChunk, Row, RowRef};
 use risingwave_common::buffer::BitmapBuilder;
 use risingwave_common::catalog::{ColumnDesc, Field, Schema};
 use risingwave_common::error::{internal_error, ErrorCode, Result, RwError};
-use risingwave_common::types::{DataType, ParallelUnitId, ScalarImpl, ToOwnedDatum, VirtualNode};
+use risingwave_common::types::{
+    DataType, Datum, ParallelUnitId, ScalarImpl, ToOwnedDatum, VirtualNode, VnodeMapping,
+};
 use risingwave_common::util::chunk_coalesce::{DataChunkBuilder, SlicedDataChunk};
 use risingwave_common::util::scan_range::ScanRange;
 use risingwave_common::util::worker_util::get_pu_to_worker_mapping;
@@ -40,7 +42,7 @@ use risingwave_pb::batch_plan::{
 };
 use risingwave_pb::common::WorkerNode;
 use risingwave_pb::expr::expr_node::Type;
-use risingwave_pb::plan_common::CellBasedTableDesc;
+use risingwave_pb::plan_common::StorageTableDesc;
 use uuid::Uuid;
 
 use crate::executor::join::{
@@ -54,10 +56,33 @@ use crate::task::{BatchTaskContext, TaskId};
 // Build side = "Left side", where we go through its rows one by one
 // Probe side = "Right side", where we find matches for each row from the build side
 
+struct DummyExecutor {
+    schema: Schema,
+}
+
+impl Executor for DummyExecutor {
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn identity(&self) -> &str {
+        "dummy"
+    }
+
+    fn execute(self: Box<Self>) -> BoxedDataChunkStream {
+        DummyExecutor::do_nothing()
+    }
+}
+
+impl DummyExecutor {
+    #[try_stream(boxed, ok = DataChunk, error = RwError)]
+    async fn do_nothing() {}
+}
+
 /// Probe side source for the `LookupJoinExecutor`
 pub struct ProbeSideSource<C> {
-    table_desc: CellBasedTableDesc,
-    vnode_mapping: Vec<ParallelUnitId>,
+    table_desc: StorageTableDesc,
+    vnode_mapping: VnodeMapping,
     build_side_key_types: Vec<DataType>,
     probe_side_schema: Schema,
     probe_side_column_ids: Vec<i32>,
@@ -74,7 +99,7 @@ pub struct ProbeSideSource<C> {
 pub trait ProbeSideSourceBuilder: Send {
     fn reset(&mut self);
 
-    fn add_scan_range(&mut self, key_scalar_impls: &[ScalarImpl]) -> Result<()>;
+    fn add_scan_range(&mut self, key_datums: &[Datum]) -> Result<()>;
 
     async fn build_source(&self) -> Result<BoxedExecutor>;
 }
@@ -92,7 +117,7 @@ impl<C: BatchTaskContext> ProbeSideSource<C> {
             .table_desc
             .order_key
             .iter()
-            .map(|col| self.table_desc.columns[col.index as usize].column_id as usize)
+            .map(|col| col.index as _)
             .collect_vec();
 
         let virtual_node = scan_range.try_compute_vnode(&dist_keys, &pk_indices);
@@ -124,7 +149,7 @@ impl<C: BatchTaskContext> ProbeSideSource<C> {
     /// Creates the `ProstExchangeSource` using the given `id`.
     fn build_prost_exchange_source(&self, id: &ParallelUnitId) -> Result<ProstExchangeSource> {
         let worker = self.pu_to_worker_mapping.get(id).ok_or_else(|| {
-            internal_error("No worker node found for hte given parallel unit id.")
+            internal_error("No worker node found for the given parallel unit id.")
         })?;
 
         let local_execute_plan = LocalExecutePlan {
@@ -144,7 +169,14 @@ impl<C: BatchTaskContext> ProbeSideSource<C> {
 
         let prost_exchange_source = ProstExchangeSource {
             task_output_id: Some(TaskOutputId {
-                task_id: Some(ProstTaskId::default()),
+                task_id: Some(ProstTaskId {
+                    // FIXME: We should replace this random generated uuid to current query_id for
+                    // better dashboard. However, due to the lack of info of
+                    // stage_id and task_id, we can not do it now. Now just make sure it will not
+                    // conflict.
+                    query_id: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                }),
                 output_id: 0,
             }),
             host: Some(worker.host.as_ref().unwrap().clone()),
@@ -163,27 +195,24 @@ impl<C: BatchTaskContext> ProbeSideSourceBuilder for ProbeSideSource<C> {
 
     /// Adds the scan range made from the given `kwy_scalar_impls` into the parallel unit id
     /// hash map, along with the scan range's virtual node.
-    fn add_scan_range(&mut self, key_scalar_impls: &[ScalarImpl]) -> Result<()> {
+    fn add_scan_range(&mut self, key_datums: &[Datum]) -> Result<()> {
         let mut scan_range = ScanRange::full_table_scan();
 
-        for ((scalar_impl, build_type), probe_type) in key_scalar_impls
+        for ((datum, build_type), probe_type) in key_datums
             .iter()
             .zip_eq(self.build_side_key_types.iter())
             .zip_eq(self.probe_side_key_types.iter())
         {
             let scalar_impl = if probe_type == build_type {
-                scalar_impl.clone()
+                datum.as_ref().unwrap().clone()
             } else {
                 let cast_expr = new_unary_expr(
                     Type::Cast,
                     probe_type.clone(),
-                    Box::new(LiteralExpression::new(
-                        build_type.clone(),
-                        Some(scalar_impl.clone()),
-                    )),
+                    Box::new(LiteralExpression::new(build_type.clone(), datum.clone())),
                 )?;
 
-                let datum = cast_expr.eval_row(&Row(vec![]))?;
+                let datum = cast_expr.eval_row(Row::empty())?;
                 datum.unwrap()
             };
 
@@ -208,6 +237,12 @@ impl<C: BatchTaskContext> ProbeSideSourceBuilder for ProbeSideSource<C> {
         let mut sources = vec![];
         for id in self.pu_to_scan_range_mapping.keys() {
             sources.push(self.build_prost_exchange_source(id)?);
+        }
+
+        if sources.is_empty() {
+            return Ok(Box::new(DummyExecutor {
+                schema: Schema::default(),
+            }));
         }
 
         let exchange_node = NodeBody::Exchange(ExchangeNode {
@@ -297,7 +332,7 @@ impl<P: 'static + ProbeSideSourceBuilder> LookupJoinExecutor<P> {
             let groups = build_chunk.rows().into_group_map_by(|row| {
                 self.build_side_key_idxs
                     .iter()
-                    .map(|&idx| row.value_at(idx).to_owned_datum().unwrap())
+                    .map(|&idx| row.value_at(idx).to_owned_datum())
                     .collect_vec()
             });
 
@@ -313,7 +348,9 @@ impl<P: 'static + ProbeSideSourceBuilder> LookupJoinExecutor<P> {
 
             self.probe_side_source.reset();
             for row_key in &row_keys {
-                self.probe_side_source.add_scan_range(row_key)?;
+                if row_key.iter().all(|datum| datum.is_some()) {
+                    self.probe_side_source.add_scan_range(row_key)?;
+                }
             }
 
             let probe_child = self.probe_side_source.build_source().await?;
@@ -342,7 +379,7 @@ impl<P: 'static + ProbeSideSourceBuilder> LookupJoinExecutor<P> {
                 for (i, row_refs) in all_row_refs.iter().enumerate() {
                     // We filter the probe side chunk to only have the rows whose key datums
                     // matches the key datums of the row_refs we're currently looking at
-                    let expr = self.create_expression(&row_keys[i], 0);
+                    let expr = self.create_expression(&row_keys[i]);
                     let chunk = if let Some(chunk) = probe_side_chunk.as_ref() {
                         let vis = expr.eval(chunk)?;
                         let chunk = chunk.with_visibility(vis.as_bool().iter().collect());
@@ -442,13 +479,26 @@ impl<P: 'static + ProbeSideSourceBuilder> LookupJoinExecutor<P> {
     }
 
     /// Creates an expression that returns true if the value of the datums in all the probe side
-    /// key columns match the given `key_scalar_impls`.
-    fn create_expression(&self, key_scalar_impls: &[ScalarImpl], i: usize) -> BoxedExpression {
-        assert!(i < key_scalar_impls.len());
+    /// key columns match the given `key_datums`. If any of the `key_datums` are none, then
+    /// return an expression that always evaluates to false.
+    fn create_expression(&self, key_datums: &[Datum]) -> BoxedExpression {
+        if key_datums.iter().all(|datum| datum.is_some()) {
+            self.create_expression_helper(key_datums, 0)
+        } else {
+            Box::new(LiteralExpression::new(
+                DataType::Boolean,
+                Some(ScalarImpl::Bool(false)),
+            ))
+        }
+    }
+
+    /// Recursively builds the expression
+    fn create_expression_helper(&self, key_datums: &[Datum], i: usize) -> BoxedExpression {
+        assert!(i < key_datums.len());
 
         let literal = Box::new(LiteralExpression::new(
             self.build_side_data_types[self.build_side_key_idxs[i]].clone(),
-            Some(key_scalar_impls[i].clone()),
+            key_datums[i].clone(),
         ));
 
         let input_ref = Box::new(InputRefExpression::new(
@@ -458,14 +508,14 @@ impl<P: 'static + ProbeSideSourceBuilder> LookupJoinExecutor<P> {
 
         let equal = new_binary_expr(Type::Equal, DataType::Boolean, literal, input_ref);
 
-        if i + 1 == key_scalar_impls.len() {
+        if i + 1 == key_datums.len() {
             equal
         } else {
             new_nullable_binary_expr(
                 Type::And,
                 DataType::Boolean,
                 equal,
-                self.create_expression(key_scalar_impls, i + 1),
+                self.create_expression_helper(key_datums, i + 1),
             )
         }
     }
@@ -535,9 +585,9 @@ pub struct LookupJoinExecutorBuilder {}
 impl BoxedExecutorBuilder for LookupJoinExecutorBuilder {
     async fn new_boxed_executor<C: BatchTaskContext>(
         source: &ExecutorBuilder<C>,
-        mut inputs: Vec<BoxedExecutor>,
+        inputs: Vec<BoxedExecutor>,
     ) -> Result<BoxedExecutor> {
-        ensure!(inputs.len() == 1, "LookupJoinExecutor should have 1 child!");
+        let [build_child]: [_; 1] = inputs.try_into().unwrap();
 
         let lookup_join_node = try_match_expand!(
             source.plan_node().get_node_body().unwrap(),
@@ -556,7 +606,6 @@ impl BoxedExecutorBuilder for LookupJoinExecutorBuilder {
             .map(|&x| x as usize)
             .collect();
 
-        let build_child = inputs.remove(0);
         let build_side_data_types = build_child.schema().data_types();
 
         let table_desc = lookup_join_node.get_probe_side_table_desc()?;
@@ -565,7 +614,14 @@ impl BoxedExecutorBuilder for LookupJoinExecutorBuilder {
         let probe_side_schema = Schema {
             fields: probe_side_column_ids
                 .iter()
-                .map(|&i| Field::from(&ColumnDesc::from(table_desc.columns[i as usize].clone())))
+                .map(|&id| {
+                    let column = table_desc
+                        .columns
+                        .iter()
+                        .find(|c| c.column_id == id)
+                        .unwrap();
+                    Field::from(&ColumnDesc::from(column))
+                })
                 .collect_vec(),
         };
 
@@ -648,9 +704,6 @@ impl BoxedExecutorBuilder for LookupJoinExecutorBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BinaryHeap;
-    use std::sync::Arc;
-
     use risingwave_common::array::{DataChunk, DataChunkTestExt};
     use risingwave_common::catalog::{Field, Schema};
     use risingwave_common::types::{DataType, ScalarImpl};
@@ -690,7 +743,8 @@ mod tests {
             "i f
              2 5.5
              5 4.1
-             5 9.1",
+             5 9.1
+             . .",
         ));
 
         Box::new(executor)
@@ -748,16 +802,8 @@ mod tests {
 
         Box::new(OrderByExecutor::new(
             child,
-            vec![],
-            vec![],
-            vec![],
-            BinaryHeap::new(),
-            Arc::new(order_pairs),
-            vec![],
-            false,
-            false,
-            "OrderByExecutor".to_string(),
-            2048,
+            order_pairs,
+            "OrderByExecutor".into(),
         ))
     }
 
@@ -800,7 +846,8 @@ mod tests {
              5 4.1 5 3.7
              5 4.1 5 2.3
              5 9.1 5 3.7
-             5 9.1 5 2.3",
+             5 9.1 5 2.3
+             . .   . .",
         );
 
         do_test(JoinType::LeftOuter, None, expected).await;
@@ -824,7 +871,8 @@ mod tests {
     async fn test_left_anti_join() {
         let expected = DataChunk::from_pretty(
             "i f
-             3 3.9",
+             3 3.9
+             . .",
         );
 
         do_test(JoinType::LeftAnti, None, expected).await;
@@ -861,7 +909,8 @@ mod tests {
              2 8.4 2 5.5
              3 3.9 . .
              5 4.1 . .
-             5 9.1 . .",
+             5 9.1 . .
+             . .   . .",
         );
 
         let condition = Some(new_binary_expr(
@@ -905,7 +954,8 @@ mod tests {
             "i f
             3 3.9
             5 4.1
-            5 9.1",
+            5 9.1
+            . .",
         );
 
         let condition = Some(new_binary_expr(

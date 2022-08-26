@@ -17,10 +17,12 @@ use std::sync::Arc;
 use pgwire::pg_response::PgResponse;
 use pgwire::pg_response::StatementType::{ABORT, START_TRANSACTION};
 use risingwave_common::error::{ErrorCode, Result};
-use risingwave_sqlparser::ast::{DropStatement, ObjectType, Statement, WithProperties};
+use risingwave_sqlparser::ast::{DropStatement, ObjectType, Statement};
 
+use self::util::handle_with_properties;
 use crate::session::{OptimizerContext, SessionImpl};
 
+pub mod alter_user;
 mod create_database;
 pub mod create_index;
 pub mod create_mv;
@@ -46,7 +48,7 @@ pub mod privilege;
 pub mod query;
 mod show;
 pub mod util;
-mod variable;
+pub mod variable;
 
 pub async fn handle(
     session: Arc<SessionImpl>,
@@ -54,14 +56,26 @@ pub async fn handle(
     sql: &str,
     format: bool,
 ) -> Result<PgResponse> {
-    let context = OptimizerContext::new(session.clone(), Arc::from(sql));
+    let mut context = OptimizerContext::new(session.clone(), Arc::from(sql));
     match stmt {
         Statement::Explain {
             statement,
-            verbose,
-            trace,
-            ..
-        } => explain::handle_explain(context, *statement, verbose, trace),
+            describe_alias: _,
+            analyze,
+            options,
+        } => {
+            match statement.as_ref() {
+                Statement::CreateTable { with_options, .. }
+                | Statement::CreateView { with_options, .. } => {
+                    context.with_properties =
+                        handle_with_properties("explain create_table", with_options.clone())?;
+                }
+
+                _ => {}
+            }
+
+            explain::handle_explain(context, *statement, options, analyze)
+        }
         Statement::CreateSource {
             is_materialized,
             stmt,
@@ -71,8 +85,12 @@ pub async fn handle(
             name,
             columns,
             with_options,
+            constraints,
             ..
-        } => create_table::handle_create_table(context, name, columns, with_options).await,
+        } => {
+            context.with_properties = handle_with_properties("handle_create_table", with_options)?;
+            create_table::handle_create_table(context, name, columns, constraints).await
+        }
         Statement::CreateDatabase {
             db_name,
             if_not_exists,
@@ -84,6 +102,7 @@ pub async fn handle(
             ..
         } => create_schema::handle_create_schema(context, schema_name, if_not_exists).await,
         Statement::CreateUser(stmt) => create_user::handle_create_user(context, stmt).await,
+        Statement::AlterUser(stmt) => alter_user::handle_alter_user(context, stmt).await,
         Statement::Grant { .. } => handle_privilege::handle_grant_privilege(context, stmt).await,
         Statement::Revoke { .. } => handle_privilege::handle_revoke_privilege(context, stmt).await,
         Statement::Describe { name } => describe::handle_describe(context, name),
@@ -131,7 +150,10 @@ pub async fn handle(
             query,
             with_options,
             ..
-        } => create_mv::handle_create_mv(context, name, query, WithProperties(with_options)).await,
+        } => {
+            context.with_properties = handle_with_properties("handle_create_mv", with_options)?;
+            create_mv::handle_create_mv(context, name, query).await
+        }
         Statement::Flush => flush::handle_flush(context).await,
         Statement::SetVariable {
             local: _,
@@ -143,6 +165,7 @@ pub async fn handle(
             name,
             table_name,
             columns,
+            include,
             unique,
             if_not_exists,
         } => {
@@ -158,7 +181,8 @@ pub async fn handle(
                 )
                 .into());
             }
-            create_index::handle_create_index(context, name, table_name, columns.to_vec()).await
+            create_index::handle_create_index(context, name, table_name, columns.to_vec(), include)
+                .await
         }
         // Ignore `StartTransaction` and `Abort` temporarily.Its not final implementation.
         // 1. Fully support transaction is too hard and gives few benefits to us.

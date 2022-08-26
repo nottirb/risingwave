@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::assert_matches::assert_matches;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
@@ -63,7 +62,6 @@ impl Binder {
         }
 
         let table = self.bind_vec_table_with_joins(vec![table])?.unwrap();
-        assert_matches!(table, Relation::BaseTable(_));
 
         let selection = selection.map(|expr| self.bind_expr(expr)).transpose()?;
 

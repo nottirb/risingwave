@@ -31,7 +31,12 @@ impl StateStore for PanicStateStore {
 
     define_state_store_associated_type!();
 
-    fn get<'a>(&'a self, _key: &'a [u8], _read_options: ReadOptions) -> Self::GetFuture<'_> {
+    fn get<'a>(
+        &'a self,
+        _key: &'a [u8],
+        _check_bloom_filter: bool,
+        _read_options: ReadOptions,
+    ) -> Self::GetFuture<'_> {
         async move {
             panic!("should not read from the state store!");
         }
@@ -39,6 +44,7 @@ impl StateStore for PanicStateStore {
 
     fn scan<R, B>(
         &self,
+        _prefix_hint: Option<Vec<u8>>,
         _key_range: R,
         _limit: Option<usize>,
         _read_options: ReadOptions,
@@ -87,7 +93,12 @@ impl StateStore for PanicStateStore {
         }
     }
 
-    fn iter<R, B>(&self, _key_range: R, _read_options: ReadOptions) -> Self::IterFuture<'_, R, B>
+    fn iter<R, B>(
+        &self,
+        _prefix_hint: Option<Vec<u8>>,
+        _key_range: R,
+        _read_options: ReadOptions,
+    ) -> Self::IterFuture<'_, R, B>
     where
         R: RangeBounds<B> + Send,
         B: AsRef<[u8]> + Send,
@@ -117,7 +128,7 @@ impl StateStore for PanicStateStore {
         }
     }
 
-    fn sync(&self, _epoch: Option<u64>) -> Self::SyncFuture<'_> {
+    fn sync(&self, _epoch: u64) -> Self::SyncFuture<'_> {
         async move {
             panic!("should not sync from the panic state store!");
         }

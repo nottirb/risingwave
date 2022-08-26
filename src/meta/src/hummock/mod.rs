@@ -17,9 +17,9 @@ pub mod compaction_group;
 mod compaction_scheduler;
 mod compactor_manager;
 pub mod error;
-mod hummock_manager;
-#[cfg(test)]
-mod hummock_manager_tests;
+mod manager;
+pub use manager::*;
+
 mod level_handler;
 mod metrics_utils;
 #[cfg(any(test, feature = "test"))]
@@ -35,9 +35,9 @@ use std::time::Duration;
 
 pub use compaction_scheduler::CompactionScheduler;
 pub use compactor_manager::*;
-pub use hummock_manager::*;
 #[cfg(any(test, feature = "test"))]
 pub use mock_hummock_meta_client::MockHummockMetaClient;
+use risingwave_common::util::sync_point::on_sync_point;
 use tokio::sync::oneshot::Sender;
 use tokio::task::JoinHandle;
 use tokio_retry::strategy::{jitter, ExponentialBackoff};
@@ -47,21 +47,26 @@ use crate::hummock::compaction_scheduler::CompactionSchedulerRef;
 use crate::hummock::utils::RetryableError;
 use crate::manager::{LocalNotification, NotificationManagerRef};
 use crate::storage::MetaStore;
+use crate::MetaOpts;
 
 /// Start hummock's asynchronous tasks.
 pub async fn start_hummock_workers<S>(
     hummock_manager: HummockManagerRef<S>,
     compactor_manager: CompactorManagerRef,
-    vacuum_trigger: Arc<VacuumTrigger<S>>,
+    vacuum_manager: Arc<VacuumManager<S>>,
     notification_manager: NotificationManagerRef,
     compaction_scheduler: CompactionSchedulerRef<S>,
+    meta_opts: &MetaOpts,
 ) -> Vec<(JoinHandle<()>, Sender<()>)>
 where
     S: MetaStore,
 {
     vec![
         start_compaction_scheduler(compaction_scheduler),
-        start_vacuum_scheduler(vacuum_trigger),
+        start_vacuum_scheduler(
+            vacuum_manager.clone(),
+            Duration::from_secs(meta_opts.vacuum_interval_sec),
+        ),
         subscribe_cluster_membership_change(
             hummock_manager,
             compactor_manager,
@@ -139,16 +144,18 @@ where
     (join_handle, shutdown_tx)
 }
 
-/// Vacuum is triggered at this rate.
-const VACUUM_TRIGGER_INTERVAL: Duration = Duration::from_secs(30);
 /// Starts a task to periodically vacuum hummock.
-pub fn start_vacuum_scheduler<S>(vacuum: Arc<VacuumTrigger<S>>) -> (JoinHandle<()>, Sender<()>)
+pub fn start_vacuum_scheduler<S>(
+    vacuum: Arc<VacuumManager<S>>,
+    interval: Duration,
+) -> (JoinHandle<()>, Sender<()>)
 where
     S: MetaStore,
 {
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
     let join_handle = tokio::spawn(async move {
-        let mut min_trigger_interval = tokio::time::interval(VACUUM_TRIGGER_INTERVAL);
+        let mut min_trigger_interval = tokio::time::interval(interval);
+        min_trigger_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 // Wait for interval
@@ -159,12 +166,45 @@ where
                     return;
                 }
             }
-            if let Err(err) = vacuum.vacuum_version_metadata().await {
-                tracing::warn!("Vacuum tracked data error {}", err);
+            // May metadata vacuum and SST vacuum split into two tasks.
+            if let Err(err) = vacuum.vacuum_metadata().await {
+                tracing::warn!("Vacuum metadata error {:#?}", err);
             }
-            // vacuum_orphan_data can be invoked less frequently.
             if let Err(err) = vacuum.vacuum_sst_data().await {
-                tracing::warn!("Vacuum SST data error {}", err);
+                tracing::warn!("Vacuum SST error {:#?}", err);
+            }
+            on_sync_point("AFTER_SCHEDULE_VACUUM").await.unwrap();
+        }
+    });
+    (join_handle, shutdown_tx)
+}
+
+// As we have supported manual full GC in risectl,
+// this auto full GC scheduler is not used for now.
+#[allow(unused)]
+pub fn start_full_gc_scheduler<S>(
+    vacuum: Arc<VacuumManager<S>>,
+    interval: Duration,
+    sst_retention_time: Duration,
+) -> (JoinHandle<()>, Sender<()>)
+where
+    S: MetaStore,
+{
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+    let join_handle = tokio::spawn(async move {
+        let mut min_trigger_interval = tokio::time::interval(interval);
+        min_trigger_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        min_trigger_interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = min_trigger_interval.tick() => {},
+                _ = &mut shutdown_rx => {
+                    tracing::info!("Full GC scheduler is stopped");
+                    return;
+                }
+            }
+            if let Err(err) = vacuum.start_full_gc(sst_retention_time).await {
+                tracing::warn!("Full GC error {:#?}", err);
             }
         }
     });

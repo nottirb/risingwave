@@ -17,14 +17,14 @@ use std::sync::atomic::Ordering;
 use pgwire::pg_field_descriptor::{PgFieldDescriptor, TypeOid};
 use pgwire::pg_response::{PgResponse, StatementType};
 use pgwire::types::Row;
-use risingwave_common::error::Result;
+use risingwave_common::error::{ErrorCode, Result};
 use risingwave_common::session_config::QueryMode;
-use risingwave_sqlparser::ast::Statement;
+use risingwave_sqlparser::ast::{ExplainOptions, ExplainType, Statement};
 
 use super::create_index::gen_create_index_plan;
 use super::create_mv::gen_create_mv_plan;
+use super::create_sink::gen_sink_plan;
 use super::create_table::gen_create_table_plan;
-use super::util::handle_with_properties;
 use crate::binder::Binder;
 use crate::handler::util::force_local_mode;
 use crate::planner::Planner;
@@ -33,12 +33,33 @@ use crate::session::OptimizerContext;
 pub(super) fn handle_explain(
     context: OptimizerContext,
     stmt: Statement,
-    verbose: bool,
-    trace: bool,
+    options: ExplainOptions,
+    analyze: bool,
 ) -> Result<PgResponse> {
+    if analyze {
+        return Err(ErrorCode::NotImplemented("explain analyze".to_string(), 4856.into()).into());
+    }
+    match options.explain_type {
+        ExplainType::Logical => {
+            return Err(
+                ErrorCode::NotImplemented("explain logical".to_string(), 4856.into()).into(),
+            )
+        }
+        ExplainType::Physical => {}
+        ExplainType::DistSQL => {
+            return Err(
+                ErrorCode::NotImplemented("explain distsql".to_string(), 4856.into()).into(),
+            )
+        }
+    };
+
     let session = context.session_ctx.clone();
-    context.explain_verbose.store(verbose, Ordering::Release);
-    context.explain_trace.store(trace, Ordering::Release);
+    context
+        .explain_verbose
+        .store(options.verbose, Ordering::Release);
+    context
+        .explain_trace
+        .store(options.trace, Ordering::Release);
     // bind, plan, optimize, and serialize here
     let mut planner = Planner::new(context.into());
     let plan = match stmt {
@@ -47,48 +68,29 @@ pub(super) fn handle_explain(
             materialized: true,
             query,
             name,
-            with_options,
             ..
-        } => {
-            gen_create_mv_plan(
-                &session,
-                planner.ctx(),
-                query,
-                name,
-                handle_with_properties("explain create_mv", with_options)?,
-            )?
-            .0
-        }
+        } => gen_create_mv_plan(&session, planner.ctx(), query, name)?.0,
+
+        Statement::CreateSink { stmt } => gen_sink_plan(&session, planner.ctx(), stmt)?.0,
 
         Statement::CreateTable {
             name,
             columns,
-            with_options,
+            constraints,
             ..
-        } => {
-            gen_create_table_plan(
-                &session,
-                planner.ctx(),
-                name,
-                columns,
-                handle_with_properties("explain create_table", with_options)?,
-            )?
-            .0
-        }
+        } => gen_create_table_plan(&session, planner.ctx(), name, columns, constraints)?.0,
 
         Statement::CreateIndex {
             name,
             table_name,
             columns,
+            include,
             ..
-        } => gen_create_index_plan(&session, planner.ctx(), name, table_name, columns)?.0,
+        } => gen_create_index_plan(&session, planner.ctx(), name, table_name, columns, include)?.0,
 
         stmt => {
             let bound = {
-                let mut binder = Binder::new(
-                    session.env().catalog_reader().read_guard(),
-                    session.database().to_string(),
-                );
+                let mut binder = Binder::new(&session);
                 binder.bind(stmt)?
             };
 
@@ -100,7 +102,7 @@ pub(super) fn handle_explain(
             let logical = planner.plan(bound)?;
             match query_mode {
                 QueryMode::Local => logical.gen_batch_local_plan()?,
-                QueryMode::Distributed => logical.gen_batch_query_plan()?,
+                QueryMode::Distributed => logical.gen_batch_distributed_plan()?,
             }
         }
     };

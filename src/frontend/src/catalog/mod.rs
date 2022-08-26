@@ -20,13 +20,16 @@ pub(crate) mod catalog_service;
 
 pub(crate) mod column_catalog;
 pub(crate) mod database_catalog;
+pub(crate) mod index_catalog;
 pub(crate) mod pg_catalog;
 pub(crate) mod root_catalog;
 pub(crate) mod schema_catalog;
+pub(crate) mod sink_catalog;
 pub(crate) mod source_catalog;
 pub(crate) mod system_catalog;
 pub(crate) mod table_catalog;
 
+pub use index_catalog::IndexCatalog;
 pub use table_catalog::TableCatalog;
 
 pub(crate) type SourceId = u32;
@@ -72,13 +75,12 @@ pub fn is_row_id_column_name(name: &str) -> bool {
     name.starts_with(ROWID_PREFIX)
 }
 
-pub const TABLE_SOURCE_PK_COLID: ColumnId = ColumnId::new(0);
-
 /// Creates a row ID column (for implicit primary key).
-pub fn row_id_column_desc() -> ColumnDesc {
+pub fn row_id_column_desc(column_id: ColumnId) -> ColumnDesc {
     ColumnDesc {
         data_type: DataType::Int64,
-        column_id: ColumnId::new(0),
+        // We should not assume the first column (i.e., column_id == 0) is `_row_id`.
+        column_id,
         name: row_id_column_name(),
         field_descs: vec![],
         type_name: "".to_string(),

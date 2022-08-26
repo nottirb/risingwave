@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::atomic::AtomicU64;
+
 use prometheus::{
     exponential_buckets, histogram_opts, register_histogram_vec_with_registry,
     register_histogram_with_registry, register_int_gauge_vec_with_registry,
@@ -23,8 +25,11 @@ pub struct MetaMetrics {
 
     /// gRPC latency of meta services
     pub grpc_latency: HistogramVec,
-    /// latency of each barrier
+    /// The duration from barrier injection to commit
+    /// It is the sum of inflight-latency , sync-latency and wait-commit-latency
     pub barrier_latency: Histogram,
+    /// The duration from barrier complete to commit
+    pub barrier_wait_commit_latency: Histogram,
 
     /// latency between each barrier send
     pub barrier_send_latency: Histogram,
@@ -52,6 +57,8 @@ pub struct MetaMetrics {
 
     /// Latency for hummock manager to really process a request after acquire the lock
     pub hummock_manager_real_process_time: HistogramVec,
+
+    pub time_after_last_observation: AtomicU64,
 }
 
 impl MetaMetrics {
@@ -71,6 +78,14 @@ impl MetaMetrics {
             exponential_buckets(0.1, 1.5, 16).unwrap() // max 43s
         );
         let barrier_latency = register_histogram_with_registry!(opts, registry).unwrap();
+
+        let opts = histogram_opts!(
+            "meta_barrier_wait_commit_duration_seconds",
+            "barrier_wait_commit_latency",
+            exponential_buckets(0.1, 1.5, 16).unwrap() // max 43s
+        );
+        let barrier_wait_commit_latency =
+            register_histogram_with_registry!(opts, registry).unwrap();
 
         let opts = histogram_opts!(
             "meta_barrier_send_duration_seconds",
@@ -153,6 +168,7 @@ impl MetaMetrics {
 
             grpc_latency,
             barrier_latency,
+            barrier_wait_commit_latency,
             barrier_send_latency,
             all_barrier_nums,
             in_flight_barrier_nums,
@@ -165,6 +181,7 @@ impl MetaMetrics {
             version_size,
             hummock_manager_lock_time,
             hummock_manager_real_process_time,
+            time_after_last_observation: AtomicU64::new(0),
         }
     }
 

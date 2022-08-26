@@ -15,7 +15,6 @@
 use std::fmt;
 
 use itertools::Itertools;
-use risingwave_common::catalog::FieldVerboseDisplay;
 use risingwave_pb::stream_plan::expand_node::Subset;
 use risingwave_pb::stream_plan::stream_node::NodeBody as ProstStreamNode;
 use risingwave_pb::stream_plan::ExpandNode;
@@ -31,11 +30,20 @@ pub struct StreamExpand {
 
 impl StreamExpand {
     pub fn new(logical: LogicalExpand) -> Self {
+        let dist = match logical.input().distribution() {
+            Distribution::Single => Distribution::Single,
+            Distribution::SomeShard
+            | Distribution::HashShard(_)
+            | Distribution::UpstreamHashShard(_) => Distribution::SomeShard,
+            Distribution::Broadcast => unreachable!(),
+        };
+
         let base = PlanBase::new_stream(
             logical.base.ctx.clone(),
             logical.schema().clone(),
-            logical.base.pk_indices.to_vec(),
-            Distribution::SomeShard,
+            logical.base.logical_pk.to_vec(),
+            logical.functional_dependency().clone(),
+            dist,
             logical.input().append_only(),
         );
         StreamExpand { base, logical }
@@ -43,10 +51,6 @@ impl StreamExpand {
 
     pub fn column_subsets(&self) -> &Vec<Vec<usize>> {
         self.logical.column_subsets()
-    }
-
-    pub fn column_subsets_verbose_display(&self) -> Vec<Vec<FieldVerboseDisplay>> {
-        self.logical.column_subsets_verbose_display()
     }
 }
 

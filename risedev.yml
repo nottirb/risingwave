@@ -26,8 +26,8 @@ risedev:
     # - use: compactor
 
     # If you want to enable metrics, uncomment those two lines.
-    # - use: prometheus
-    # - use: grafana
+    - use: prometheus
+    - use: grafana
 
     # If you want to enable tracing, uncomment the following line.
     # - use: jaeger
@@ -120,6 +120,35 @@ risedev:
       max-idle-secs-to-exit: 1800
     - use: compute-node
     - use: frontend
+
+  playground-test:
+    - use: meta-node
+      enable-dashboard-v2: false
+      unsafe-disable-recovery: true
+      max-idle-secs-to-exit: 1800
+      vacuum-interval-sec: 1
+      collect-gc-watermark-spin-interval-sec: 1
+      min-sst-retention-time-sec: 0
+    - use: compute-node
+    - use: frontend
+    - use: compactor
+
+  playground-3cn:
+    - use: meta-node
+      enable-dashboard-v2: false
+      unsafe-disable-recovery: true
+      max-idle-secs-to-exit: 1800
+    - use: compute-node
+      port: 5687
+      exporter-port: 1222
+    - use: compute-node
+      port: 5688
+      exporter-port: 1223
+    - use: compute-node
+      port: 5689
+      exporter-port: 1224
+    - use: frontend
+    - use: compactor
 
   docker-playground:
     - use: meta-node
@@ -235,16 +264,19 @@ risedev:
       id: compute-node-0
       listen-address: "0.0.0.0"
       address: ${dns-host:rw-compute-0}
+      enable-async-stack-trace: true
 
     - use: compute-node
       id: compute-node-1
       listen-address: "0.0.0.0"
       address: ${dns-host:rw-compute-1}
+      enable-async-stack-trace: true
 
     - use: compute-node
       id: compute-node-2
       listen-address: "0.0.0.0"
       address: ${dns-host:rw-compute-2}
+      enable-async-stack-trace: true
 
     - use: frontend
       id: frontend-node-0
@@ -255,6 +287,8 @@ risedev:
       id: compactor-0
       listen-address: "0.0.0.0"
       address: ${dns-host:rw-source-0}
+      max-concurrent-task-number: 15
+      compaction-worker-threads-number: 15
 
     - use: redpanda
       address: ${dns-host:rw-source-0}
@@ -280,6 +314,7 @@ risedev:
     - use: meta-node
       unsafe-disable-recovery: true
     - use: compute-node
+      enable-tiered-cache: true
     - use: frontend
     - use: compactor
 
@@ -292,13 +327,42 @@ risedev:
     - use: compute-node
       port: 5687
       exporter-port: 1222
+      enable-tiered-cache: true
     - use: compute-node
       port: 5688
       exporter-port: 1223
+      enable-tiered-cache: true
     - use: compute-node
       port: 5689
       exporter-port: 1224
+      enable-tiered-cache: true
     - use: frontend
+    - use: compactor
+
+  ci-3cn-3fe:
+    - use: minio
+    - use: etcd
+      unsafe-no-fsync: true
+    - use: meta-node
+      unsafe-disable-recovery: true
+    - use: compute-node
+      port: 5687
+      exporter-port: 1222
+      enable-tiered-cache: true
+    - use: compute-node
+      port: 5688
+      exporter-port: 1223
+      enable-tiered-cache: true
+    - use: compute-node
+      port: 5689
+      exporter-port: 1224
+      enable-tiered-cache: true
+    - use: frontend
+      port: 4565
+    - use: frontend
+      port: 4566
+    - use: frontend
+      port: 4567
     - use: compactor
 
   ci-kafka:
@@ -314,6 +378,18 @@ risedev:
       persist-data: true
     - use: kafka
       persist-data: true
+
+  ci-redis:
+    - use: minio
+    - use: etcd
+      unsafe-no-fsync: true
+    - use: meta-node
+      unsafe-disable-recovery: true
+    - use: compute-node
+    - use: frontend
+    - use: compactor
+    - use: redis
+
 
 compose:
   risingwave: "ghcr.io/singularity-data/risingwave:latest"
@@ -394,6 +470,12 @@ template:
     # Id of this instance
     id: compute-node-${port}
 
+    # Whether to enable async stack trace for this compute node.
+    enable-async-stack-trace: false
+
+    # If `enable-tiered-cache` is true, hummock will use data directory as file cache.
+    enable-tiered-cache: false
+
     # Minio instances used by this compute node
     provide-minio: "minio*"
 
@@ -445,6 +527,16 @@ template:
 
     # Whether to disable recovery mode
     unsafe-disable-recovery: false
+
+    # Interval of GC stale metadata and SST
+    vacuum-interval-sec: 30
+
+    # The spin interval when collecting global GC watermark in hummock
+    collect-gc-watermark-spin-interval-sec: 5
+
+    # Threshold used by worker node to filter out new SSTs when scanning object store, during full SST GC.
+    # 7 days by default.
+    min-sst-retention-time-sec: 604800
 
   prometheus:
     # Advertise address of Prometheus
@@ -532,6 +624,9 @@ template:
 
     # If `user-managed` is true, this service will be started by user with the above config
     user-managed: false
+
+    # Hint used by meta node
+    max-concurrent-task-number: 15
 
   grafana:
     # Listen address of Grafana
@@ -631,3 +726,14 @@ template:
 
     # Memory limit for Redpanda
     memory: 16G
+
+  # redis service
+  redis:
+    # Id to be picked-up by services
+    id: redis
+
+    # listen port of redis
+    port: 6379
+
+    # address of redis
+    address: "127.0.0.1"

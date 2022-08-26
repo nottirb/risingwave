@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::collections::{HashMap, HashSet};
-use std::fmt;
+use std::fmt::{self, Debug, Display};
 use std::ops::Bound;
 
 use fixedbitset::FixedBitSet;
@@ -21,12 +21,11 @@ use itertools::Itertools;
 use lazy_static::lazy_static;
 use risingwave_common::catalog::Schema;
 use risingwave_common::error::Result;
-use risingwave_common::util::scan_range::ScanRange;
+use risingwave_common::util::scan_range::{is_full_range, ScanRange};
 
 use crate::expr::{
     factorization_expr, fold_boolean_constant, push_down_not, to_conjunctions,
-    try_get_bool_constant, ExprImpl, ExprRewriter, ExprType, ExprVerboseDisplay, ExprVisitor,
-    InputRef,
+    try_get_bool_constant, ExprDisplay, ExprImpl, ExprRewriter, ExprType, ExprVisitor, InputRef,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -240,6 +239,72 @@ impl Condition {
         .unwrap()
     }
 
+    /// Generate range scans from each arm of `OR` clause and merge them.
+    /// Currently, only support equal type range scans.
+    /// Keep in mind that range scans can not overlap, otherwise duplicate rows will occur.
+    fn disjunctions_to_scan_ranges(
+        order_column_ids: &[usize],
+        num_cols: usize,
+        disjunctions: Vec<ExprImpl>,
+    ) -> Result<Option<(Vec<ScanRange>, Self)>> {
+        let disjunctions_result: Result<Vec<(Vec<ScanRange>, Self)>> = disjunctions
+            .into_iter()
+            .map(|x| {
+                Condition {
+                    conjunctions: to_conjunctions(x),
+                }
+                .split_to_scan_ranges(order_column_ids, num_cols)
+            })
+            .collect();
+
+        // If any arm of `OR` clause fails, bail out.
+        let disjunctions_result = disjunctions_result?;
+
+        // If all arms of `OR` clause scan ranges are simply equal condition type, merge all
+        // of them.
+        let all_equal = disjunctions_result
+            .iter()
+            .all(|(scan_ranges, other_condition)| {
+                other_condition.always_true()
+                    && scan_ranges
+                        .iter()
+                        .all(|x| !x.eq_conds.is_empty() && is_full_range(&x.range))
+            });
+
+        if all_equal {
+            // Think about the case (a = 1) or (a = 1 and b = 2).
+            // We should only keep the large one range scan a = 1, because a = 1 overlaps with
+            // (a = 1 and b = 2).
+            let scan_ranges = disjunctions_result
+                .into_iter()
+                .flat_map(|(scan_ranges, _)| scan_ranges)
+                // sort, large one first
+                .sorted_by(|a, b| a.eq_conds.len().cmp(&b.eq_conds.len()))
+                .collect_vec();
+            // Make sure each range never overlaps with others, that's what scan range mean.
+            let mut non_overlap_scan_ranges: Vec<ScanRange> = vec![];
+            for s1 in &scan_ranges {
+                let overlap = non_overlap_scan_ranges.iter().any(|s2| {
+                    #[allow(clippy::disallowed_methods)]
+                    s1.eq_conds
+                        .iter()
+                        .zip(s2.eq_conds.iter())
+                        .all(|(a, b)| a == b)
+                });
+                // If overlap happens, keep the large one and large one always in
+                // `non_overlap_scan_ranges`.
+                // Otherwise, put s1 into `non_overlap_scan_ranges`.
+                if !overlap {
+                    non_overlap_scan_ranges.push(s1.clone());
+                }
+            }
+
+            Ok(Some((non_overlap_scan_ranges, Condition::true_cond())))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// See also [`ScanRange`](risingwave_pb::batch_plan::ScanRange).
     pub fn split_to_scan_ranges(
         self,
@@ -248,6 +313,19 @@ impl Condition {
     ) -> Result<(Vec<ScanRange>, Self)> {
         fn false_cond() -> (Vec<ScanRange>, Condition) {
             (vec![], Condition::false_cond())
+        }
+
+        // It's an OR.
+        if self.conjunctions.len() == 1 {
+            if let Some(disjunctions) = self.conjunctions[0].as_or_disjunctions() {
+                if let Some((scan_ranges, other_condition)) =
+                    Self::disjunctions_to_scan_ranges(order_column_ids, num_cols, disjunctions)?
+                {
+                    return Ok((scan_ranges, other_condition));
+                } else {
+                    return Ok((vec![], self));
+                }
+            }
         }
 
         let mut col_idx_to_pk_idx = vec![None; num_cols];
@@ -463,7 +541,7 @@ impl Condition {
         }
     }
 
-    pub fn visit_expr(&self, visitor: &mut impl ExprVisitor) {
+    pub fn visit_expr(&self, visitor: &mut impl ExprVisitor<()>) {
         self.conjunctions
             .iter()
             .for_each(|expr| visitor.visit_expr(expr))
@@ -520,50 +598,37 @@ impl Condition {
     }
 }
 
-pub struct ConditionVerboseDisplay<'a> {
+pub struct ConditionDisplay<'a> {
     pub condition: &'a Condition,
     pub input_schema: &'a Schema,
 }
 
-impl ConditionVerboseDisplay<'_> {
+impl ConditionDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let that = self.condition;
-        let mut conjunctions = that.conjunctions.iter();
-        if let Some(expr) = conjunctions.next() {
-            write!(
-                f,
-                "{:?}",
-                ExprVerboseDisplay {
-                    expr,
-                    input_schema: self.input_schema
-                }
-            )?;
-        }
-        if that.always_true() {
-            write!(f, "true")?;
+        if self.condition.always_true() {
+            write!(f, "true")
         } else {
-            for expr in conjunctions {
-                write!(
-                    f,
-                    " AND {:?}",
-                    ExprVerboseDisplay {
+            self.condition
+                .conjunctions
+                .iter()
+                .format_with(" AND ", |expr, f| {
+                    f(&ExprDisplay {
                         expr,
-                        input_schema: self.input_schema
-                    }
-                )?;
-            }
+                        input_schema: self.input_schema,
+                    })
+                })
+                .fmt(f)
         }
-        Ok(())
     }
 }
 
-impl fmt::Display for ConditionVerboseDisplay<'_> {
+impl fmt::Display for ConditionDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.fmt(f)
     }
 }
 
-impl fmt::Debug for ConditionVerboseDisplay<'_> {
+impl fmt::Debug for ConditionDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.fmt(f)
     }

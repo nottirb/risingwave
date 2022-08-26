@@ -14,15 +14,16 @@
 
 use std::fmt;
 
-use risingwave_common::catalog::{ColumnId, TableDesc};
-use risingwave_common::error::{ErrorCode, Result};
+use risingwave_common::catalog::{ColumnId, Schema, TableDesc};
+use risingwave_common::error::Result;
 use risingwave_pb::batch_plan::plan_node::NodeBody;
 use risingwave_pb::batch_plan::LookupJoinNode;
 
 use crate::expr::Expr;
+use crate::optimizer::plan_node::utils::IndicesDisplay;
 use crate::optimizer::plan_node::{
-    EqJoinPredicate, LogicalJoin, PlanBase, PlanTreeNodeBinary, PlanTreeNodeUnary, ToBatchProst,
-    ToDistributedBatch, ToLocalBatch,
+    EqJoinPredicate, EqJoinPredicateDisplay, LogicalJoin, PlanBase, PlanTreeNodeBinary,
+    PlanTreeNodeUnary, ToBatchProst, ToDistributedBatch, ToLocalBatch,
 };
 use crate::optimizer::property::{Distribution, Order, RequiredDist};
 use crate::optimizer::PlanRef;
@@ -63,10 +64,7 @@ impl BatchLookupJoin {
     }
 
     fn derive_dist(left: &Distribution) -> Distribution {
-        match left {
-            Distribution::Single => Distribution::Single,
-            _ => unreachable!(),
-        }
+        left.clone()
     }
 
     fn eq_join_predicate(&self) -> &EqJoinPredicate {
@@ -76,11 +74,25 @@ impl BatchLookupJoin {
 
 impl fmt::Display for BatchLookupJoin {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "BatchLookupJoin {{ type: {:?}, predicate: {}, output_indices: {} }}",
-            self.logical.join_type(),
-            self.eq_join_predicate(),
+        let verbose = self.base.ctx.is_explain_verbose();
+        let mut builder = f.debug_struct("BatchLookupJoin");
+        builder.field("type", &format_args!("{:?}", self.logical.join_type()));
+
+        let mut concat_schema = self.logical.left().schema().fields.clone();
+        concat_schema.extend(self.logical.right().schema().fields.clone());
+        let concat_schema = Schema::new(concat_schema);
+        builder.field(
+            "predicate",
+            &format_args!(
+                "{}",
+                EqJoinPredicateDisplay {
+                    eq_join_predicate: self.eq_join_predicate(),
+                    input_schema: &concat_schema
+                }
+            ),
+        );
+
+        if verbose {
             if self
                 .logical
                 .output_indices()
@@ -88,11 +100,22 @@ impl fmt::Display for BatchLookupJoin {
                 .copied()
                 .eq(0..self.logical.internal_column_num())
             {
-                "all".to_string()
+                builder.field("output", &format_args!("all"));
             } else {
-                format!("{:?}", self.logical.output_indices())
+                builder.field(
+                    "output",
+                    &format_args!(
+                        "{:?}",
+                        &IndicesDisplay {
+                            indices: self.logical.output_indices(),
+                            input_schema: &concat_schema,
+                        }
+                    ),
+                );
             }
-        )
+        }
+
+        builder.finish()
     }
 }
 
@@ -117,7 +140,10 @@ impl_plan_tree_node_for_unary! { BatchLookupJoin }
 
 impl ToDistributedBatch for BatchLookupJoin {
     fn to_distributed(&self) -> Result<PlanRef> {
-        Err(ErrorCode::NotImplemented("Lookup Join in MPP mode".to_string(), None.into()).into())
+        let input = self
+            .input()
+            .to_distributed_with_required(&Order::any(), &RequiredDist::Any)?;
+        Ok(self.clone_with_input(input).into())
     }
 }
 
@@ -134,15 +160,10 @@ impl ToBatchProst for BatchLookupJoin {
                 .eq_join_predicate
                 .left_eq_indexes()
                 .into_iter()
-                .map(|a| a as i32)
+                .map(|a| a as _)
                 .collect(),
             probe_side_table_desc: Some(self.right_table_desc.to_protobuf()),
-            probe_side_vnode_mapping: self
-                .right_table_desc
-                .vnode_mapping
-                .as_ref()
-                .unwrap_or(&vec![])
-                .clone(),
+            probe_side_vnode_mapping: vec![], // To be filled in at local.rs
             probe_side_column_ids: self
                 .right_output_column_ids
                 .iter()
